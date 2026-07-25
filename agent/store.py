@@ -94,14 +94,17 @@ class FactStore:
             self._load()
 
     # -- write ------------------------------------------------------------
-    def append(self, fact: Fact) -> Fact:
+    def append(self, fact: Fact, *, persist: bool = True) -> Fact:
+        """persist=False is used only by _load(), which is replaying rows that
+        are already on disk. Writing them back would grow the file while it is
+        being read — an unbounded loop, and the reason this parameter exists."""
         key = (fact.entity_id, fact.field)
         times, facts = self._series.setdefault(key, ([], []))
         i = bisect_right(times, fact.observed_at)
         times.insert(i, fact.observed_at)
         facts.insert(i, fact)
         self._facts.append(fact)
-        if self._path:
+        if persist and self._path:
             with self._path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(_encode(fact)) + "\n")
         return fact
@@ -129,10 +132,12 @@ class FactStore:
 
     # -- persistence ------------------------------------------------------
     def _load(self) -> None:
+        # Read the whole file BEFORE appending anything, so the reader can
+        # never observe rows written during the replay.
         with self._path.open(encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    self.append(_decode(json.loads(line)))
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        for line in lines:
+            self.append(_decode(json.loads(line)), persist=False)
 
 
 def _encode(f: Fact) -> dict:

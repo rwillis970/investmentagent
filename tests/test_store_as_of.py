@@ -68,3 +68,30 @@ def test_jsonl_roundtrip(tmp_path):
     reloaded = FactStore(p)
     assert len(reloaded) == 2
     assert reloaded.as_of(T0 + timedelta(hours=1)).get("AAPL", "eps") == 1.0
+
+
+def test_reload_does_not_rewrite_the_file(tmp_path):
+    """Replaying rows on load must not append them again — that grew the file
+    while it was being read and looped forever."""
+    p = tmp_path / "facts.jsonl"
+    s = FactStore(p)
+    for i in range(5):
+        s.append(fact(float(i), i))
+    size_before = p.stat().st_size
+    lines_before = p.read_text().count("\n")
+
+    for _ in range(3):                      # repeated reloads must be stable
+        reloaded = FactStore(p)
+        assert len(reloaded) == 5
+
+    assert p.stat().st_size == size_before
+    assert p.read_text().count("\n") == lines_before == 5
+
+
+def test_append_after_reload_still_persists(tmp_path):
+    p = tmp_path / "facts.jsonl"
+    FactStore(p).append(fact(1.0, 0))
+    s = FactStore(p)
+    s.append(fact(2.0, 24))
+    assert p.read_text().count("\n") == 2
+    assert len(FactStore(p)) == 2

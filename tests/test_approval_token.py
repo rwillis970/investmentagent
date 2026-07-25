@@ -4,7 +4,7 @@ import pytest
 
 from agent.approval import (ApprovalError, ApprovalService, OrderMismatch,
                             PriceOutOfBand, TokenConsumed, TokenExpired,
-                            order_fingerprint)
+                            TokenReissued, order_fingerprint)
 
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
 ORDER = dict(symbol="SPY", side="BUY", qty=0.02, order_type="LIMIT",
@@ -74,10 +74,32 @@ def test_daily_cap_and_stop_loss_bypass():
     assert svc.can_request(day, is_stop_loss=True)
 
 
+def test_a_token_id_cannot_be_reissued():
+    """A replayed inbox event or a restart must not mint a fresh token for an
+    id that already exists — that would reset the single-use guarantee."""
+    svc = service()
+    approve(svc)
+    with pytest.raises(TokenReissued):
+        approve(svc)
+
+
+def test_reissue_is_blocked_even_after_consumption():
+    svc = service()
+    tok = approve(svc)
+    tok.consume(fingerprint=order_fingerprint(**ORDER), price=500.0, now=T0)
+    with pytest.raises(TokenReissued, match="already been issued and consumed"):
+        approve(svc, now=T0 + timedelta(minutes=1))
+
+
 def test_rubber_stamp_detection():
     svc = service()
-    fast = [approve(svc, now=T0 + timedelta(minutes=i),
-                    shown_delta=timedelta(seconds=11)) for i in range(6)]
+    fast = []
+    for i in range(6):
+        fast.append(svc.approve(
+            token_id=f"t{i}", request_id=f"r{i}",
+            fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+            shown_at=T0 + timedelta(minutes=i) - timedelta(seconds=11),
+            now=T0 + timedelta(minutes=i)))
     assert svc.rubber_stamp_risk(fast) is True
 
 

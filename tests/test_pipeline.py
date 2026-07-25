@@ -1,0 +1,160 @@
+"""The gates must be enforced by the pipeline, not only by their own unit tests.
+
+Each test here drives Gatekeeper.stage and asserts which gate rejected — the
+composition is the thing under test.
+"""
+from datetime import date, datetime, timedelta, timezone
+
+import pytest
+
+from agent.daytrade import DayTradeGuard
+from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+from agent.pipeline import Gatekeeper, Rejected, StagedOrder
+from agent.policy import initial_policy
+from agent.risk import PortfolioState, RiskPolicy
+
+T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+SESSIONS = [date(2026, 7, 14) + timedelta(days=i) for i in range(5)]
+RISK = RiskPolicy("t", max_position_pct=5.0, max_sector_pct=20.0,
+                  min_settled_cash_pct_of_nlv=20.0, min_absolute_settled_cash=75.0)
+PORTFOLIO = PortfolioState(nlv=500.0, settled_cash=500.0)   # reserve 100 -> 400
+
+
+def keeper(**over):
+    kw = dict(capability_policy=initial_policy(), risk_policy=RISK,
+              day_trade_guard=DayTradeGuard(max_per_5_sessions=3), live=True)
+    kw.update(over)
+    return Gatekeeper(**kw)
+
+
+def stage(gk=None, **over):
+    kw = dict(client_order_id="c1", symbol="SPY", side="BUY", qty=0.2,
+              order_type="LIMIT", time_in_force="DAY", price=500.0,
+              limit_price=500.0, portfolio=PORTFOLIO, now=T0,
+              sessions=SESSIONS, posture="CASH", asset_class="ETF")
+    kw.update(over)
+    return (gk or keeper()).stage(**kw)
+
+
+def lots(reg, version, opened=T0, settles=None, qty=1.0):
+    return [reg.make_lot(lot_id="l1", symbol="SPY", qty=qty, cost_basis=100.0,
+                         opened_at=opened, policy_version=version,
+                         settles_at=settles)]
+
+
+def registry():
+    return HoldingPolicyRegistry([
+        HoldingPolicy("long", timedelta(days=7), timedelta(days=30)),
+        HoldingPolicy("short", timedelta(hours=1), timedelta(days=1)),
+    ])
+
+
+# ------------------------------------------------------------- happy path
+
+def test_a_normal_buy_passes_every_gate_in_order():
+    o = stage()
+    assert isinstance(o, StagedOrder)
+    assert o.gates_passed == ("capability:universe", "reserve",
+                             "capability:pre_submit")
+    assert o.notional == 100.0
+
+
+def test_a_normal_sell_of_an_eligible_lot_passes():
+    reg = registry()
+    o = stage(side="SELL", qty=1.0,
+              lots=lots(reg, "short", opened=T0 - timedelta(hours=2)))
+    assert "holding" in o.gates_passed
+
+
+# ------------------------------------------------------- capability gate
+
+@pytest.mark.parametrize("asset_class", ["OPTIONS", "CRYPTO", "FUTURES", "OTC"])
+def test_disabled_asset_class_is_rejected_at_the_universe_gate(asset_class):
+    with pytest.raises(Rejected) as exc:
+        stage(asset_class=asset_class, symbol="XXX")
+    assert exc.value.gate == "capability:universe"
+
+
+def test_extended_hours_and_gtc_are_rejected():
+    for over in ({"session": "EXTENDED"}, {"time_in_force": "GTC"}):
+        with pytest.raises(Rejected) as exc:
+            stage(**over)
+        assert exc.value.gate == "capability:universe"
+
+
+def test_short_side_is_rejected():
+    with pytest.raises(Rejected):
+        stage(side="SELL_SHORT")
+
+
+# ------------------------------------------------------------ holding gate
+
+def test_selling_inside_the_minimum_hold_is_rejected():
+    reg = registry()
+    with pytest.raises(Rejected) as exc:
+        stage(side="SELL", qty=1.0, lots=lots(reg, "long"))
+    assert exc.value.gate == "holding"
+    assert "minimum hold" in exc.value.reason
+
+
+def test_selling_an_unsettled_lot_is_rejected():
+    reg = registry()
+    with pytest.raises(Rejected) as exc:
+        stage(side="SELL", qty=1.0,
+              lots=lots(reg, "short", opened=T0 - timedelta(hours=2),
+                        settles=T0 + timedelta(days=1)))
+    assert exc.value.gate == "holding"
+
+
+def test_partial_sell_within_eligible_quantity_is_allowed():
+    reg = registry()
+    o = stage(side="SELL", qty=0.4,
+              lots=lots(reg, "short", opened=T0 - timedelta(hours=2), qty=1.0))
+    assert o.qty == 0.4
+
+
+# ---------------------------------------------------------- day-trade gate
+
+def test_fourth_day_trade_is_rejected():
+    gk = keeper()
+    for i in range(3):
+        gk.day_trade_guard.record(SESSIONS[i], "SPY")
+    with pytest.raises(Rejected) as exc:
+        stage(gk, opens_day_trade=True)
+    assert exc.value.gate == "day_trade"
+
+
+def test_day_trade_gate_is_skipped_when_the_order_is_not_a_round_trip():
+    gk = keeper()
+    for i in range(3):
+        gk.day_trade_guard.record(SESSIONS[i], "SPY")
+    o = stage(gk, opens_day_trade=False)
+    assert "day_trade" not in o.gates_passed
+
+
+# ------------------------------------------------------------- reserve gate
+
+def test_buy_exceeding_investable_cash_is_rejected():
+    with pytest.raises(Rejected) as exc:
+        stage(qty=1.0)          # 500 notional vs 400 investable
+    assert exc.value.gate == "reserve"
+    assert "required reserve" in exc.value.reason
+
+
+def test_buy_exactly_at_the_reserve_boundary_is_allowed():
+    o = stage(qty=0.8)          # 400 notional == 400 investable
+    assert o.notional == 400.0
+
+
+def test_unsettled_cash_does_not_fund_a_buy():
+    p = PortfolioState(nlv=500.0, settled_cash=100.0, unsettled_cash=400.0)
+    with pytest.raises(Rejected) as exc:
+        stage(portfolio=p, qty=0.2)
+    assert exc.value.gate == "reserve"
+
+
+def test_sells_are_not_reserve_constrained():
+    reg = registry()
+    o = stage(side="SELL", qty=1.0,
+              lots=lots(reg, "short", opened=T0 - timedelta(hours=2)))
+    assert "reserve" not in o.gates_passed

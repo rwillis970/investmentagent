@@ -34,6 +34,10 @@ class PriceOutOfBand(ApprovalError):
     pass
 
 
+class TokenReissued(ApprovalError):
+    pass
+
+
 def order_fingerprint(*, symbol: str, side: str, qty: float, order_type: str,
                       time_in_force: str, limit_price: float | None = None) -> str:
     body = json.dumps({
@@ -99,6 +103,15 @@ class ApprovalService:
     def approve(self, *, token_id: str, request_id: str, fingerprint: str,
                 price_at_analysis: float, shown_at: datetime,
                 now: datetime) -> ApprovalToken:
+        # A token_id is issued once. Re-approving would mint a fresh,
+        # unconsumed token and silently reset the single-use guarantee — which
+        # is exactly what a replayed inbox event or a restart would do.
+        if token_id in self._tokens:
+            raise TokenReissued(
+                f"token {token_id} has already been issued"
+                + (" and consumed" if self._tokens[token_id].consumed_at else "")
+                + "; a new decision requires a new token id"
+            )
         elapsed = now - shown_at
         if elapsed < self.min_display:
             raise ApprovalError(

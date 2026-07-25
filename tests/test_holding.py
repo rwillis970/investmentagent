@@ -2,7 +2,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent.holding import (ExitCategory, HoldingViolation, Lot, blocked_qty,
+from agent.holding import (ExitCategory, HoldingPolicy, HoldingPolicyRegistry,
+                           HoldingViolation, Lot, blocked_qty,
                            check_normal_exit, request_early_exit, sellable_qty)
 
 T0 = datetime(2026, 7, 20, 14, 30, tzinfo=timezone.utc)
@@ -85,3 +86,64 @@ def test_no_exception_needed_when_already_eligible():
     with pytest.raises(HoldingViolation, match="already eligible"):
         request_early_exit(l, request_id="r4", category=ExitCategory.STOP_LOSS,
                            evidence_fact_ref="f", now=T0 + timedelta(hours=2))
+
+
+# ------------------------------------------------- versioned policy registry
+
+def registry():
+    return HoldingPolicyRegistry([
+        HoldingPolicy("hp-v1", timedelta(days=7), timedelta(days=30)),
+        HoldingPolicy("hp-v2", timedelta(hours=4), timedelta(days=1)),
+    ])
+
+
+def test_lot_resolves_its_duration_from_its_own_policy_version():
+    reg = registry()
+    l = reg.make_lot(lot_id="a", symbol="SPY", qty=1.0, cost_basis=100.0,
+                     opened_at=T0, policy_version="hp-v1")
+    assert l.minimum_hold == timedelta(days=7)
+    assert l.earliest_normal_exit_at == T0 + timedelta(days=7)
+
+
+def test_reloaded_lot_keeps_the_historical_duration_not_the_current_one():
+    """The scenario the plan cares about: policy has since been shortened to
+    hp-v2, but a lot opened under hp-v1 is still held for seven days."""
+    reg = registry()
+    row = {"lot_id": "a", "symbol": "SPY", "qty": 1.0, "cost_basis": 100.0,
+           "opened_at": T0, "holding_policy_version": "hp-v1"}
+    l = reg.lot_from_row(row)
+    assert l.minimum_hold == timedelta(days=7)
+    assert not l.is_hold_eligible(T0 + timedelta(hours=5))
+    with pytest.raises(HoldingViolation, match="held until"):
+        check_normal_exit(l, T0 + timedelta(hours=5))
+
+
+def test_stored_duration_disagreeing_with_the_registry_is_an_error():
+    reg = registry()
+    row = {"lot_id": "a", "symbol": "SPY", "qty": 1.0, "cost_basis": 100.0,
+           "opened_at": T0, "holding_policy_version": "hp-v1",
+           "minimum_holding_period": "PT1H"}
+    with pytest.raises(HoldingViolation, match="but policy hp-v1 defines"):
+        reg.lot_from_row(row)
+
+
+def test_matching_stored_duration_is_accepted():
+    reg = registry()
+    row = {"lot_id": "a", "symbol": "SPY", "qty": 1.0, "cost_basis": 100.0,
+           "opened_at": T0, "holding_policy_version": "hp-v2",
+           "minimum_holding_period": "PT4H"}
+    assert reg.lot_from_row(row).minimum_hold == timedelta(hours=4)
+
+
+def test_unknown_policy_version_refuses_to_guess():
+    with pytest.raises(HoldingViolation, match="unknown holding policy version"):
+        registry().lot_from_row({"lot_id": "a", "symbol": "SPY", "qty": 1.0,
+                                 "cost_basis": 100.0, "opened_at": T0,
+                                 "holding_policy_version": "hp-v9"})
+
+
+def test_policy_versions_are_immutable():
+    reg = registry()
+    reg.register(HoldingPolicy("hp-v1", timedelta(days=7), timedelta(days=30)))
+    with pytest.raises(HoldingViolation, match="already registered"):
+        reg.register(HoldingPolicy("hp-v1", timedelta(days=1), timedelta(days=30)))

@@ -35,12 +35,29 @@
     "FOREX": "DISABLED",
     "OTC": "DISABLED"
   },
+  "sides": {
+    "BUY": "PRODUCTION_ALLOWED",
+    "SELL": "PRODUCTION_ALLOWED",
+    "SELL_SHORT": "DISABLED",
+    "BUY_TO_COVER": "DISABLED"
+  },
+  "funding": {
+    "SETTLED_CASH": "PRODUCTION_ALLOWED",
+    "MARGIN": "DISABLED",
+    "UNSETTLED_CASH": "DISABLED"
+  },
   "order_types": {
     "LIMIT": "PRODUCTION_ALLOWED",
     "MARKET": "PRODUCTION_ALLOWED",
     "STOP": "PRODUCTION_ALLOWED",
     "TRAILING_STOP": "PAPER_ONLY"
   },
-  "sessions": { "REGULAR": "PRODUCTION_ALLOWED", "EXTENDED": "DISABLED" },
-  "time_in_force": { "DAY": "PRODUCTION_ALLOWED", "GTC": "DISABLED" }
+  "sessions": {
+    "REGULAR": "PRODUCTION_ALLOWED",
+    "EXTENDED": "DISABLED"
+  },
+  "time_in_force": {
+    "DAY": "PRODUCTION_ALLOWED",
+    "GTC": "DISABLED"
+  }
 }

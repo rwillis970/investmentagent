@@ -70,3 +70,36 @@ def test_forbidden_asset_classes_must_stay_disabled():
 def test_budget_ordering():
     with pytest.raises(C.ConfigError, match="budget_warning"):
         C.load(base(budget_warning_usd=25, monthly_budget_usd=20, budget_hard_stop_usd=30))
+
+
+def test_sides_and_funding_are_required():
+    with pytest.raises(C.ConfigError, match="sides must be set"):
+        C.load(base(sides={}))
+    with pytest.raises(C.ConfigError, match="funding must be set"):
+        C.load(base(funding={}))
+
+
+def test_long_only_sides_must_be_allowed():
+    with pytest.raises(C.ConfigError, match="side BUY must be PRODUCTION_ALLOWED"):
+        C.load(base(sides={"BUY": "DISABLED", "SELL": "PRODUCTION_ALLOWED",
+                           "SELL_SHORT": "DISABLED", "BUY_TO_COVER": "DISABLED"}))
+
+
+def test_shorting_and_margin_funding_must_stay_disabled():
+    with pytest.raises(C.ConfigError, match="SELL_SHORT must be DISABLED"):
+        C.load(base(sides={"BUY": "PRODUCTION_ALLOWED", "SELL": "PRODUCTION_ALLOWED",
+                           "SELL_SHORT": "PAPER_ONLY", "BUY_TO_COVER": "DISABLED"}))
+    with pytest.raises(C.ConfigError, match="funding MARGIN must be DISABLED"):
+        C.load(base(funding={"SETTLED_CASH": "PRODUCTION_ALLOWED",
+                             "MARGIN": "APPROVAL_REQUIRED",
+                             "UNSETTLED_CASH": "DISABLED"}))
+
+
+def test_config_policy_permits_a_normal_long_order():
+    """The config-driven policy must actually allow a working live order —
+    an omitted dimension would default-deny everything, silently."""
+    from agent.policy import Gate
+    caps = C.load(base()).capability_policy
+    assert caps.allows(gate=Gate.PRE_SUBMIT, live=True, asset_class="ETF",
+                       side="BUY", funding="SETTLED_CASH", order_type="LIMIT",
+                       session="REGULAR", time_in_force="DAY")

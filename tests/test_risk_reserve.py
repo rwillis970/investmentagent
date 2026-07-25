@@ -1,5 +1,6 @@
-from agent.risk import (ConstrainResult, PortfolioState, RiskPolicy,
-                        investable_cash, required_reserve, risk_constrain)
+from agent.policy import initial_policy
+from agent.risk import (PortfolioState, RiskPolicy, investable_cash,
+                        required_reserve, risk_constrain)
 
 POLICY = RiskPolicy(version="t", max_position_pct=5.0, max_sector_pct=20.0,
                     min_settled_cash_pct_of_nlv=20.0, min_absolute_settled_cash=75.0)
@@ -87,3 +88,79 @@ def test_negative_and_zero_targets_are_dropped():
     p = PortfolioState(nlv=1000.0, settled_cash=1000.0)
     r = risk_constrain({"A": -0.10, "F": 0.0, "B": 0.02}, p, POLICY, SECTORS)
     assert set(r.weights) == {"B"}
+
+
+# ----------------------------------------------------- capability gate (gate 2)
+
+CAPS = initial_policy()
+
+
+def test_disabled_asset_class_gets_no_weight():
+    p = PortfolioState(nlv=1000.0, settled_cash=1000.0)
+    r = risk_constrain(
+        {"SPY": 0.04, "AAPL260119C00150000": 0.04, "BTC/USD": 0.04},
+        p, POLICY, {"SPY": "ETF"},
+        capability_policy=CAPS, live=True,
+        asset_classes={"SPY": "ETF", "AAPL260119C00150000": "OPTIONS",
+                       "BTC/USD": "CRYPTO"},
+    )
+    assert set(r.weights) == {"SPY"}
+    assert ("BTC/USD", "capability:CRYPTO") in r.rejected
+    assert "capability:AAPL260119C00150000" in r.binding
+
+
+def test_capability_gate_runs_before_sizing():
+    """A disabled name must not consume sizing headroom before being dropped."""
+    p = PortfolioState(nlv=1000.0, settled_cash=1000.0)
+    r = risk_constrain(
+        {"A": 0.05, "BAD": 0.50}, p, POLICY, {"A": "TECH", "BAD": "TECH"},
+        capability_policy=CAPS, live=True,
+        asset_classes={"A": "US_EQUITY", "BAD": "FUTURES"},
+    )
+    assert r.weights == {"A": 0.05}
+
+
+def test_blocklisted_symbol_is_dropped():
+    from dataclasses import replace
+    p = PortfolioState(nlv=1000.0, settled_cash=1000.0)
+    caps = replace(CAPS, symbol_blocklist=frozenset({"GME"}))
+    r = risk_constrain({"GME": 0.04, "SPY": 0.04}, p, POLICY, {},
+                       capability_policy=caps, live=True,
+                       asset_classes={"GME": "US_EQUITY", "SPY": "ETF"})
+    assert set(r.weights) == {"SPY"}
+
+
+# ----------------------------------------------------- order of operations
+
+def test_asymmetric_three_name_sector_case():
+    """Clip-then-scale is the specified order (§6.1 docstring). With cap 4% and
+    sector cap 9%, targets 8/2/2 clip to 4/2/2 = 8%, which is inside the sector
+    cap — so no sector scaling occurs and the big name keeps its full 4%."""
+    pol = RiskPolicy("t", max_position_pct=4.0, max_sector_pct=9.0,
+                     min_settled_cash_pct_of_nlv=5.0, min_absolute_settled_cash=25.0)
+    p = PortfolioState(nlv=10_000.0, settled_cash=10_000.0)
+    r = risk_constrain({"A": 0.08, "B": 0.02, "C": 0.02}, p, pol,
+                       {"A": "TECH", "B": "TECH", "C": "TECH"})
+    assert r.weights == {"A": 0.04, "B": 0.02, "C": 0.02}
+    assert "max_position:A" in r.binding
+    assert not any(b.startswith("max_sector") for b in r.binding)
+
+
+def test_asymmetric_case_where_sector_also_binds():
+    pol = RiskPolicy("t", max_position_pct=4.0, max_sector_pct=7.0,
+                     min_settled_cash_pct_of_nlv=5.0, min_absolute_settled_cash=25.0)
+    p = PortfolioState(nlv=10_000.0, settled_cash=10_000.0)
+    r = risk_constrain({"A": 0.08, "B": 0.02, "C": 0.02}, p, pol,
+                       {"A": "TECH", "B": "TECH", "C": "TECH"})
+    assert abs(sum(r.weights.values()) - 0.07) < 1e-9
+    assert "max_position:A" in r.binding
+    assert "max_sector:TECH" in r.binding
+
+
+def test_sector_post_condition_holds_across_many_names():
+    pol = RiskPolicy("t", 5.0, 20.0, 20.0, 75.0)
+    p = PortfolioState(nlv=100_000.0, settled_cash=100_000.0)
+    target = {f"T{i}": 0.05 for i in range(10)}
+    sectors = {f"T{i}": "TECH" for i in range(10)}
+    r = risk_constrain(target, p, pol, sectors)
+    assert abs(sum(r.weights.values()) - 0.20) < 1e-9

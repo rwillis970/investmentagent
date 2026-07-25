@@ -65,6 +65,8 @@ class Config:
     budget_hard_stop_usd: float = 30.0
 
     trade_capabilities: dict = field(default_factory=dict)
+    sides: dict = field(default_factory=dict)
+    funding: dict = field(default_factory=dict)
     order_types: dict = field(default_factory=dict)
     sessions: dict = field(default_factory=dict)
     time_in_force: dict = field(default_factory=dict)
@@ -83,6 +85,8 @@ class Config:
         return TradeCapabilityPolicy(
             version="config",
             asset_class=_statuses(self.trade_capabilities),
+            side=_statuses(self.sides),
+            funding=_statuses(self.funding),
             order_type=_statuses(self.order_types),
             session=_statuses(self.sessions),
             time_in_force=_statuses(self.time_in_force),
@@ -175,11 +179,32 @@ def validate(cfg: Config) -> None:
         err.append("require budget_warning < monthly_budget <= budget_hard_stop")
 
     caps = cfg.capability_policy
+    # Every dimension must be populated. TradeCapabilityPolicy default-denies,
+    # so an omitted table would block every order — fail-safe in direction, but
+    # silent. Catch it here instead.
+    for dimension, table in (("sides", cfg.sides), ("funding", cfg.funding),
+                             ("trade_capabilities", cfg.trade_capabilities),
+                             ("order_types", cfg.order_types),
+                             ("sessions", cfg.sessions),
+                             ("time_in_force", cfg.time_in_force)):
+        if not table:
+            err.append(f"{dimension} must be set; an empty table denies everything")
+    for required in ("BUY", "SELL"):
+        if caps.status("side", required) is not CapabilityStatus.PRODUCTION_ALLOWED:
+            err.append(f"side {required} must be PRODUCTION_ALLOWED for long-only trading")
+    if caps.status("funding", "SETTLED_CASH") is not CapabilityStatus.PRODUCTION_ALLOWED:
+        err.append("funding SETTLED_CASH must be PRODUCTION_ALLOWED")
     for forbidden in ("OPTIONS", "CRYPTO", "SHORT_SELLING", "MARGIN",
                       "FUTURES", "FOREX", "OTC"):
         status = caps.asset_class.get(forbidden, CapabilityStatus.DISABLED)
         if status is not CapabilityStatus.DISABLED:
             err.append(f"{forbidden} must be DISABLED in this release (Appendix E)")
+    for forbidden in ("SELL_SHORT", "BUY_TO_COVER"):
+        if caps.status("side", forbidden) is not CapabilityStatus.DISABLED:
+            err.append(f"side {forbidden} must be DISABLED in this release")
+    for forbidden in ("MARGIN", "UNSETTLED_CASH"):
+        if caps.status("funding", forbidden) is not CapabilityStatus.DISABLED:
+            err.append(f"funding {forbidden} must be DISABLED in this release")
 
     if err:
         raise ConfigError("invalid configuration:\n  - " + "\n  - ".join(err))

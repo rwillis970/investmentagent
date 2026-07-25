@@ -14,6 +14,31 @@ from typing import Any
 GENESIS = "0" * 64
 
 
+class AuditError(Exception):
+    pass
+
+
+class _AppendOnlyList(list):
+    """Preventive immutability, matching FactStore.update/delete (§8).
+    Detection via verify() is the backstop, not the only guard."""
+
+    def _forbid(self, *args, **kwargs):
+        raise AuditError(
+            "the audit log is append-only; rows are never modified or removed"
+        )
+
+    __setitem__ = _forbid
+    __delitem__ = _forbid
+    __iadd__ = _forbid
+    insert = _forbid
+    remove = _forbid
+    pop = _forbid
+    clear = _forbid
+    sort = _forbid
+    reverse = _forbid
+    extend = _forbid
+
+
 @dataclass(frozen=True)
 class AuditEvent:
     seq: int
@@ -36,7 +61,11 @@ def _digest(payload: dict, prev_hash: str) -> str:
 
 @dataclass
 class AuditLog:
-    _events: list[AuditEvent] = field(default_factory=list)
+    _events: _AppendOnlyList = field(default_factory=_AppendOnlyList)
+
+    @property
+    def events(self) -> tuple[AuditEvent, ...]:
+        return tuple(self._events)
 
     def append(self, *, actor: str, action: str, object_type: str, object_id: str,
                before: Any = None, after: Any = None,

@@ -8,9 +8,11 @@ Two properties that position-level enforcement cannot provide:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+
+from .durations import parse_duration
 
 
 class ExitCategory(Enum):
@@ -27,6 +29,75 @@ EVIDENCE_EXEMPT = frozenset({ExitCategory.MANUAL_INSTRUCTION})
 
 class HoldingViolation(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class HoldingPolicy:
+    """Versioned holding policy (§9). The registry below is the authority for
+    what a version MEANS, so a lot reconstructed from storage resolves its
+    duration from its own version — never from whatever config says today."""
+    version: str
+    minimum_holding_period: timedelta
+    cooldown_period: timedelta
+    effective_at: datetime | None = None
+
+
+class HoldingPolicyRegistry:
+    def __init__(self, policies=()):
+        self._by_version: dict[str, HoldingPolicy] = {}
+        for p in policies:
+            self.register(p)
+
+    def register(self, policy: HoldingPolicy) -> HoldingPolicy:
+        existing = self._by_version.get(policy.version)
+        if existing is not None and existing != policy:
+            raise HoldingViolation(
+                f"holding policy {policy.version} is already registered with "
+                "different values; policy versions are immutable"
+            )
+        self._by_version[policy.version] = policy
+        return policy
+
+    def get(self, version: str) -> HoldingPolicy:
+        try:
+            return self._by_version[version]
+        except KeyError as exc:
+            raise HoldingViolation(
+                f"unknown holding policy version {version!r}; refusing to guess "
+                "a duration for an existing lot"
+            ) from exc
+
+    def make_lot(self, *, lot_id: str, symbol: str, qty: float, cost_basis: float,
+                 opened_at: datetime, policy_version: str,
+                 settles_at: datetime | None = None) -> "Lot":
+        policy = self.get(policy_version)
+        return Lot(lot_id=lot_id, symbol=symbol, qty=qty, cost_basis=cost_basis,
+                   opened_at=opened_at,
+                   minimum_hold=policy.minimum_holding_period,
+                   holding_policy_version=policy.version, settles_at=settles_at)
+
+    def lot_from_row(self, row: dict) -> "Lot":
+        """Reconstruct a lot from storage. The duration comes from the version,
+        and a stored duration that disagrees with the registry is an error
+        rather than something to silently prefer."""
+        version = row["holding_policy_version"]
+        policy = self.get(version)
+        stored = row.get("minimum_holding_period")
+        if stored is not None:
+            stored_td = (stored if isinstance(stored, timedelta)
+                         else parse_duration(str(stored)))
+            if stored_td != policy.minimum_holding_period:
+                raise HoldingViolation(
+                    f"lot {row.get('lot_id')!r} stores {stored_td} but policy "
+                    f"{version} defines {policy.minimum_holding_period}"
+                )
+        return Lot(
+            lot_id=row["lot_id"], symbol=row["symbol"], qty=row["qty"],
+            cost_basis=row["cost_basis"], opened_at=row["opened_at"],
+            minimum_hold=policy.minimum_holding_period,
+            holding_policy_version=version, settles_at=row.get("settles_at"),
+            closed_at=row.get("closed_at"),
+        )
 
 
 @dataclass(frozen=True)

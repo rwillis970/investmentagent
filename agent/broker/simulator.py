@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
+from ..policy import TradeCapabilityPolicy, initial_policy
 from .base import (AccountPosture, AccountSnapshot, BrokerAdapter, BrokerOrder,
                    Position)
 
@@ -17,7 +18,11 @@ class SimulatorBroker(BrokerAdapter):
     name = "simulator"
 
     def __init__(self, *, cash: float = 500.0, posture: AccountPosture = AccountPosture.CASH,
-                 now: datetime | None = None):
+                 now: datetime | None = None,
+                 capability_policy: TradeCapabilityPolicy | None = None):
+        # The simulator defaults to the Appendix E boundary so tests exercise a
+        # real policy. A live adapter must be given one explicitly.
+        super().__init__(capability_policy or initial_policy())
         self._cash = cash
         self._settled = cash
         self._unsettled = 0.0
@@ -45,6 +50,9 @@ class SimulatorBroker(BrokerAdapter):
     def now(self) -> datetime:
         return self._now
 
+    def clock(self) -> datetime:
+        return self._now
+
     # -- interface --------------------------------------------------------
     def account(self) -> AccountSnapshot:
         mv = sum(q * self._prices.get(s, p) for s, (q, p) in self._positions.items())
@@ -65,9 +73,9 @@ class SimulatorBroker(BrokerAdapter):
         return [o for o in self._orders.values()
                 if o.status in ("new", "partially_filled")]
 
-    def submit(self, *, client_order_id: str, symbol: str, side: str, qty: float,
-               order_type: str, time_in_force: str,
-               limit_price: float | None = None) -> BrokerOrder:
+    def _submit_impl(self, *, client_order_id: str, symbol: str, side: str,
+                     qty: float, order_type: str, time_in_force: str,
+                     limit_price: float | None = None) -> BrokerOrder:
         if client_order_id in self._orders:
             return self._orders[client_order_id]        # idempotent
 
