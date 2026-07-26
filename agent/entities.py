@@ -45,7 +45,12 @@ class ApprovalRequest:
 
 @dataclass(frozen=True)
 class RunManifest:
+    """MULTI-ACCOUNT ADDENDUM: a run manifest is scoped to ONE account. If a
+    tick evaluates both accounts, it produces two RunManifest rows, not one
+    covering both -- decision provenance stays account-scoped, same as
+    everything else in this change."""
     run_id: str
+    account_id: str
     as_of: datetime
     trigger: str                     # EVENT | ROUTINE | REVIEW
     mode: str

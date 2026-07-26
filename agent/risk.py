@@ -35,6 +35,12 @@ class RiskPolicy:
 
 @dataclass(frozen=True)
 class PortfolioState:
+    """One account's state. Never a total across accounts -- see
+    accounts.aggregate_report for the reporting-only equivalent, which is a
+    different type on purpose. account_id is required: there is no sensible
+    default, and a missing one is exactly the bug (whose money is this?) the
+    multi-account addendum exists to make impossible to write by accident."""
+    account_id: str
     nlv: float
     settled_cash: float
     unsettled_cash: float = 0.0

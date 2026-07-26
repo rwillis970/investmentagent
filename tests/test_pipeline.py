@@ -1,28 +1,38 @@
 """The gates must be enforced by the pipeline, not only by their own unit tests.
 
 Each test here drives Gatekeeper.stage and asserts which gate rejected — the
-composition is the thing under test.
+composition is the thing under test, not the internals of any one gate (those
+are covered in test_risk_reserve.py, test_holding.py, test_daytrade.py).
+
+RISK below deliberately sets max_position_pct and max_sector_pct to 100 so a
+single-name test order never trips the per-name/sector clip -- these tests are
+about gate ORDER and NAMES, not risk sizing. required_reserve/investable_cash
+still bind, since those are what §5.1's reserve gate is for.
 """
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from agent.accounts import AccountType
 from agent.daytrade import DayTradeGuard
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.pipeline import Gatekeeper, Rejected, StagedOrder
 from agent.policy import initial_policy
 from agent.risk import PortfolioState, RiskPolicy
 
+ACCT = "acct-taxable"
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
 SESSIONS = [date(2026, 7, 14) + timedelta(days=i) for i in range(5)]
-RISK = RiskPolicy("t", max_position_pct=5.0, max_sector_pct=20.0,
+RISK = RiskPolicy("t", max_position_pct=100.0, max_sector_pct=100.0,
                   min_settled_cash_pct_of_nlv=20.0, min_absolute_settled_cash=75.0)
-PORTFOLIO = PortfolioState(nlv=500.0, settled_cash=500.0)   # reserve 100 -> 400
+PORTFOLIO = PortfolioState(account_id=ACCT, nlv=500.0, settled_cash=500.0)   # reserve 100 -> 400
 
 
 def keeper(**over):
-    kw = dict(capability_policy=initial_policy(), risk_policy=RISK,
-              day_trade_guard=DayTradeGuard(max_per_5_sessions=3), live=True)
+    kw = dict(account_id=ACCT, account_type=AccountType.TAXABLE,
+              capability_policy=initial_policy(), risk_policy=RISK,
+              day_trade_guard=DayTradeGuard(account_id=ACCT, max_per_5_sessions=3),
+              live=True)
     kw.update(over)
     return Gatekeeper(**kw)
 
@@ -37,8 +47,8 @@ def stage(gk=None, **over):
 
 
 def lots(reg, version, opened=T0, settles=None, qty=1.0):
-    return [reg.make_lot(lot_id="l1", symbol="SPY", qty=qty, cost_basis=100.0,
-                         opened_at=opened, policy_version=version,
+    return [reg.make_lot(lot_id="l1", account_id=ACCT, symbol="SPY", qty=qty,
+                         cost_basis=100.0, opened_at=opened, policy_version=version,
                          settles_at=settles)]
 
 
@@ -54,7 +64,7 @@ def registry():
 def test_a_normal_buy_passes_every_gate_in_order():
     o = stage()
     assert isinstance(o, StagedOrder)
-    assert o.gates_passed == ("capability:universe", "reserve",
+    assert o.gates_passed == ("capability:universe", "risk",
                              "capability:pre_submit")
     assert o.notional == 100.0
 
@@ -132,29 +142,36 @@ def test_day_trade_gate_is_skipped_when_the_order_is_not_a_round_trip():
     assert "day_trade" not in o.gates_passed
 
 
-# ------------------------------------------------------------- reserve gate
+# --------------------------------------------------------------- risk gate
 
-def test_buy_exceeding_investable_cash_is_rejected():
-    with pytest.raises(Rejected) as exc:
-        stage(qty=1.0)          # 500 notional vs 400 investable
-    assert exc.value.gate == "reserve"
-    assert "required reserve" in exc.value.reason
+def test_buy_exceeding_investable_cash_is_resized_not_rejected():
+    """§6.1's target-weight-vector model resizes a too-large order down to
+    what the reserve allows rather than rejecting it outright -- rejection is
+    reserved for the case where the authorised weight comes back at zero."""
+    o = stage(qty=1.0)          # 500 requested notional vs 400 investable
+    assert o.requested_qty == 1.0
+    assert o.authorized_qty == pytest.approx(0.8)
+    assert o.notional == pytest.approx(400.0)
+    assert "settled_cash_reserve" in o.binding
+    assert "risk" in o.gates_passed
 
 
 def test_buy_exactly_at_the_reserve_boundary_is_allowed():
     o = stage(qty=0.8)          # 400 notional == 400 investable
     assert o.notional == 400.0
+    assert "settled_cash_reserve" not in o.binding
 
 
-def test_unsettled_cash_does_not_fund_a_buy():
-    p = PortfolioState(nlv=500.0, settled_cash=100.0, unsettled_cash=400.0)
+def test_unsettled_cash_leaves_nothing_to_authorize():
+    p = PortfolioState(account_id=ACCT, nlv=500.0, settled_cash=100.0,
+                       unsettled_cash=400.0)
     with pytest.raises(Rejected) as exc:
         stage(portfolio=p, qty=0.2)
-    assert exc.value.gate == "reserve"
+    assert exc.value.gate == "risk"
 
 
-def test_sells_are_not_reserve_constrained():
+def test_sells_are_not_risk_constrained():
     reg = registry()
     o = stage(side="SELL", qty=1.0,
               lots=lots(reg, "short", opened=T0 - timedelta(hours=2)))
-    assert "reserve" not in o.gates_passed
+    assert "risk" not in o.gates_passed

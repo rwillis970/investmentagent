@@ -1,39 +1,113 @@
+"""Broker-adapter mechanics: gate 4 (the adapter's own, independent capability
+re-check), idempotency, T+1 settlement, and the live approval-token path.
+
+Order staging itself (gates 1-3, risk sizing) is covered in test_pipeline.py
+and test_risk_reserve.py -- this file exists to prove the ADAPTER doesn't
+just trust a StagedOrder's gates_passed. RISK below is deliberately generous
+(no position/sector/reserve binding) so a StagedOrder built through
+Gatekeeper.stage() here is authorized at face value, and the interesting
+behaviour under test is the adapter's, not the pipeline's.
+
+Where a test needs to reach gate 4 specifically (an adapter re-check that
+would never be reachable through a compliant Gatekeeper.stage() call, because
+gate 1 would already have rejected it), it builds a StagedOrder by hand and
+signs it with the same Gatekeeper's key -- simulating a StagedOrder that
+somehow got past the pipeline, which is exactly the scenario gate 4 exists
+to catch independently.
+"""
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from agent.approval import ApprovalService, order_fingerprint
+from agent.accounts import AccountType
+from agent.approval import ApprovalService, OrderMismatch, TokenConsumed, order_fingerprint
 from agent.audit import AuditError, AuditLog
 from agent.broker import (AccountPosture, CapabilityPolicyUnset, MissingApproval,
                           SimulatorBroker, detect_posture)
 from agent.broker.base import AccountSnapshot, BrokerAdapter, BrokerOrder
 from agent.cost import BudgetState, CostEntry, CostLedger
-from agent.policy import PolicyViolation
+from agent.daytrade import DayTradeGuard
+from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+from agent.pipeline import Gatekeeper, StagedOrder, sign_staged_order
+from agent.policy import PolicyViolation, initial_policy
+from agent.risk import PortfolioState, RiskPolicy
 
+ACCT = "acct-taxable"
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+SESSIONS = [date(2026, 7, 14) + timedelta(days=i) for i in range(5)]
 
+RISK = RiskPolicy("t", max_position_pct=100.0, max_sector_pct=100.0,
+                  min_settled_cash_pct_of_nlv=0.0, min_absolute_settled_cash=0.0)
 
-def acct(equity, multiplier):
-    return AccountSnapshot(equity=equity, cash=equity, settled_cash=equity,
-                           unsettled_cash=0.0, buying_power=equity,
-                           multiplier=multiplier, pattern_day_trader=False,
-                           day_trade_count=0, fetched_at=T0)
-
-
-def broker(cash=500.0):
-    b = SimulatorBroker(cash=cash, now=T0)
-    b.set_price("SPY", 500.0)
-    return b
-
-
-ORDER = dict(symbol="SPY", side="BUY", qty=0.2, order_type="LIMIT",
-             time_in_force="DAY", limit_price=500.0)
+HOLD = HoldingPolicyRegistry([HoldingPolicy("instant", timedelta(0), timedelta(0))])
 
 
 class LiveSimulator(SimulatorBroker):
     is_live = True
     name = "live-simulator"
+
+
+def acct(equity, multiplier):
+    return AccountSnapshot(account_id=ACCT, equity=equity, cash=equity, settled_cash=equity,
+                           unsettled_cash=0.0, buying_power=equity,
+                           multiplier=multiplier, pattern_day_trader=False,
+                           day_trade_count=0, fetched_at=T0)
+
+
+def gatekeeper(*, live=False):
+    return Gatekeeper(account_id=ACCT, account_type=AccountType.TAXABLE,
+                      capability_policy=initial_policy(), risk_policy=RISK,
+                      day_trade_guard=DayTradeGuard(account_id=ACCT, max_per_5_sessions=3),
+                      live=live)
+
+
+def broker(cash=500.0, live=False):
+    cls = LiveSimulator if live else SimulatorBroker
+    b = cls(account_id=ACCT, cash=cash, now=T0)
+    b.set_price("SPY", 500.0)
+    gk = gatekeeper(live=live)
+    b.attach_staging_key(gk.signing_key)
+    return b, gk
+
+
+def portfolio(nlv=500.0, settled_cash=500.0, **kw):
+    return PortfolioState(account_id=ACCT, nlv=nlv, settled_cash=settled_cash, **kw)
+
+
+def lot(qty, opened=T0):
+    return HOLD.make_lot(lot_id="l1", account_id=ACCT, symbol="SPY", qty=qty,
+                         cost_basis=500.0, opened_at=opened, policy_version="instant")
+
+
+ORDER = dict(symbol="SPY", side="BUY", qty=0.2, order_type="LIMIT",
+             time_in_force="DAY", price=500.0, limit_price=500.0,
+             asset_class="US_EQUITY")
+
+
+def staged(gk, **over):
+    kw = dict(client_order_id="c1", now=T0, sessions=SESSIONS, posture="CASH",
+              portfolio=portfolio())
+    kw.update(ORDER)
+    kw.update(over)
+    return gk.stage(**kw)
+
+
+def make_staged(key, **over):
+    """Build and sign a StagedOrder directly, bypassing Gatekeeper.stage(),
+    for tests that need to reach gate 4 with a shape gate 1 would refuse."""
+    fields = dict(
+        account_id=ACCT, client_order_id="c1", symbol="SPY", side="BUY",
+        requested_qty=1.0, authorized_qty=1.0, order_type="LIMIT",
+        time_in_force="DAY", limit_price=100.0, asset_class="US_EQUITY",
+        funding="SETTLED_CASH", session="REGULAR", requested_notional=100.0,
+        notional=100.0,
+        gates_passed=("capability:universe", "risk", "capability:pre_submit"),
+        binding=(),
+    )
+    fields.update(over)
+    signature = sign_staged_order(fields, key)
+    return StagedOrder(**fields, signature=signature)
 
 
 # ------------------------------------------------------------------ posture
@@ -47,24 +121,25 @@ def test_posture_is_detected_not_declared():
 # ------------------------------------------------------- order path basics
 
 def test_submit_is_idempotent_on_client_order_id():
-    b = broker()
-    o1 = b.submit(client_order_id="c1", **ORDER)
-    o2 = b.submit(client_order_id="c1", **ORDER)
+    b, gk = broker()
+    o1 = b.submit(staged(gk))
+    o2 = b.submit(staged(gk))
     assert o1 is o2 and o1.broker_order_id == o2.broker_order_id
     assert len(b.positions()) == 1
     assert b.get_by_client_id("c1").status == "filled"
 
 
 def test_insufficient_settled_cash_is_rejected():
-    b = broker(cash=50.0)
-    o = b.submit(client_order_id="c1", **(ORDER | {"qty": 1.0}))
+    b, gk = broker(cash=50.0)
+    o = b.submit(staged(gk, qty=1.0))
     assert o.status == "rejected"
 
 
 def test_sale_proceeds_settle_t_plus_one():
-    b = broker()
-    b.submit(client_order_id="buy", **(ORDER | {"qty": 0.5}))
-    b.submit(client_order_id="sell", **(ORDER | {"qty": 0.5, "side": "SELL"}))
+    b, gk = broker()
+    b.submit(staged(gk, client_order_id="buy", qty=0.5))
+    b.submit(staged(gk, client_order_id="sell", side="SELL", qty=0.5,
+                    lots=[lot(0.5)]))
     assert b.account().unsettled_cash == 250.0
     assert b.account().settled_cash == 250.0
     b.advance(timedelta(days=1))
@@ -73,7 +148,8 @@ def test_sale_proceeds_settle_t_plus_one():
 
 
 def test_sessions_skip_weekends():
-    s = broker().sessions(date(2026, 7, 20), 5)
+    b, _ = broker()
+    s = b.sessions(date(2026, 7, 20), 5)
     assert len(s) == 5 and all(d.weekday() < 5 for d in s)
 
 
@@ -87,85 +163,94 @@ def test_sessions_skip_weekends():
     ("OTC", "ABCDF"),
 ])
 def test_disabled_asset_class_never_reaches_the_adapter(asset_class, symbol):
-    b = broker()
+    b, gk = broker()
     b.set_price(symbol, 100.0)
+    bad = make_staged(gk.signing_key, symbol=symbol, asset_class=asset_class)
     with pytest.raises(PolicyViolation):
-        b.submit(client_order_id="c1", symbol=symbol, side="BUY", qty=1.0,
-                 order_type="LIMIT", time_in_force="DAY", limit_price=100.0,
-                 asset_class=asset_class)
+        b.submit(bad)
     assert b.get_by_client_id("c1") is None       # never reached _submit_impl
 
 
 def test_short_side_margin_funding_and_extended_hours_are_blocked():
-    b = broker()
+    b, gk = broker()
     for over in ({"side": "SELL_SHORT"}, {"funding": "MARGIN"},
                  {"session": "EXTENDED"}, {"time_in_force": "GTC"}):
+        bad = make_staged(gk.signing_key, client_order_id=f"c-{list(over)[0]}", **over)
         with pytest.raises(PolicyViolation):
-            b.submit(client_order_id=f"c-{list(over)[0]}", **(ORDER | over))
+            b.submit(bad)
 
 
 def test_paper_only_order_type_is_allowed_on_paper_and_blocked_live():
-    """TRAILING_STOP is PAPER_ONLY, so the same order must pass one adapter and
-    fail the other — the gate reads mode, not just the policy table."""
-    paper = broker()
-    o = paper.submit(client_order_id="c1", **(ORDER | {"order_type": "TRAILING_STOP"}))
+    """TRAILING_STOP is PAPER_ONLY. On paper it clears the whole pipeline
+    (gate 1 through gate 4). Live is exercised at gate 4 directly: a live
+    Gatekeeper.stage() would already refuse TRAILING_STOP at gate 1, so the
+    only way to observe the adapter's OWN, independent block is to hand it a
+    StagedOrder as if gate 1 had (wrongly) let it through."""
+    paper, gk = broker()
+    o = paper.submit(staged(gk, order_type="TRAILING_STOP"))
     assert o.status == "filled"
 
-    live = LiveSimulator(cash=500.0, now=T0)
-    live.set_price("SPY", 500.0)
+    live, live_gk = broker(live=True)
+    bad = make_staged(live_gk.signing_key, order_type="TRAILING_STOP")
     with pytest.raises(PolicyViolation):
-        live.submit(client_order_id="c2", **(ORDER | {"order_type": "TRAILING_STOP"}))
+        live.submit(bad)
 
 
 def test_an_adapter_without_a_policy_refuses_to_trade():
     class Bare(SimulatorBroker):
         def __init__(self):
-            super().__init__(now=T0)
+            super().__init__(account_id=ACCT, now=T0)
             self._capability_policy = None
 
+    gk = gatekeeper()
+    bare = Bare()
+    bare.attach_staging_key(gk.signing_key)
     with pytest.raises(CapabilityPolicyUnset):
-        Bare().submit(client_order_id="c1", **ORDER)
+        bare.submit(staged(gk))
 
 
 # ------------------------------------------------- live path requires a token
 
 def test_live_order_without_a_token_is_refused():
-    b = LiveSimulator(cash=500.0, now=T0)
-    b.set_price("SPY", 500.0)
+    b, gk = broker(live=True)
+    s = staged(gk)
     with pytest.raises(MissingApproval):
-        b.submit(client_order_id="c1", **ORDER)
+        b.submit(s)
     assert b.get_by_client_id("c1") is None
 
 
 def test_live_order_consumes_its_token_exactly_once():
-    b = LiveSimulator(cash=500.0, now=T0)
-    b.set_price("SPY", 500.0)
+    b, gk = broker(live=True)
     svc = ApprovalService(expiration=timedelta(minutes=30),
                           min_display=timedelta(seconds=10), max_per_day=4)
+    s = staged(gk)
     tok = svc.approve(token_id="t1", request_id="r1",
-                      fingerprint=order_fingerprint(**ORDER),
+                      fingerprint=order_fingerprint(
+                          symbol=s.symbol, side=s.side, qty=s.authorized_qty,
+                          order_type=s.order_type, time_in_force=s.time_in_force,
+                          limit_price=s.limit_price),
                       price_at_analysis=500.0,
                       shown_at=T0 - timedelta(seconds=15), now=T0)
-    b.submit(client_order_id="c1", approval_token=tok, **ORDER)
+    b.submit(s, approval_token=tok)
     assert tok.consumed_at == T0
-    from agent.approval import TokenConsumed
+    s2 = staged(gk, client_order_id="c2")
     with pytest.raises(TokenConsumed):
-        b.submit(client_order_id="c2", approval_token=tok, **ORDER)
+        b.submit(s2, approval_token=tok)
 
 
 def test_live_order_diverging_from_the_approved_size_is_refused():
-    b = LiveSimulator(cash=500.0, now=T0)
-    b.set_price("SPY", 500.0)
+    b, gk = broker(live=True)
     svc = ApprovalService(expiration=timedelta(minutes=30),
                           min_display=timedelta(seconds=10), max_per_day=4)
-    tok = svc.approve(token_id="t1", request_id="r1",
-                      fingerprint=order_fingerprint(**ORDER),
+    approved_fp = order_fingerprint(symbol="SPY", side="BUY", qty=0.2,
+                                    order_type="LIMIT", time_in_force="DAY",
+                                    limit_price=500.0)
+    tok = svc.approve(token_id="t1", request_id="r1", fingerprint=approved_fp,
                       price_at_analysis=500.0,
                       shown_at=T0 - timedelta(seconds=15), now=T0)
-    from agent.approval import OrderMismatch
+    s = staged(gk, qty=0.5)   # diverges from the 0.2 the token approved
     with pytest.raises(OrderMismatch):
-        b.submit(client_order_id="c1", approval_token=tok,
-                 **(ORDER | {"qty": 0.5}))
+        b.submit(s, approval_token=tok)
 
 
 # ----------------------------------------------------------------- audit

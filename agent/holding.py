@@ -67,12 +67,12 @@ class HoldingPolicyRegistry:
                 "a duration for an existing lot"
             ) from exc
 
-    def make_lot(self, *, lot_id: str, symbol: str, qty: float, cost_basis: float,
-                 opened_at: datetime, policy_version: str,
+    def make_lot(self, *, lot_id: str, account_id: str, symbol: str, qty: float,
+                 cost_basis: float, opened_at: datetime, policy_version: str,
                  settles_at: datetime | None = None) -> "Lot":
         policy = self.get(policy_version)
-        return Lot(lot_id=lot_id, symbol=symbol, qty=qty, cost_basis=cost_basis,
-                   opened_at=opened_at,
+        return Lot(lot_id=lot_id, account_id=account_id, symbol=symbol, qty=qty,
+                   cost_basis=cost_basis, opened_at=opened_at,
                    minimum_hold=policy.minimum_holding_period,
                    holding_policy_version=policy.version, settles_at=settles_at)
 
@@ -92,7 +92,8 @@ class HoldingPolicyRegistry:
                     f"{version} defines {policy.minimum_holding_period}"
                 )
         return Lot(
-            lot_id=row["lot_id"], symbol=row["symbol"], qty=row["qty"],
+            lot_id=row["lot_id"], account_id=row["account_id"],
+            symbol=row["symbol"], qty=row["qty"],
             cost_basis=row["cost_basis"], opened_at=row["opened_at"],
             minimum_hold=policy.minimum_holding_period,
             holding_policy_version=version, settles_at=row.get("settles_at"),
@@ -103,6 +104,7 @@ class HoldingPolicyRegistry:
 @dataclass(frozen=True)
 class Lot:
     lot_id: str
+    account_id: str                # required: a lot belongs to one account
     symbol: str
     qty: float
     cost_basis: float
@@ -139,18 +141,23 @@ class EarlyExitRequest:
     requested_at: datetime
 
 
-def open_lots(lots, symbol: str | None = None):
-    return [l for l in lots if l.is_open() and (symbol is None or l.symbol == symbol)]
+def open_lots(lots, account_id: str, symbol: str | None = None):
+    """account_id is required, not optional -- filtering by symbol alone
+    would net two accounts' shares of the same symbol together, which is
+    exactly the cross-account netting bug the multi-account addendum exists
+    to prevent."""
+    return [l for l in lots if l.is_open() and l.account_id == account_id
+            and (symbol is None or l.symbol == symbol)]
 
 
-def sellable_qty(lots, symbol: str, now: datetime) -> float:
-    """Quantity a normal strategy exit may sell right now."""
-    return sum(l.qty for l in open_lots(lots, symbol)
+def sellable_qty(lots, account_id: str, symbol: str, now: datetime) -> float:
+    """Quantity a normal strategy exit may sell right now, for THIS account."""
+    return sum(l.qty for l in open_lots(lots, account_id, symbol)
                if l.is_hold_eligible(now) and l.is_settled(now))
 
 
-def blocked_qty(lots, symbol: str, now: datetime) -> float:
-    return sum(l.qty for l in open_lots(lots, symbol)
+def blocked_qty(lots, account_id: str, symbol: str, now: datetime) -> float:
+    return sum(l.qty for l in open_lots(lots, account_id, symbol)
                if not (l.is_hold_eligible(now) and l.is_settled(now)))
 
 

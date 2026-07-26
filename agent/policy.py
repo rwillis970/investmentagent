@@ -90,7 +90,14 @@ def initial_policy(version: str = "v1") -> TradeCapabilityPolicy:
         asset_class={"US_EQUITY": P, "ETF": P, "OPTIONS": D, "CRYPTO": D,
                      "FUTURES": D, "FOREX": D, "OTC": D, "SHORT_SELLING": D,
                      "MARGIN": D},
-        side={"BUY": P, "SELL": P, "SELL_SHORT": D, "BUY_TO_COVER": D},
+        side={"BUY": P, "SELL": P, "SELL_SHORT": D, "BUY_TO_COVER": D,
+             # CANCEL and CLOSE are order KINDS, not new market exposure --
+             # allowed by default so a capability change elsewhere can never
+             # trap an order in the market. REPLACE is deliberately absent:
+             # default-deny keeps it DISABLED until it's implemented (see
+             # pipeline.Gatekeeper.stage, which raises NotImplementedError
+             # for it before capability is even checked).
+             "CANCEL": P, "CLOSE": P},
         funding={"SETTLED_CASH": P, "MARGIN": D, "UNSETTLED_CASH": D},
         order_type={"LIMIT": P, "MARKET": P, "STOP": P, "STOP_LIMIT": P,
                     "TRAILING_STOP": PO},

@@ -2,13 +2,15 @@ from datetime import date, timedelta
 
 import pytest
 
+from agent.accounts import CrossAccountError
 from agent.daytrade import DayTradeBlocked, DayTradeGuard, PostureMismatch
 
 SESSIONS = [date(2026, 7, 20) + timedelta(days=i) for i in range(5)]
+ACCT = "acct-taxable"
 
 
 def test_fourth_day_trade_is_blocked():
-    g = DayTradeGuard(max_per_5_sessions=3)
+    g = DayTradeGuard(account_id=ACCT, max_per_5_sessions=3)
     for i in range(3):
         g.record(SESSIONS[i], "SPY")
     assert g.count(SESSIONS) == 3
@@ -17,14 +19,14 @@ def test_fourth_day_trade_is_blocked():
 
 
 def test_three_are_allowed():
-    g = DayTradeGuard(max_per_5_sessions=3)
+    g = DayTradeGuard(account_id=ACCT, max_per_5_sessions=3)
     g.record(SESSIONS[0], "SPY")
     g.record(SESSIONS[1], "QQQ")
     g.check(SESSIONS, posture="MARGIN_UNDER_25K")       # no raise
 
 
 def test_window_rolls_off_old_sessions():
-    g = DayTradeGuard(max_per_5_sessions=3)
+    g = DayTradeGuard(account_id=ACCT, max_per_5_sessions=3)
     old = SESSIONS[0] - timedelta(days=10)
     for _ in range(3):
         g.record(old, "SPY")
@@ -33,7 +35,7 @@ def test_window_rolls_off_old_sessions():
 
 
 def test_not_binding_above_the_threshold():
-    g = DayTradeGuard(max_per_5_sessions=3)
+    g = DayTradeGuard(account_id=ACCT, max_per_5_sessions=3)
     for i in range(4):
         g.record(SESSIONS[i], "SPY")
     g.check(SESSIONS, posture="MARGIN_OVER_25K")        # observed, not enforced
@@ -42,8 +44,15 @@ def test_not_binding_above_the_threshold():
 
 
 def test_broker_mismatch_halts():
-    g = DayTradeGuard()
+    g = DayTradeGuard(account_id=ACCT)
     g.record(SESSIONS[0], "SPY")
-    g.reconcile(1, SESSIONS)
+    g.reconcile(account_id=ACCT, broker_reported=1, sessions=SESSIONS)
     with pytest.raises(PostureMismatch, match="stale count"):
-        g.reconcile(3, SESSIONS)
+        g.reconcile(account_id=ACCT, broker_reported=3, sessions=SESSIONS)
+
+
+def test_reconcile_refuses_a_different_accounts_snapshot():
+    g = DayTradeGuard(account_id=ACCT)
+    g.record(SESSIONS[0], "SPY")
+    with pytest.raises(CrossAccountError):
+        g.reconcile(account_id="acct-ira", broker_reported=1, sessions=SESSIONS)
