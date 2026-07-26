@@ -193,7 +193,7 @@ score = w1 * abs(ret_since_open) / atr_20
       + w2 * log(volume_so_far / median_volume_same_time)
       + w3 * filing_weight[form_type, item_codes]
       + w4 * earnings_proximity(t)
-      + w5 * abs(ret - sector_ret) / atr_20      # idiosyncratic move
+      + w5 * abs(ret_since_open - sector_ret) / atr_20      # idiosyncratic move
       - w6 * analyses_today / max_model_analyses_per_day   # budget brake
 
 trigger if score >= threshold
