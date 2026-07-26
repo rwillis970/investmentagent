@@ -23,7 +23,8 @@ MODES = mode_fsm.CHAIN
 PROFILES = ("CONSERVATIVE", "MODERATE", "AGGRESSIVE", "CUSTOM")
 POSTURES = ("CASH", "MARGIN_UNDER_25K", "MARGIN_OVER_25K", "UNKNOWN")
 
-# Platform maxima — §6. Config is clamped against these, not the reverse.
+# Platform maxima — §6. Config is validated against these, not the reverse,
+# and rejected at load if it exceeds them — never clamped to them.
 MIN_HOLDING_FLOOR = timedelta(minutes=15)
 MIN_RESERVE_PCT_FLOOR = 5.0
 MIN_ABSOLUTE_CASH_FLOOR = 25.0
