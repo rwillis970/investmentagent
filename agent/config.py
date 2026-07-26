@@ -11,10 +11,15 @@ from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import Any
 
+from . import mode as mode_fsm
 from .durations import parse_duration
 from .policy import CapabilityStatus, TradeCapabilityPolicy
 
-MODES = ("DISABLED", "RESEARCH", "PAPER", "PRODUCTION_ACTIVE", "PAUSED")
+# The single source of truth for legal mode values is the transition chain in
+# agent.mode -- keeping a second, independent tuple here is exactly how the
+# two drift apart. §9.2 mode transition legality is a separate, opt-in check
+# (see check_mode_transition below); this tuple only proves membership.
+MODES = mode_fsm.CHAIN
 PROFILES = ("CONSERVATIVE", "MODERATE", "AGGRESSIVE", "CUSTOM")
 POSTURES = ("CASH", "MARGIN_UNDER_25K", "MARGIN_OVER_25K", "UNKNOWN")
 
@@ -27,6 +32,60 @@ MAX_POSITION_CEILING = 15.0
 MAX_SECTOR_CEILING = 35.0
 MAX_DRAWDOWN_CEILING = 20.0
 MIN_DECISION_INTERVAL_MINUTES = 15
+
+ONE_DAY = timedelta(days=1)
+AGGRESSIVE_MIN_HOLD = timedelta(hours=4)
+SUB_DAY_UNSAFE_POSTURES = ("CASH", "MARGIN_UNDER_25K")
+
+# §6: "the table is a preset table, not documentation of independent
+# fields." risk_profile selects the column; a field absent from config
+# takes the profile's value (see _apply_profile_defaults, called from
+# load() before Config is constructed -- a dataclass default can't tell
+# "explicitly 20.0" from "defaulted to 20.0", so the merge has to happen on
+# the raw dict). CUSTOM is deliberately absent from this table: it requires
+# every field explicit, with no fallback at all.
+PROFILE_FIELDS = (
+    "minimum_holding_period", "minimum_settled_cash_pct_of_nlv",
+    "minimum_absolute_settled_cash", "max_position_pct", "max_sector_pct",
+    "routine_decision_interval_minutes", "max_new_positions_per_day",
+    "drawdown_pause_pct", "trade_cooldown_period",
+)
+
+PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "CONSERVATIVE": {
+        "minimum_holding_period": "P14D",
+        "minimum_settled_cash_pct_of_nlv": 30.0,
+        "minimum_absolute_settled_cash": 100.0,
+        "max_position_pct": 3.0,
+        "max_sector_pct": 15.0,
+        "routine_decision_interval_minutes": 1440,
+        "max_new_positions_per_day": 1,
+        "drawdown_pause_pct": 4.0,
+        "trade_cooldown_period": "P30D",
+    },
+    "MODERATE": {
+        "minimum_holding_period": "P2D",
+        "minimum_settled_cash_pct_of_nlv": 20.0,
+        "minimum_absolute_settled_cash": 75.0,
+        "max_position_pct": 5.0,
+        "max_sector_pct": 20.0,
+        "routine_decision_interval_minutes": 240,
+        "max_new_positions_per_day": 3,
+        "drawdown_pause_pct": 7.0,
+        "trade_cooldown_period": "P5D",
+    },
+    "AGGRESSIVE": {
+        "minimum_holding_period": "PT4H",
+        "minimum_settled_cash_pct_of_nlv": 10.0,
+        "minimum_absolute_settled_cash": 50.0,
+        "max_position_pct": 10.0,
+        "max_sector_pct": 25.0,
+        "routine_decision_interval_minutes": 60,
+        "max_new_positions_per_day": 5,
+        "drawdown_pause_pct": 12.0,
+        "trade_cooldown_period": "P1D",
+    },
+}
 
 
 class ConfigError(ValueError):
@@ -110,8 +169,45 @@ def _statuses(raw: dict) -> dict:
     return out
 
 
-def load(raw: dict[str, Any]) -> Config:
-    """Build a Config from a plain dict, rejecting anything unrecognised."""
+def _apply_profile_defaults(raw: dict) -> dict:
+    """Merge in this profile's §6 defaults for any of PROFILE_FIELDS the
+    caller didn't set explicitly. CUSTOM gets no merge at all -- every field
+    must already be present, or this raises, naming what's missing.
+
+    An unrecognised risk_profile value is left untouched here; the existing
+    membership check in validate() reports it with the clearer, established
+    message rather than this function guessing.
+    """
+    profile = raw.get("risk_profile", Config.risk_profile)
+    if profile == "CUSTOM":
+        missing = [f for f in PROFILE_FIELDS if f not in raw]
+        if missing:
+            raise ConfigError(
+                "risk_profile CUSTOM requires every value explicit; no "
+                "implicit fallback (§6). Missing: " + ", ".join(missing)
+            )
+        return raw
+    defaults = PROFILE_DEFAULTS.get(profile)
+    if defaults is None:
+        return raw
+    merged = dict(defaults)
+    merged.update(raw)   # explicit config always wins over the profile
+    return merged
+
+
+def load(raw: dict[str, Any], *, check_mode_transition: bool = False,
+         persisted_mode: str | None = None, confirmed: bool = False) -> Config:
+    """Build a Config from a plain dict, rejecting anything unrecognised.
+
+    `check_mode_transition`, `persisted_mode` and `confirmed` are opt-in
+    (§9.2): a caller that doesn't pass them gets exactly the old membership
+    check, so every existing call site is unaffected. A real startup path
+    should pass `check_mode_transition=True` and the mode the system was
+    last persisted in -- see agent.mode.assert_legal_startup. There is no
+    persistence layer yet to source `persisted_mode` from automatically
+    (that lands with the run loop); until then this is the caller's
+    responsibility to supply.
+    """
     if not isinstance(raw, dict):
         raise ConfigError("config must be an object")
     known = {f.name for f in fields(Config)}
@@ -121,16 +217,28 @@ def load(raw: dict[str, Any]) -> Config:
             "unknown config key(s): " + ", ".join(unknown)
             + ". Refusing to start rather than apply a default."
         )
+    # Unknown-key check runs on the caller's literal input, above, before the
+    # profile merge -- the merge only ever adds already-known field names, so
+    # ordering here doesn't hide a typo either way, but checking the literal
+    # input first keeps the error about what the caller actually wrote.
+    raw = _apply_profile_defaults(raw)
     cfg = Config(**raw)
-    validate(cfg)
+    validate(cfg, check_mode_transition=check_mode_transition,
+             persisted_mode=persisted_mode, confirmed=confirmed)
     return cfg
 
 
-def validate(cfg: Config) -> None:
+def validate(cfg: Config, *, check_mode_transition: bool = False,
+            persisted_mode: str | None = None, confirmed: bool = False) -> None:
     err: list[str] = []
 
     if cfg.mode not in MODES:
         err.append(f"mode must be one of {MODES}")
+    elif check_mode_transition:
+        try:
+            mode_fsm.assert_legal_startup(persisted_mode, cfg.mode, confirmed=confirmed)
+        except mode_fsm.ModeTransitionError as exc:
+            err.append(str(exc))
     if cfg.risk_profile not in PROFILES:
         err.append(f"risk_profile must be one of {PROFILES}")
     if cfg.assert_account_posture not in POSTURES:
@@ -138,8 +246,10 @@ def validate(cfg: Config) -> None:
     if not cfg.require_human_trade_approval:
         err.append("require_human_trade_approval cannot be false in this release (§6)")
 
+    hold: timedelta | None = None
     try:
-        if cfg.minimum_hold < MIN_HOLDING_FLOOR:
+        hold = cfg.minimum_hold
+        if hold < MIN_HOLDING_FLOOR:
             err.append(f"minimum_holding_period below platform floor PT15M")
     except ValueError as exc:
         err.append(str(exc))
@@ -147,6 +257,27 @@ def validate(cfg: Config) -> None:
         cfg.cooldown
     except ValueError as exc:
         err.append(str(exc))
+
+    # §6: reject at load, never clamp. Both checks are about what the
+    # *combination* of risk_profile/hold/posture means, not about the hold
+    # value in isolation -- MIN_HOLDING_FLOOR above already covers that.
+    if hold is not None:
+        if cfg.risk_profile == "AGGRESSIVE" and hold < AGGRESSIVE_MIN_HOLD:
+            err.append(
+                f"risk_profile AGGRESSIVE requires minimum_holding_period >= "
+                f"PT4H (§6); got {cfg.minimum_holding_period}. A one-hour hold "
+                "reliably produces day trades and collides with §4.4."
+            )
+        if cfg.assert_account_posture in SUB_DAY_UNSAFE_POSTURES and hold < ONE_DAY:
+            err.append(
+                f"minimum_holding_period {cfg.minimum_holding_period} is "
+                f"sub-day but assert_account_posture is "
+                f"{cfg.assert_account_posture}; a cash or margin-under-25k "
+                "account cannot honour a sub-day hold (§4.4). The runtime "
+                "binding-constraint display is for an account whose posture "
+                "is *detected* to be this way after the fact -- it is not a "
+                "reason to let a config that already knows better load."
+            )
 
     if cfg.minimum_settled_cash_pct_of_nlv < MIN_RESERVE_PCT_FLOOR:
         err.append(f"minimum_settled_cash_pct_of_nlv below floor {MIN_RESERVE_PCT_FLOOR}")
