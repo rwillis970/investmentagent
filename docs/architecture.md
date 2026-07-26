@@ -234,7 +234,7 @@ triggers — can generate far more approval requests than a person can meaningfu
 evaluate, and an approval that is not meaningfully evaluated is not a control.
 
 The system therefore treats your attention as a scarce, metered resource. A hard daily cap
-on approval requests, defaulting to six. Competing candidates ranked by materiality so the
+on approval requests, defaulting to four. Competing candidates ranked by materiality so the
 cap is spent on the largest opportunities rather than the earliest. Batching of anything
 below the immediate-action bar into a single scheduled review. And a dashboard metric that
 tracks median time-to-decision and approve rate — if median decision time falls below
@@ -424,6 +424,15 @@ one-hour hold reliably produces day trades and collides with §4.4. And selectin
 Aggressive never touches capability policy — it cannot enable options, crypto, shorting,
 margin or extended hours, which remain independent of the risk profile by design.
 
+**The table is a preset table, not documentation of independent fields.** `risk_profile`
+selects the column; each setting takes that column's value unless explicitly overridden in
+config, and an override is clamped to the platform max. A profile that is validated for
+membership and then never read is not a risk profile — it is a label. Two rules follow:
+selecting a profile must actually change behaviour with no other config edits, and a
+combination the profile forbids must fail validation rather than load. Concretely,
+`risk_profile: "AGGRESSIVE"` with `minimum_holding_period: "PT1H"` is the misconfiguration
+this section exists to prevent, and it must be rejected at load, not merely clamped.
+
 ### 6.1 Reserve semantics
 
 The dual basis from Change Request §6.1 is adopted, and it is an improvement on v1.0: net
@@ -564,12 +573,15 @@ to keep the pilot short and to treat its P&L as noise, not a reason to hide the 
 ### 8.3 One gated path to broker-side effect
 
 Invariant #2 was previously stated as *one code path from store to orders* and enforced only
-where it was tested: the `submit` path. That is a point patch, not an invariant. Any second
+where it was tested: the `submit` path. That was a point patch, not an invariant. Any second
 method on the broker adapter that produces a broker-side effect is a second path, and it
 reaches the broker without a signed `StagedOrder`, without a capability re-check and
-without gate 4. This is not hypothetical: `cancel(client_order_id: str)` is abstract on the
-adapter today, takes a bare string, and is ungated. It is the same hole, already merged,
-lower consequence only because it reduces exposure rather than creating it.
+without gate 4. The hole was not hypothetical: `cancel(client_order_id: str)` was abstract on the
+adapter, took a bare string, and was ungated — the same hole as `submit`, already merged,
+lower consequence only because it reduces exposure rather than creating it. It was closed in
+commit 556e2c2, together with the `__init_subclass__` tripwire and the submit-signature
+test. What follows specifies the invariant that fix has to keep satisfying; it is not a
+report of a live defect.
 
 The invariant is therefore restated at the interface level, before a concrete broker
 adapter exists to be refactored around it. **Every broker-side effect is an order kind, and
@@ -624,9 +636,13 @@ valid token.
 
 ### 9.1 Configuration example
 
+This is `config.example.json` as it exists in the repository. It is kept in sync with the
+schema `config.py` validates; loading it verbatim must succeed, and an unknown key must be
+rejected.
+
 ```json
 {
-  "mode": "PRODUCTION_ACTIVE",
+  "mode": "PAPER",
   "require_human_trade_approval": true,
   "risk_profile": "MODERATE",
   "assert_account_posture": "CASH",
@@ -634,15 +650,19 @@ valid token.
   "minimum_absolute_settled_cash": 75,
   "minimum_holding_period": "P2D",
   "trade_cooldown_period": "P5D",
+  "max_position_pct": 5,
+  "max_sector_pct": 20,
+  "drawdown_pause_pct": 7,
   "data_collection_interval_seconds": 60,
   "event_feed_interval_minutes": 5,
   "opportunity_screen_interval_minutes": 5,
   "routine_decision_interval_minutes": 240,
-  "full_portfolio_review_schedule": ["09:45", "12:30", "15:45"],
   "event_driven_analysis_enabled": true,
   "approval_expiration_minutes": 30,
+  "approval_min_display_seconds": 10,
   "max_model_analyses_per_day": 8,
   "max_approval_requests_per_day": 4,
+  "max_new_positions_per_day": 3,
   "max_day_trades_per_5_sessions": 3,
   "monthly_budget_usd": 20,
   "budget_warning_usd": 15,
@@ -658,6 +678,17 @@ valid token.
     "FOREX": "DISABLED",
     "OTC": "DISABLED"
   },
+  "sides": {
+    "BUY": "PRODUCTION_ALLOWED",
+    "SELL": "PRODUCTION_ALLOWED",
+    "SELL_SHORT": "DISABLED",
+    "BUY_TO_COVER": "DISABLED"
+  },
+  "funding": {
+    "SETTLED_CASH": "PRODUCTION_ALLOWED",
+    "MARGIN": "DISABLED",
+    "UNSETTLED_CASH": "DISABLED"
+  },
   "order_types": {
     "LIMIT": "PRODUCTION_ALLOWED",
     "MARKET": "PRODUCTION_ALLOWED",
@@ -670,7 +701,25 @@ valid token.
 ```
 
 `assert_account_posture` is asserted, then verified against the broker; a mismatch halts
-trading.
+trading. `full_portfolio_review_schedule` is not yet a field — scheduled reviews arrive with
+the cadence loop (Day 4), and the key must be added to the schema in the same commit that
+reads it.
+
+### 9.2 Mode transitions
+
+Mode is not a free-text field and membership validation is not sufficient. The legal
+transitions are:
+
+```
+DISABLED  ⇄  RESEARCH  ⇄  PAPER  ⇄  PRODUCTION_ACTIVE  ⇄  PAUSED
+```
+
+Forward movement is one step at a time and requires re-authentication and explicit
+confirmation at the PAPER → PRODUCTION_ACTIVE edge. Any transition to DISABLED or PAUSED is
+immediate and unconditional, from any state. Loading a config that names a mode more than
+one step ahead of the persisted current mode is a startup error, not a silent adoption —
+otherwise "DISABLED to PRODUCTION_ACTIVE in one step is impossible" (§12 criterion 3, and
+the Day-1 exit criterion in §11) is enforced by nothing.
 
 ---
 
@@ -1164,3 +1213,7 @@ plus a versioned `CapabilityChangeRequest` per §5.
 | v1.1 | Revision of v1.0 per Change Request v1.1. |
 | v1.1 + §8.3 | Invariant #2 restated at the `BrokerAdapter` interface: every broker-side effect is a staged, signed order kind. Adds the order-kind table, gates `cancel`, defers `REPLACE`. Acceptance criterion 21 added. |
 | v1.1 fix | §13 model budget corrected to $20/$30 (was $75/$100, contradicting §1.2 and §8.2). |
+| v1.1 fix | Approval cap standardised at 4/day; §3.4's prose said six, §3.1 and §9.1 said four, and the code had already standardised on four. |
+| v1.1 fix | §9.1 config example replaced with the repository's actual `config.example.json`. The previous example omitted `sides`, `funding`, `max_position_pct`, `max_sector_pct`, `drawdown_pause_pct`, `max_new_positions_per_day` and `approval_min_display_seconds`, and included `full_portfolio_review_schedule`, which the schema does not yet accept. |
+| v1.1 add | §9.2 mode transitions written out explicitly. Criterion 3 and the Day-1 exit criterion require a transition guard; membership validation alone does not provide one. |
+| v1.1 add | §6 states that the profile table is a preset table — `risk_profile` must drive the defaults and reject contradictory overrides, not sit unread beside independent fields. |

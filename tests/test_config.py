@@ -95,6 +95,45 @@ def test_shorting_and_margin_funding_must_stay_disabled():
                              "UNSETTLED_CASH": "DISABLED"}))
 
 
+def test_check_mode_transition_is_opt_in_and_off_by_default():
+    """Every existing call site in this file loads config.example.json's
+    mode: "PAPER" with no persisted history at all. That must keep working
+    exactly as before -- the §9.2 guard only engages when a caller asks for
+    it. (If it engaged by default, this would raise: PAPER is two steps from
+    the implicit DISABLED baseline via RESEARCH.)"""
+    cfg = C.load(base())
+    assert cfg.mode == "PAPER"
+
+
+def test_disabled_install_loading_production_active_fails_to_start():
+    """The literal scenario §9.2 and §12 criterion 3 name: a DISABLED-state
+    install loading mode: "PRODUCTION_ACTIVE" must fail to start, not warn
+    and not clamp."""
+    with pytest.raises(C.ConfigError, match="not reachable in one step"):
+        C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True,
+               persisted_mode="DISABLED")
+
+
+def test_no_persisted_mode_defaults_to_disabled_baseline_not_anything_goes():
+    with pytest.raises(C.ConfigError, match="not reachable in one step"):
+        C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True)
+
+
+def test_paper_to_production_active_needs_confirmation_through_load():
+    with pytest.raises(C.ConfigError, match="requires explicit confirmation"):
+        C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True,
+               persisted_mode="PAPER")
+    cfg = C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True,
+                 persisted_mode="PAPER", confirmed=True)
+    assert cfg.mode == "PRODUCTION_ACTIVE"
+
+
+def test_kill_switch_targets_load_from_anywhere_even_with_the_guard_on():
+    for persisted in C.MODES:
+        C.load(base(mode="DISABLED"), check_mode_transition=True, persisted_mode=persisted)
+        C.load(base(mode="PAUSED"), check_mode_transition=True, persisted_mode=persisted)
+
+
 def test_config_policy_permits_a_normal_long_order():
     """The config-driven policy must actually allow a working live order —
     an omitted dimension would default-deny everything, silently."""
