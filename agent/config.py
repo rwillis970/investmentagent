@@ -13,6 +13,7 @@ from typing import Any
 
 from . import mode as mode_fsm
 from .durations import parse_duration
+from .materiality import MaterialityPolicy
 from .policy import CapabilityStatus, TradeCapabilityPolicy
 
 # The single source of truth for legal mode values is the transition chain in
@@ -120,6 +121,24 @@ class Config:
     max_new_positions_per_day: int = 3
     max_day_trades_per_5_sessions: int = 3
 
+    # T3 materiality screen (§3.2). w1-w6 and materiality_threshold are
+    # UNCALIBRATED PLACEHOLDERS -- the Day-11 calibration harness that solves
+    # for a threshold against a declared analysis budget is a separate,
+    # not-yet-built unit (see agent/materiality.py's module docstring).
+    # threshold_version names the whole vector as one unit: changing the
+    # threshold changes what the system trades, so it is a policy version,
+    # not a bare float (§3.2). It shares its name with the identical field
+    # already on RunManifest and OpportunityEvent rather than being prefixed
+    # like the weights, to stay one name across all three.
+    materiality_w1: float = 1.0
+    materiality_w2: float = 1.0
+    materiality_w3: float = 1.0
+    materiality_w4: float = 1.0
+    materiality_w5: float = 1.0
+    materiality_w6: float = 1.0
+    materiality_threshold: float = 2.0
+    threshold_version: str = "materiality-v1-uncalibrated"
+
     monthly_budget_usd: float = 20.0
     budget_warning_usd: float = 15.0
     budget_hard_stop_usd: float = 30.0
@@ -157,6 +176,16 @@ class Config:
         # Not relaxable while the pilot is running (§6). Kept as a property so
         # no caller can flip the field on a frozen instance and proceed.
         return True
+
+    @property
+    def materiality_policy(self) -> MaterialityPolicy:
+        return MaterialityPolicy(
+            version=self.threshold_version,
+            w1=self.materiality_w1, w2=self.materiality_w2,
+            w3=self.materiality_w3, w4=self.materiality_w4,
+            w5=self.materiality_w5, w6=self.materiality_w6,
+            threshold=self.materiality_threshold,
+        )
 
 
 def _statuses(raw: dict) -> dict:
@@ -305,6 +334,19 @@ def validate(cfg: Config, *, check_mode_transition: bool = False,
 
     if cfg.max_new_positions_per_day > cfg.max_approval_requests_per_day:
         err.append("max_new_positions_per_day cannot exceed max_approval_requests_per_day (§3.4)")
+
+    # §3.2: a negative weight would flip a term's intended direction --
+    # most dangerously w6, whose sign is already fixed by the score formula
+    # itself (`- w6 * ...`); a negative w6 would turn the budget brake into
+    # a budget accelerant. Rejected at load, same direction as everything
+    # else in this file.
+    for name in ("materiality_w1", "materiality_w2", "materiality_w3",
+                 "materiality_w4", "materiality_w5", "materiality_w6"):
+        if getattr(cfg, name) < 0:
+            err.append(f"{name} cannot be negative (§3.2)")
+    if not cfg.threshold_version:
+        err.append("threshold_version must be set; a threshold change is a policy "
+                   "version, never an unversioned float (§3.2)")
     if cfg.max_day_trades_per_5_sessions > 3:
         err.append("max_day_trades_per_5_sessions above 3 risks a PDT restriction (§4.4)")
     if not cfg.budget_warning_usd < cfg.monthly_budget_usd <= cfg.budget_hard_stop_usd:

@@ -134,6 +134,46 @@ def test_kill_switch_targets_load_from_anywhere_even_with_the_guard_on():
         C.load(base(mode="PAUSED"), check_mode_transition=True, persisted_mode=persisted)
 
 
+def test_example_config_carries_materiality_defaults():
+    """§3.2, §9.1: the keys are added in the same commit that reads them,
+    and the example still loads verbatim."""
+    cfg = C.load(base())
+    assert cfg.threshold_version == "materiality-v1-uncalibrated"
+    assert cfg.materiality_threshold == 2.0
+    assert cfg.materiality_w1 == 1.0
+
+
+def test_materiality_policy_property_matches_the_config_fields():
+    cfg = C.load(base())
+    pol = cfg.materiality_policy
+    assert pol.version == cfg.threshold_version
+    assert (pol.w1, pol.w2, pol.w3, pol.w4, pol.w5, pol.w6) == (
+        cfg.materiality_w1, cfg.materiality_w2, cfg.materiality_w3,
+        cfg.materiality_w4, cfg.materiality_w5, cfg.materiality_w6,
+    )
+    assert pol.threshold == cfg.materiality_threshold
+
+
+@pytest.mark.parametrize("field", ["materiality_w1", "materiality_w2", "materiality_w3",
+                                   "materiality_w4", "materiality_w5", "materiality_w6"])
+def test_negative_materiality_weight_is_rejected(field):
+    with pytest.raises(C.ConfigError, match=f"{field} cannot be negative"):
+        C.load(base(**{field: -0.1}))
+
+
+def test_empty_threshold_version_is_rejected():
+    with pytest.raises(C.ConfigError, match="threshold_version must be set"):
+        C.load(base(threshold_version=""))
+
+
+def test_only_materiality_weights_changing_changes_the_derived_policy():
+    """Mirrors the risk-profile invariant: a config change must actually
+    change observable behaviour, not sit unread beside the score function."""
+    default_policy = C.load(base()).materiality_policy
+    changed_policy = C.load(base(materiality_w1=9.0)).materiality_policy
+    assert default_policy.w1 != changed_policy.w1
+
+
 def test_config_policy_permits_a_normal_long_order():
     """The config-driven policy must actually allow a working live order —
     an omitted dimension would default-deny everything, silently."""
