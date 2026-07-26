@@ -150,6 +150,29 @@ def test_day_trade_gate_is_skipped_when_the_order_is_not_a_round_trip():
     assert "day_trade" not in o.gates_passed
 
 
+def test_day_trade_gate_rolls_off_as_now_advances():
+    """The day-trade gate has no wall-clock coupling to pin: `now` is a
+    required, caller-supplied argument to stage() with no fallback, and
+    as_of is derived from it fresh on every call (agent/daytrade.py DECISION
+    2). This proves that derivation end-to-end through stage() itself, not
+    just against DayTradeGuard directly (see test_daytrade.py): the same
+    three round trips that block staging at T0 no longer count once `now`
+    is advanced past the real trailing five-session window, with no other
+    state changed."""
+    gk = keeper()
+    for i in range(3):
+        gk.day_trade_guard.record(SESSIONS[i], "SPY")
+    with pytest.raises(Rejected) as exc:
+        stage(gk, opens_day_trade=True, now=T0)
+    assert exc.value.gate == "day_trade"
+
+    # 2026-07-27's real trailing five sessions are [7/21, 22, 23, 24, 27] --
+    # none of the three recorded round trips (7/14, 15, 16) are in it.
+    later = datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc)
+    o = stage(gk, opens_day_trade=True, now=later)
+    assert "day_trade" in o.gates_passed
+
+
 # --------------------------------------------------------------- risk gate
 
 def test_buy_exceeding_investable_cash_is_resized_not_rejected():

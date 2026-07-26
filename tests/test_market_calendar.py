@@ -10,11 +10,13 @@ DECISION 1 (hardcoded table vs. calendar library) and DECISION 2
 and agent/daytrade.py's module docstrings, and restated in the delivery
 report.
 """
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from agent.market_calendar import (MAX_YEAR, MIN_YEAR, CalendarCoverageError,
+                                   CalendarExpiryError, _EXPIRY_WARNING_DAYS,
+                                   assert_calendar_coverage_at_startup,
                                    is_early_close, is_trading_day,
                                    session_for_instant, session_times,
                                    settlement_date, trailing_sessions)
@@ -247,3 +249,75 @@ def test_the_table_has_not_yet_expired():
         f"today is {today}. Extend the table before relying on this "
         "calendar for anything -- do not silently keep using stale data."
     )
+
+
+# ---------------------------------------- startup coverage check (§8.1)
+#
+# The last-resort mid-order raise (_check_range, exercised above) stays
+# exactly as it is. This is a second, earlier check meant to be called once
+# at process startup -- refusing PRODUCTION_ACTIVE outright once the table
+# is actually exhausted, and warning well before that for every mode so a
+# human has time to extend MIN_YEAR/MAX_YEAR before it becomes a refusal.
+
+_LAST_COVERED = date(MAX_YEAR, 12, 31)
+
+
+def test_well_before_expiry_no_mode_gets_a_warning():
+    today = _LAST_COVERED - timedelta(days=_EXPIRY_WARNING_DAYS + 1)
+    assert assert_calendar_coverage_at_startup("PRODUCTION_ACTIVE", today=today) is None
+    assert assert_calendar_coverage_at_startup("PAPER", today=today) is None
+
+
+def test_inside_the_warning_window_every_mode_gets_a_warning_not_a_refusal():
+    today = _LAST_COVERED - timedelta(days=_EXPIRY_WARNING_DAYS)
+    for mode in ("RESEARCH", "PAPER", "PRODUCTION_ACTIVE", "PAUSED"):
+        warning = assert_calendar_coverage_at_startup(mode, today=today)
+        assert warning is not None
+        assert str(MAX_YEAR) in warning
+
+
+def test_on_the_last_covered_day_itself_still_only_warns():
+    """Exactly MAX_YEAR-12-31 is still covered -- 0 days past it, not past
+    it -- so this is a warning (loudly due, `_EXPIRY_WARNING_DAYS` away by
+    definition of the window), never a refusal."""
+    warning = assert_calendar_coverage_at_startup("PRODUCTION_ACTIVE", today=_LAST_COVERED)
+    assert warning is not None
+
+
+def test_past_the_table_production_active_refuses_to_start():
+    with pytest.raises(CalendarExpiryError):
+        assert_calendar_coverage_at_startup(
+            "PRODUCTION_ACTIVE", today=_LAST_COVERED + timedelta(days=1)
+        )
+    # Not just the boundary year -- still refuses years further out too.
+    with pytest.raises(CalendarExpiryError):
+        assert_calendar_coverage_at_startup(
+            "PRODUCTION_ACTIVE", today=date(MAX_YEAR + 2, 3, 1)
+        )
+
+
+def test_calendar_expiry_error_is_a_calendar_coverage_error():
+    """Same family as the mid-order last-resort raise -- a caller that
+    already catches CalendarCoverageError catches this too -- but a
+    distinct subclass, so a caller (or a test) can tell 'refused at
+    startup' apart from 'blew up mid-order' if it needs to."""
+    assert issubclass(CalendarExpiryError, CalendarCoverageError)
+
+
+def test_past_the_table_non_production_modes_warn_instead_of_raising():
+    for mode in ("RESEARCH", "PAPER", "PAUSED"):
+        warning = assert_calendar_coverage_at_startup(
+            mode, today=_LAST_COVERED + timedelta(days=1)
+        )
+        assert warning is not None
+        assert str(MAX_YEAR) in warning
+
+
+def test_the_warning_window_is_a_named_constant_not_a_magic_number():
+    """Locks in the chosen window so a change to it is a deliberate, visible
+    diff rather than a silent drift. 90 days (~1 calendar quarter): long
+    enough that a human maintaining a hardcoded table on no fixed release
+    cadence has real lead time to extend it before PRODUCTION_ACTIVE is
+    refused outright, short enough that the warning doesn't start firing
+    years in advance and become noise."""
+    assert _EXPIRY_WARNING_DAYS == 90

@@ -81,6 +81,29 @@ class CalendarCoverageError(Exception):
     or a wrong settlement date."""
 
 
+class CalendarExpiryError(CalendarCoverageError):
+    """Raised by `assert_calendar_coverage_at_startup`, not by any per-query
+    function above -- this fires once, at process startup, before
+    PRODUCTION_ACTIVE is allowed to begin live trading against a table with
+    no verified coverage for the current date. Same family as
+    CalendarCoverageError (a caller that already catches that catches this),
+    but a distinct subclass so 'refused at startup' can be told apart from
+    'blew up mid-order' when that distinction matters. `_check_range` is
+    unchanged and still raises the base class as the last resort mid-order
+    for any caller that reaches an out-of-range date some other way (a
+    non-PRODUCTION_ACTIVE mode, or a bug elsewhere) -- this is an earlier,
+    louder check for the highest-stakes mode, not a replacement for that."""
+
+
+# §8.1 startup check window. 90 days is about one calendar quarter: long
+# enough that a human maintaining a hardcoded table with no fixed release
+# cadence has real lead time to extend MIN_YEAR/MAX_YEAR before
+# PRODUCTION_ACTIVE is refused outright, short enough that the warning
+# doesn't start firing years in advance and become noise that's easy to
+# tune out.
+_EXPIRY_WARNING_DAYS = 90
+
+
 # Full-day closures, MIN_YEAR-MAX_YEAR inclusive. New Year's Day, Independence
 # Day and Christmas Day are shifted under the observed-day rule (a Saturday
 # holiday observed the preceding Friday, a Sunday holiday the following
@@ -141,6 +164,61 @@ def _check_range(d: date, *, where: str) -> None:
             "a wrong one. Extend MIN_YEAR/MAX_YEAR and the holiday tables "
             "in agent/market_calendar.py against NYSE's published schedule."
         )
+
+
+def assert_calendar_coverage_at_startup(mode: str, *, today: date) -> str | None:
+    """§8.1 startup sequence: reconcile -> verify audit hash chain -> expire
+    stale approvals -> resume. This is a coverage check meant to run once
+    during that sequence, before any order can be staged -- so the table's
+    MAX_YEAR limit surfaces as a startup refusal or warning, not as a
+    CalendarCoverageError raised from inside the order path on the first
+    live trade past coverage.
+
+    Returns a warning string if `today` is within `_EXPIRY_WARNING_DAYS` of
+    the table's last covered date (inclusive) but not yet past it, or if
+    `today` is past it and `mode` is anything other than PRODUCTION_ACTIVE.
+    Returns None if there is nothing to say.
+
+    Raises CalendarExpiryError if `mode` is PRODUCTION_ACTIVE and `today` is
+    already past the table's last covered date -- refusing to start live
+    trading against a calendar with no verified coverage for the current
+    date, rather than letting the first live order of the next year
+    discover it. RESEARCH and PAPER do not move real money and are left to
+    run; they remain bounded by `_check_range`'s last-resort raise on any
+    calendar query that actually falls out of range.
+
+    Does not itself validate that `mode` is a known mode (see agent.mode) --
+    it only recognises the literal string "PRODUCTION_ACTIVE" as the one
+    value that changes a warning into a refusal.
+    """
+    last_covered = date(MAX_YEAR, 12, 31)
+    if today > last_covered:
+        if mode == "PRODUCTION_ACTIVE":
+            raise CalendarExpiryError(
+                f"market calendar table is verified only through {last_covered} "
+                f"(MAX_YEAR={MAX_YEAR}); current date is {today}. Refusing to "
+                "start PRODUCTION_ACTIVE rather than discover this on the "
+                "first live order of the new year (§8.1). Extend MIN_YEAR/"
+                "MAX_YEAR and the _HOLIDAYS/_EARLY_CLOSES tables in "
+                "agent/market_calendar.py against NYSE's published schedule "
+                "before starting live trading again."
+            )
+        return (
+            f"market calendar table is verified only through {last_covered} "
+            f"(MAX_YEAR={MAX_YEAR}); current date is {today}. {mode} may "
+            "continue, but any calendar query that actually falls out of "
+            "range will still raise CalendarCoverageError; extend the table "
+            "before promoting to PRODUCTION_ACTIVE."
+        )
+    if today >= last_covered - timedelta(days=_EXPIRY_WARNING_DAYS):
+        return (
+            f"market calendar table coverage ends {last_covered} "
+            f"({(last_covered - today).days} day(s) away). Extend MIN_YEAR/"
+            "MAX_YEAR and the _HOLIDAYS/_EARLY_CLOSES tables in "
+            "agent/market_calendar.py before then, or PRODUCTION_ACTIVE will "
+            "refuse to start once it passes."
+        )
+    return None
 
 
 def is_trading_day(d: date) -> bool:
