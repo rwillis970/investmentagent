@@ -9,10 +9,12 @@ in one step is impossible" passed trivially: nothing asserted it at all.
 
 Forward movement is one step at a time. DISABLED and PAUSED are reachable
 immediately and unconditionally from any state -- the kill-switch ends of
-the chain. PAPER -> PRODUCTION_ACTIVE additionally requires explicit
-confirmation (real re-authentication against live credentials is a Day-10
-concern and out of scope here; this module only enforces that the edge
-cannot be crossed silently by config alone).
+the chain. Both edges into PRODUCTION_ACTIVE -- from PAPER and from PAUSED --
+additionally require explicit confirmation (real re-authentication against
+live credentials is a Day-10 concern and out of scope here; this module only
+enforces that neither edge can be crossed silently by config alone). PAUSED
+itself stays reachable unconditionally: only resuming OUT of it into live
+trading is gated, never entering it.
 """
 import pytest
 
@@ -97,12 +99,25 @@ def test_paper_to_production_active_requires_confirmation():
     M.assert_legal_startup("PAPER", "PRODUCTION_ACTIVE", confirmed=True)
 
 
-def test_confirmation_is_scoped_to_the_paper_to_production_active_edge_only():
-    """Every other legal edge, including the reverse of the guarded one,
-    needs no confirmation flag at all."""
+def test_paused_to_production_active_also_requires_confirmation():
+    """Resuming into live trading after a pause is not exempt from the same
+    re-authentication §9.2 requires of the initial PAPER promotion --
+    resuming after any pause, including an operator-initiated one, is
+    exactly the moment confirmation matters most."""
+    with pytest.raises(M.ConfirmationRequired):
+        M.assert_legal_startup("PAUSED", "PRODUCTION_ACTIVE")
+    with pytest.raises(M.ConfirmationRequired):
+        M.assert_legal_startup("PAUSED", "PRODUCTION_ACTIVE", confirmed=False)
+    # Does not raise when confirmed.
+    M.assert_legal_startup("PAUSED", "PRODUCTION_ACTIVE", confirmed=True)
+
+
+def test_confirmation_is_required_on_both_edges_into_production_active_and_nowhere_else():
+    """Every other legal edge -- including the reverse of either guarded
+    edge, and entering PAUSED itself -- needs no confirmation flag at all."""
     M.assert_legal_startup("PRODUCTION_ACTIVE", "PAPER")  # backward, no confirm needed
     M.assert_legal_startup("RESEARCH", "PAPER")
-    M.assert_legal_startup("PRODUCTION_ACTIVE", "PAUSED")
+    M.assert_legal_startup("PRODUCTION_ACTIVE", "PAUSED")  # entering PAUSED: unguarded
     M.assert_legal_startup("DISABLED", "PAUSED")
 
 
@@ -114,8 +129,13 @@ def test_illegal_jump_is_reported_even_with_confirmed_true():
 
 
 def test_pause_and_resume_round_trip():
+    """Pausing needs no confirmation -- PAUSED is a kill-switch target.
+    Resuming from it back into PRODUCTION_ACTIVE does, same as the initial
+    PAPER -> PRODUCTION_ACTIVE promotion."""
     M.assert_legal_startup("PRODUCTION_ACTIVE", "PAUSED")
-    M.assert_legal_startup("PAUSED", "PRODUCTION_ACTIVE")
+    with pytest.raises(M.ConfirmationRequired):
+        M.assert_legal_startup("PAUSED", "PRODUCTION_ACTIVE")
+    M.assert_legal_startup("PAUSED", "PRODUCTION_ACTIVE", confirmed=True)
 
 
 def test_unknown_persisted_or_target_mode_is_a_readable_error():

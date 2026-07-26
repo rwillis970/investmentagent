@@ -14,11 +14,14 @@ because a kill switch must never be blocked by the same state machine it
 exists to override -- PAUSED is three steps from DISABLED on the chain, and
 that transition still has to be immediate.
 
-The PAPER -> PRODUCTION_ACTIVE edge additionally requires explicit
-confirmation. Real re-authentication against live broker credentials is a
-Day-10 concern (a separate keychain entry, a separate process) and is out of
-scope here; this module only guarantees the edge cannot be crossed silently
-by a config value alone -- `confirmed` is the config-level half of that gate.
+The PAPER -> PRODUCTION_ACTIVE and PAUSED -> PRODUCTION_ACTIVE edges
+additionally require explicit confirmation -- resuming into live trading
+after a pause is not exempt from the same re-authentication the initial
+promotion requires. Real re-authentication against live broker credentials is
+a Day-10 concern (a separate keychain entry, a separate process) and is out
+of scope here; this module only guarantees neither edge can be crossed
+silently by a config value alone -- `confirmed` is the config-level half of
+that gate.
 """
 from __future__ import annotations
 
@@ -30,8 +33,16 @@ CHAIN = ("DISABLED", "RESEARCH", "PAPER", "PRODUCTION_ACTIVE", "PAUSED")
 IMMEDIATE_TARGETS = frozenset({"DISABLED", "PAUSED"})
 
 # Edges that are legal one-step moves but additionally require explicit
-# confirmation before they may be taken.
-CONFIRMATION_REQUIRED = frozenset({("PAPER", "PRODUCTION_ACTIVE")})
+# confirmation before they may be taken. Both edges land on
+# PRODUCTION_ACTIVE: the initial promotion from PAPER, and resuming into it
+# from a PAUSED state. Pausing itself (the reverse direction, into PAUSED)
+# is deliberately NOT in this set -- PAUSED is a kill-switch target and must
+# stay reachable unconditionally; only the way back out to live trading is
+# gated.
+CONFIRMATION_REQUIRED = frozenset({
+    ("PAPER", "PRODUCTION_ACTIVE"),
+    ("PAUSED", "PRODUCTION_ACTIVE"),
+})
 
 _POSITION = {name: i for i, name in enumerate(CHAIN)}
 
@@ -58,10 +69,12 @@ def _check_known(value: str, *, where: str) -> None:
 
 def is_legal_step(persisted: str, target: str) -> bool:
     """Whether `target` is directly reachable in one step from `persisted`,
-    per §9.2. Ignores the confirmation requirement on the guarded edge --
+    per §9.2. Ignores the confirmation requirement on either guarded edge --
     that is a separate concern, checked by `assert_legal_startup`, because
     "is this edge on the graph" and "has this edge been confirmed" are
-    different questions with different failure modes."""
+    different questions with different failure modes. PAUSED -> PRODUCTION_
+    ACTIVE is still a legal *step* under this function even though
+    `assert_legal_startup` will refuse it without confirmation."""
     _check_known(persisted, where="is_legal_step")
     _check_known(target, where="is_legal_step")
     if target == persisted:

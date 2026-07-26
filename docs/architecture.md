@@ -426,12 +426,34 @@ margin or extended hours, which remain independent of the risk profile by design
 
 **The table is a preset table, not documentation of independent fields.** `risk_profile`
 selects the column; each setting takes that column's value unless explicitly overridden in
-config, and an override is clamped to the platform max. A profile that is validated for
-membership and then never read is not a risk profile — it is a label. Two rules follow:
-selecting a profile must actually change behaviour with no other config edits, and a
-combination the profile forbids must fail validation rather than load. Concretely,
-`risk_profile: "AGGRESSIVE"` with `minimum_holding_period: "PT1H"` is the misconfiguration
-this section exists to prevent, and it must be rejected at load, not merely clamped.
+config, and an override outside the platform max is rejected at load, not clamped to it. A
+profile that is validated for membership and then never read is not a risk profile — it is a
+label. Two rules follow: selecting a profile must actually change behaviour with no other
+config edits, and a combination the profile forbids must fail validation rather than load.
+Concretely, `risk_profile: "AGGRESSIVE"` with `minimum_holding_period: "PT1H"` is the
+misconfiguration this section exists to prevent, and it must be rejected at load, not merely
+clamped.
+
+**Consequence: AGGRESSIVE is unloadable at the pilot's actual cash posture, for two
+independent reasons.** AGGRESSIVE's own `PT4H` minimum hold is sub-day, and §4.4's rule that
+a cash or margin-under-25k account cannot honour a sub-day hold applies at load, not only at
+runtime — so `risk_profile: "AGGRESSIVE"` with `assert_account_posture: "CASH"` (the pilot's
+actual posture at $500 capital; `assert_account_posture` itself defaults to `UNKNOWN`, not
+`CASH`, so this only surfaces once the posture is asserted honestly) fails validation on that
+basis alone. Separately, and regardless of posture, AGGRESSIVE's own
+`max_new_positions_per_day: 5` exceeds the platform default `max_approval_requests_per_day:
+4` (§3.4) — a config that only changes `risk_profile` to `AGGRESSIVE` and nothing else fails
+for this reason even before the posture question comes up. Both failures are independent:
+fixing one and not the other still refuses to load. Neither constraint is relaxed for
+AGGRESSIVE. An account whose posture is later *detected* to be cash or margin-under-25k has
+to fail the same way even if config guessed differently, so weakening the sub-day/posture
+rule here would only move that failure from load time to runtime, silently — and the
+approval-cap relationship in §3.4 does not carry a risk-profile exception either. Loading
+AGGRESSIVE for real therefore requires both `assert_account_posture: "MARGIN_OVER_25K"` (an
+account posture that then still has to be confirmed against the broker before trading
+starts, per §9.1) and an explicit `max_approval_requests_per_day` override of at least 5 —
+which is to say, AGGRESSIVE is not usable in this pilot's actual $500 cash-account
+deployment at all, by design, not by oversight.
 
 ### 6.1 Reserve semantics
 
@@ -458,6 +480,21 @@ investable_cash  = settled_cash
 Neither the model nor the playbook optimiser can write any reserve field. This is enforced
 the same way capability status is: separate write path, import boundary, and a test
 asserting that no model-originated artefact can reach the configuration table.
+
+**A BUY that exceeds investable cash is resized, not rejected.** Risk is applied to the
+target weight vector, not per order (§1, §6.1): staging a BUY builds the post-trade target
+weight for the whole book and runs it through the one shared constrainer, which clips
+per-name and sector caps, then scales the entire vector down if its total notional exceeds
+investable cash. If that scaling brings the requested symbol's authorised weight below what
+was asked but still above zero, the order is sized down to what the reserve actually permits
+rather than refused outright; it is rejected only when the authorised weight comes back at
+zero. This is deliberately different from this section's own reject-at-load rule for an
+out-of-range risk-profile override: that rule governs a *configuration* value at load time,
+where there is no partial-credit notion of "half a valid config" to fall back to, so the only
+sound response to an invalid combination is to refuse to start. A BUY's target weight, by
+contrast, is a runtime quantity with a well-defined smaller value that still satisfies every
+constraint — so resizing to it is not a laxer version of the same rule, it is the correct
+behaviour for a different kind of decision, at a different layer.
 
 ---
 
@@ -580,11 +617,11 @@ without gate 4. The hole was not hypothetical: `cancel(client_order_id: str)` wa
 adapter, took a bare string, and was ungated — the same hole as `submit`, already merged,
 lower consequence only because it reduces exposure rather than creating it. It was closed in
 commit 556e2c2, together with the `__init_subclass__` tripwire and the submit-signature
-test. What follows specifies the invariant that fix has to keep satisfying; it is not a
-report of a live defect.
+test. What follows records the invariant that fix had to satisfy; it is a report of a closed
+defect, not a still-open concern.
 
-The invariant is therefore restated at the interface level, before a concrete broker
-adapter exists to be refactored around it. **Every broker-side effect is an order kind, and
+The invariant was therefore restated at the interface level, before a concrete broker
+adapter existed to be refactored around it. **Every broker-side effect is an order kind, and
 every order kind is staged.** The adapter's public surface is the staging call; adapters
 implement private `_*_impl` methods that are unreachable without a Gatekeeper-signed token.
 A convenience wrapper — `replace_order`, `close_position` — is not a new method; it is a
@@ -715,8 +752,11 @@ DISABLED  ⇄  RESEARCH  ⇄  PAPER  ⇄  PRODUCTION_ACTIVE  ⇄  PAUSED
 ```
 
 Forward movement is one step at a time and requires re-authentication and explicit
-confirmation at the PAPER → PRODUCTION_ACTIVE edge. Any transition to DISABLED or PAUSED is
-immediate and unconditional, from any state. Loading a config that names a mode more than
+confirmation at both edges landing on PRODUCTION_ACTIVE — from PAPER, and from PAUSED.
+Resuming into live trading after a pause is not exempt from the same re-authentication the
+initial promotion requires. Any transition to DISABLED or PAUSED is immediate and
+unconditional, from any state — entering PAUSED itself carries no confirmation requirement;
+only the way back out of it into PRODUCTION_ACTIVE does. Loading a config that names a mode more than
 one step ahead of the persisted current mode is a startup error, not a silent adoption —
 otherwise "DISABLED to PRODUCTION_ACTIVE in one step is impossible" (§12 criterion 3, and
 the Day-1 exit criterion in §11) is enforced by nothing.

@@ -14,7 +14,7 @@ from typing import Any
 from .durations import parse_duration
 from .policy import CapabilityStatus, TradeCapabilityPolicy
 
-MODES = ("DISABLED", "PAPER", "PRODUCTION_PENDING", "PRODUCTION_ACTIVE", "PAUSED")
+MODES = ("DISABLED", "RESEARCH", "PAPER", "PRODUCTION_ACTIVE", "PAUSED")
 PROFILES = ("CONSERVATIVE", "MODERATE", "AGGRESSIVE", "CUSTOM")
 POSTURES = ("CASH", "MARGIN_UNDER_25K", "MARGIN_OVER_25K", "UNKNOWN")
 
