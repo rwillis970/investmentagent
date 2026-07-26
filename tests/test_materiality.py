@@ -9,6 +9,7 @@ sets, and `capability_policy` is a real `agent.policy.TradeCapabilityPolicy`
 tracker anywhere in the codebase yet, so the screen treats both as externally
 supplied facts, exactly like `analyses_today`/`approvals_today` already are.
 """
+import math
 import sys
 from datetime import datetime, timezone
 
@@ -114,11 +115,37 @@ def test_budget_brake_reduces_score_as_analyses_accumulate():
     assert high < low
 
 
-def test_zero_volume_so_far_does_not_crash_and_contributes_no_volume_term():
+def test_zero_volume_so_far_does_not_crash():
     cand = candidate(volume_so_far=0.0, median_volume_same_time=100.0)
     score, components = compute_score(cand, POLICY, analyses_today=0,
                                       max_model_analyses_per_day=8)
-    assert components["weighted_terms"]["volume"] == 0.0
+    assert math.isfinite(components["weighted_terms"]["volume"])
+
+
+def test_zero_volume_orders_strictly_below_any_legitimate_sub_median_ratio():
+    """Regression test for the bug where volume_ratio == 0 produced
+    term2 == 0.0 == log(1) -- i.e. 'trading exactly at median volume', the
+    opposite of what a zero reading means. This is an ordering test, not an
+    equality test on a magic value: the bug was that the special case
+    landed in the wrong place on the scale, not that it had the wrong
+    literal number, and only an ordering check catches that class of bug."""
+    zero_score, zero_components = compute_score(
+        candidate(volume_so_far=0.0, median_volume_same_time=100.0),
+        POLICY, analyses_today=0, max_model_analyses_per_day=8,
+    )
+    zero_term2 = zero_components["weighted_terms"]["volume"]
+
+    for ratio in (0.5, 0.1, 0.01, 0.001):
+        below_score, below_components = compute_score(
+            candidate(volume_so_far=ratio * 100.0, median_volume_same_time=100.0),
+            POLICY, analyses_today=0, max_model_analyses_per_day=8,
+        )
+        below_term2 = below_components["weighted_terms"]["volume"]
+        assert zero_term2 < below_term2, (
+            f"zero-volume term2 ({zero_term2}) must be strictly below the "
+            f"term2 for ratio={ratio} ({below_term2}); zero volume is not "
+            "parity with the median"
+        )
 
 
 def test_nonpositive_atr_is_refused_not_guessed():

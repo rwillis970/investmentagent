@@ -39,6 +39,19 @@ from dataclasses import dataclass
 from .entities import OpportunityEvent
 from .policy import Gate, TradeCapabilityPolicy
 
+# Floor for volume_so_far / median_volume_same_time before taking its log
+# (term 2). volume_so_far == 0 is a legitimate reading -- the screen can run
+# before the first print of the day -- so it is not treated as malformed
+# input (unlike a non-positive ATR or median volume, which are data-quality
+# errors, not real readings). But 0.0 is not a safe stand-in for the ratio
+# itself: log(1) == 0.0, so an unclamped zero ratio would score as "trading
+# exactly at its median volume", the opposite of what zero volume means, and
+# would rank ABOVE every real sub-median reading rather than below all of
+# them. Flooring the ratio at a small epsilon before the log keeps zero (and
+# any vanishingly small nonzero ratio) below every legitimate sub-median
+# reading, and keeps the term finite instead of -inf.
+_VOLUME_RATIO_FLOOR = 1e-6
+
 # §3.2: an explicit allowlist, not a heuristic. Only the 8-K items and form
 # types named here carry weight; everything else -- routine ownership forms,
 # administrative forms, and any form type this allowlist has never heard of
@@ -136,10 +149,7 @@ def compute_score(candidate: MaterialityCandidate, policy: MaterialityPolicy, *,
 
     term1_momentum = abs(candidate.ret_since_open) / candidate.atr_20
     volume_ratio = candidate.volume_so_far / candidate.median_volume_same_time
-    # volume_so_far == 0 is a legitimate reading (e.g. the screen runs before
-    # the first print of the day) -- log(0) is undefined, so this term goes
-    # to its floor (no volume signal) rather than -inf.
-    term2_volume = math.log(volume_ratio) if volume_ratio > 0 else 0.0
+    term2_volume = math.log(max(volume_ratio, _VOLUME_RATIO_FLOOR))
     fw = filing_weight(candidate.form_type, candidate.item_codes)
     term3_filing = fw
     term4_earnings = candidate.earnings_proximity
