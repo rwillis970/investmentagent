@@ -1,0 +1,249 @@
+"""NYSE market calendar (§11 Day 4).
+
+Two consumers were already waiting on this and are exercised indirectly
+here: `DayTradeGuard` needs a real trailing-session window (agent/daytrade.py,
+tested in test_daytrade.py), and settlement (`Lot.settled`/`settles_at`,
+§4.1) needs a T+1-in-sessions function, not calendar days.
+
+DECISION 1 (hardcoded table vs. calendar library) and DECISION 2
+(DayTradeGuard.count's signature) are explained in agent/market_calendar.py's
+and agent/daytrade.py's module docstrings, and restated in the delivery
+report.
+"""
+from datetime import date, datetime, timezone
+
+import pytest
+
+from agent.market_calendar import (MAX_YEAR, MIN_YEAR, CalendarCoverageError,
+                                   is_early_close, is_trading_day,
+                                   session_for_instant, session_times,
+                                   settlement_date, trailing_sessions)
+
+# ----------------------------------------------------------- trading-day predicate
+
+@pytest.mark.parametrize("d", [
+    date(2024, 1, 1),    # New Year's Day
+    date(2024, 1, 15),   # MLK Day
+    date(2024, 2, 19),   # Washington's Birthday
+    date(2024, 3, 29),   # Good Friday
+    date(2025, 4, 18),   # Good Friday (moveable -- different date each year)
+    date(2024, 5, 27),   # Memorial Day
+    date(2024, 6, 19),   # Juneteenth
+    date(2024, 7, 4),    # Independence Day
+    date(2024, 9, 2),    # Labor Day
+    date(2024, 11, 28),  # Thanksgiving
+    date(2024, 12, 25),  # Christmas
+])
+def test_known_holidays_are_not_trading_days(d):
+    assert is_trading_day(d) is False
+
+
+@pytest.mark.parametrize("d", [
+    date(2024, 1, 2), date(2024, 7, 3), date(2026, 6, 18), date(2028, 6, 20),
+])
+def test_ordinary_weekdays_are_trading_days(d):
+    assert is_trading_day(d) is True
+
+
+@pytest.mark.parametrize("d", [date(2024, 1, 6), date(2024, 1, 7)])
+def test_weekends_are_not_trading_days(d):
+    assert is_trading_day(d) is False
+
+
+def test_saturday_holiday_observed_the_preceding_friday():
+    """Independence Day 2026 falls on a Saturday; NYSE observes it Friday
+    July 3 instead -- and Saturday itself needs no separate closure, it's
+    already a weekend."""
+    assert is_trading_day(date(2026, 7, 3)) is False   # observed Friday
+    assert is_trading_day(date(2026, 7, 4)) is False   # the actual Saturday
+
+
+def test_sunday_holiday_observed_the_following_monday():
+    """Independence Day 2027 falls on a Sunday; NYSE observes it Monday
+    July 5 instead."""
+    assert is_trading_day(date(2027, 7, 5)) is False   # observed Monday
+    assert is_trading_day(date(2027, 7, 2)) is True    # the preceding Friday is normal
+
+
+def test_christmas_on_saturday_shifts_to_the_preceding_friday():
+    assert is_trading_day(date(2027, 12, 24)) is False  # observed Friday
+    assert is_trading_day(date(2027, 12, 23)) is True
+
+
+def test_new_year_shift_can_spill_into_the_prior_calendar_year():
+    """January 1, 2028 is a Saturday -- NYSE observes New Year's Day on the
+    preceding Friday, December 31, 2027. The holiday lands in a different
+    calendar year than the one it's 'for', and the table has to get that
+    right rather than bucketing purely by year."""
+    assert is_trading_day(date(2027, 12, 31)) is False
+    assert is_trading_day(date(2027, 12, 30)) is True
+
+
+# --------------------------------------------------------------- early closes
+
+@pytest.mark.parametrize("d", [
+    date(2024, 7, 3), date(2024, 11, 29), date(2024, 12, 24),
+    date(2025, 7, 3), date(2025, 11, 28), date(2025, 12, 24),
+    date(2026, 11, 27), date(2026, 12, 24),
+    date(2028, 7, 3), date(2028, 11, 24),
+])
+def test_known_early_closes(d):
+    assert is_early_close(d) is True
+    assert is_trading_day(d) is True   # an early close is still a trading day
+
+
+def test_full_holiday_is_never_also_an_early_close():
+    for d in (date(2024, 12, 25), date(2026, 7, 3), date(2027, 12, 24)):
+        assert is_early_close(d) is False
+
+
+def test_july_third_is_not_an_early_close_when_it_is_the_observed_holiday():
+    """2026: July 4 falls on Saturday, so July 3 (Friday) IS the observed
+    full holiday, not a half day -- there is no early close that year."""
+    assert is_trading_day(date(2026, 7, 3)) is False
+    assert is_early_close(date(2026, 7, 3)) is False
+
+
+def test_no_holidays_and_no_early_closes_overlap_anywhere_in_the_table():
+    """A defensive check on the hardcoded tables themselves (§3.2-style
+    allowlist discipline): a date cannot be both a full closure and a half
+    day, or the two tables have drifted against each other."""
+    from agent.market_calendar import _EARLY_CLOSES, _HOLIDAYS
+    assert not (_HOLIDAYS & _EARLY_CLOSES)
+
+
+# ------------------------------------------------------------- session times
+
+def test_regular_session_times_in_utc():
+    st = session_times(date(2026, 1, 15))   # EST: UTC-5
+    assert st.open == datetime(2026, 1, 15, 14, 30, tzinfo=timezone.utc)
+    assert st.close == datetime(2026, 1, 15, 21, 0, tzinfo=timezone.utc)
+    assert st.is_early_close is False
+
+
+def test_session_times_survive_the_dst_transition():
+    """Same 9:30/4:00 ET wall-clock time, different UTC offset -- EDT is
+    UTC-4, EST is UTC-5. If this used a fixed UTC offset instead of a real
+    zoneinfo conversion, one of these would be wrong by an hour."""
+    winter = session_times(date(2026, 1, 15))   # EST
+    summer = session_times(date(2026, 7, 15))   # EDT
+    assert winter.open.hour == 14   # 9:30 ET + 5h
+    assert summer.open.hour == 13   # 9:30 ET + 4h
+
+
+def test_early_close_session_ends_at_one_pm_eastern():
+    st = session_times(date(2024, 7, 3))   # EDT half day
+    assert st.is_early_close is True
+    assert st.close == datetime(2024, 7, 3, 17, 0, tzinfo=timezone.utc)  # 13:00 ET + 4h
+
+
+def test_session_times_refuses_a_non_trading_day():
+    with pytest.raises(ValueError):
+        session_times(date(2024, 12, 25))
+    with pytest.raises(ValueError):
+        session_times(date(2024, 1, 6))   # Saturday
+
+
+# ----------------------------------------------------- session_for_instant
+
+def test_session_for_instant_converts_utc_to_the_eastern_calendar_date():
+    # 2026-07-20 23:00 UTC is 19:00 ET the same day (EDT, UTC-4).
+    late_utc = datetime(2026, 7, 20, 23, 0, tzinfo=timezone.utc)
+    assert session_for_instant(late_utc) == date(2026, 7, 20)
+
+
+def test_session_for_instant_rolls_back_a_day_near_utc_midnight():
+    """02:00 UTC is 22:00 ET the PREVIOUS day during EDT -- a naive
+    `.date()` on the UTC instant would silently attribute the instant to
+    the wrong trading day."""
+    early_utc = datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc)
+    assert session_for_instant(early_utc) == date(2026, 7, 20)
+
+
+def test_session_for_instant_requires_timezone_aware_input():
+    with pytest.raises(ValueError):
+        session_for_instant(datetime(2026, 7, 20, 12, 0))
+
+
+# --------------------------------------------------------- trailing sessions
+
+def test_trailing_sessions_includes_as_of_when_it_is_a_trading_day():
+    out = trailing_sessions(date(2026, 1, 15), 5)   # a Thursday
+    assert out[-1] == date(2026, 1, 15)
+    assert len(out) == 5
+    assert out == sorted(out)   # oldest first
+
+
+def test_trailing_sessions_walks_back_from_a_weekend():
+    """Saturday isn't a session, so the window starts from the Friday
+    before it."""
+    out = trailing_sessions(date(2026, 1, 17), 5)   # a Saturday
+    assert out[-1] == date(2026, 1, 16)
+
+
+def test_trailing_sessions_skips_a_holiday_in_the_window():
+    """The five sessions trailing the day after Thanksgiving 2026 must skip
+    Thanksgiving Thursday itself."""
+    out = trailing_sessions(date(2026, 11, 27), 5)   # day after Thanksgiving
+    assert date(2026, 11, 26) not in out   # Thanksgiving itself
+    assert len(out) == 5
+
+
+def test_trailing_sessions_rejects_nonpositive_n():
+    with pytest.raises(ValueError):
+        trailing_sessions(date(2026, 1, 15), 0)
+
+
+# ------------------------------------------------------------- settlement
+
+def test_settlement_is_t_plus_one_session():
+    assert settlement_date(date(2026, 1, 20)) == date(2026, 1, 21)  # Tue -> Wed
+
+
+def test_settlement_skips_a_weekend_and_an_adjacent_holiday():
+    """Friday Jan 16, 2026 settles T+1 -- the very next SESSION, not the
+    next weekday. Saturday/Sunday and Monday Jan 19 (MLK Day) are all
+    skipped, landing on Tuesday."""
+    assert settlement_date(date(2026, 1, 16)) == date(2026, 1, 20)
+
+
+def test_settlement_supports_a_configurable_t_plus():
+    assert settlement_date(date(2026, 1, 20), t_plus=2) == date(2026, 1, 22)
+
+
+def test_settlement_refuses_a_non_trading_fill_date():
+    with pytest.raises(ValueError):
+        settlement_date(date(2024, 12, 25))
+
+
+# --------------------------------------------------------- coverage boundary
+
+def test_out_of_range_year_raises_rather_than_guessing():
+    with pytest.raises(CalendarCoverageError):
+        is_trading_day(date(MIN_YEAR - 1, 6, 15))
+    with pytest.raises(CalendarCoverageError):
+        is_trading_day(date(MAX_YEAR + 1, 6, 15))
+    with pytest.raises(CalendarCoverageError):
+        trailing_sessions(date(MAX_YEAR + 1, 6, 15), 5)
+    with pytest.raises(CalendarCoverageError):
+        settlement_date(date(MAX_YEAR + 1, 6, 15))
+
+
+def test_trailing_sessions_raises_rather_than_walking_off_the_table_start():
+    with pytest.raises(CalendarCoverageError):
+        trailing_sessions(date(MIN_YEAR, 1, 3), 10)   # not 10 sessions of history before this
+
+
+def test_the_table_has_not_yet_expired():
+    """Deliberately uses REAL wall-clock time, not a frozen date -- this is
+    the test that is supposed to start failing once the calendar runs past
+    its own verified coverage, per the task's own requirement, rather than
+    every other test silently returning wrong answers forever. When this
+    fails, extend MIN_YEAR/MAX_YEAR and the two hardcoded tables in
+    agent/market_calendar.py against NYSE's published holiday schedule."""
+    today = datetime.now(timezone.utc).date()
+    assert today.year <= MAX_YEAR, (
+        f"the NYSE calendar table is only verified through {MAX_YEAR}; "
+        f"today is {today}. Extend the table before relying on this "
+        "calendar for anything -- do not silently keep using stale data."
+    )

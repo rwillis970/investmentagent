@@ -23,6 +23,10 @@ from agent.risk import PortfolioState, RiskPolicy
 
 ACCT = "acct-taxable"
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+# Gatekeeper.stage() derives its day-trade as_of from `now` itself; SESSIONS
+# is used directly with day_trade_guard.record()/check(). Its first three
+# entries (Jul 14/15/16) fall inside the real trailing-5-session window
+# ending 2026-07-20 -- see the identical comment in tests/test_pipeline.py.
 SESSIONS = [date(2026, 7, 14) + timedelta(days=i) for i in range(5)]
 RISK = RiskPolicy("t", max_position_pct=5.0, max_sector_pct=20.0,
                   min_settled_cash_pct_of_nlv=20.0, min_absolute_settled_cash=75.0)
@@ -41,7 +45,7 @@ def cancel(gk=None, **over):
     kw = dict(client_order_id="existing-order-1", symbol="SPY", side="CANCEL",
               order_type="LIMIT", time_in_force="DAY",
               portfolio=PortfolioState(account_id=ACCT, nlv=0.0, settled_cash=0.0),
-              now=T0, sessions=SESSIONS, posture="CASH")
+              now=T0, posture="CASH")
     kw.update(over)
     return (gk or keeper()).stage(**kw)
 
@@ -72,7 +76,7 @@ def test_cancel_skips_an_exhausted_day_trade_guard():
         gk.day_trade_guard.record(SESSIONS[i], "SPY")
     # A BUY/SELL opening a day trade here would be rejected outright.
     with pytest.raises(DayTradeBlocked):
-        gk.day_trade_guard.check(SESSIONS, posture="CASH")
+        gk.day_trade_guard.check(date(2026, 7, 20), posture="CASH")
     # The cancel is entirely unaffected.
     o = cancel(gk, opens_day_trade=True)
     assert "day_trade" not in o.gates_passed

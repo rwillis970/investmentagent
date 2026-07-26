@@ -35,7 +35,6 @@ from agent.risk import PortfolioState, RiskPolicy
 
 ACCT = "acct-taxable"
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
-SESSIONS = [date(2026, 7, 14) + timedelta(days=i) for i in range(5)]
 
 RISK = RiskPolicy("t", max_position_pct=100.0, max_sector_pct=100.0,
                   min_settled_cash_pct_of_nlv=0.0, min_absolute_settled_cash=0.0)
@@ -86,7 +85,7 @@ ORDER = dict(symbol="SPY", side="BUY", qty=0.2, order_type="LIMIT",
 
 
 def staged(gk, **over):
-    kw = dict(client_order_id="c1", now=T0, sessions=SESSIONS, posture="CASH",
+    kw = dict(client_order_id="c1", now=T0, posture="CASH",
               portfolio=portfolio())
     kw.update(ORDER)
     kw.update(over)

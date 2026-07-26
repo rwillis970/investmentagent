@@ -22,6 +22,14 @@ from agent.risk import PortfolioState, RiskPolicy
 
 ACCT = "acct-taxable"
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+# Gatekeeper.stage() derives its own day-trade as_of from `now` (T0's ET
+# calendar date, 2026-07-20 -- see agent/market_calendar.py) rather than
+# taking a session list; SESSIONS below is used directly with
+# day_trade_guard.record() in the day-trade tests. Its first three entries
+# (Jul 14/15/16, real trading days) fall inside the real trailing-5-session
+# window ending 2026-07-20 -- [Jul 14, 15, 16, 17, 20], per
+# agent.market_calendar.trailing_sessions -- which is what makes those tests
+# still correct against the real calendar, not just against a hand-built list.
 SESSIONS = [date(2026, 7, 14) + timedelta(days=i) for i in range(5)]
 RISK = RiskPolicy("t", max_position_pct=100.0, max_sector_pct=100.0,
                   min_settled_cash_pct_of_nlv=20.0, min_absolute_settled_cash=75.0)
@@ -41,7 +49,7 @@ def stage(gk=None, **over):
     kw = dict(client_order_id="c1", symbol="SPY", side="BUY", qty=0.2,
               order_type="LIMIT", time_in_force="DAY", price=500.0,
               limit_price=500.0, portfolio=PORTFOLIO, now=T0,
-              sessions=SESSIONS, posture="CASH", asset_class="ETF")
+              posture="CASH", asset_class="ETF")
     kw.update(over)
     return (gk or keeper()).stage(**kw)
 

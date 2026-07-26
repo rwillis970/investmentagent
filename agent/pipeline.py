@@ -56,8 +56,9 @@ import hmac
 import json
 import secrets
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 
+from . import market_calendar
 from .accounts import AccountType, CrossAccountError
 from .daytrade import DayTradeBlocked, DayTradeGuard
 from .holding import sellable_qty
@@ -174,7 +175,7 @@ class Gatekeeper:
     def stage(self, *, client_order_id: str, symbol: str, side: str,
               order_type: str, time_in_force: str,
               portfolio: PortfolioState, now: datetime,
-              sessions: list[date], posture: str,
+              posture: str,
               qty: float | None = None, price: float | None = None,
               limit_price: float | None = None,
               asset_class: str = "US_EQUITY", funding: str = "SETTLED_CASH",
@@ -253,10 +254,16 @@ class Gatekeeper:
                 )
             passed.append("holding")
 
-        # 3. day-trade guard
+        # 3. day-trade guard. as_of is derived from `now` (the moment this
+        #    order is being staged), not supplied by the caller -- the
+        #    market calendar unit (§11 Day 4) removed the caller-supplied
+        #    session-list form of this check because a wrong window
+        #    miscounted silently; there is nothing left here for a caller to
+        #    get wrong.
         if opens_day_trade:
+            as_of = market_calendar.session_for_instant(now)
             try:
-                self.day_trade_guard.check(sessions, posture=posture)
+                self.day_trade_guard.check(as_of, posture=posture)
             except DayTradeBlocked as exc:
                 raise Rejected("day_trade", str(exc)) from exc
             passed.append("day_trade")
