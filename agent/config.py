@@ -115,6 +115,16 @@ class Config:
     routine_decision_interval_minutes: int = 240
     event_driven_analysis_enabled: bool = True
 
+    # The scheduled reconciliation loop's own cadence (agent/run_loop.py,
+    # §11 process-entry-point unit) -- added in this same commit, per §9.1's
+    # same-commit rule: a cadence read from config must never be hardcoded
+    # in the code that reads it. Distinct from data_collection_interval_
+    # seconds (market data collection, not yet built) and routine_decision_
+    # interval_minutes (the analysis/decision cadence, also not yet built) --
+    # this one governs only sync_fills + reconciliation + run_startup, the
+    # one loop that exists today.
+    reconciliation_cycle_interval_seconds: int = 300
+
     approval_expiration_minutes: int = 30
     approval_min_display_seconds: int = 10
     max_model_analyses_per_day: int = 8
@@ -343,7 +353,8 @@ def validate(cfg: Config) -> None:
     for name in ("data_collection_interval_seconds", "event_feed_interval_minutes",
                  "opportunity_screen_interval_minutes", "approval_expiration_minutes",
                  "max_model_analyses_per_day", "max_approval_requests_per_day",
-                 "max_new_positions_per_day", "max_day_trades_per_5_sessions"):
+                 "max_new_positions_per_day", "max_day_trades_per_5_sessions",
+                 "reconciliation_cycle_interval_seconds"):
         if getattr(cfg, name) <= 0:
             err.append(f"{name} must be positive")
 

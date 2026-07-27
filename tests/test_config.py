@@ -148,6 +148,24 @@ def test_materiality_policy_property_matches_the_config_fields():
     assert pol.threshold == cfg.materiality_threshold
 
 
+# ------------------------------------- reconciliation_cycle_interval_seconds
+# §9.1's same-commit rule: the process-entry-point/scheduled-loop unit reads
+# this cadence from config, so the key is added to the schema (and to
+# config.example.json) in the same commit as the loop code that reads it --
+# never hardcoded.
+
+def test_example_config_carries_the_reconciliation_cadence():
+    cfg = C.load(base())
+    assert cfg.reconciliation_cycle_interval_seconds == 300
+
+
+def test_reconciliation_cycle_interval_must_be_positive():
+    with pytest.raises(C.ConfigError, match="reconciliation_cycle_interval_seconds"):
+        C.load(base(reconciliation_cycle_interval_seconds=0))
+    with pytest.raises(C.ConfigError, match="reconciliation_cycle_interval_seconds"):
+        C.load(base(reconciliation_cycle_interval_seconds=-5))
+
+
 @pytest.mark.parametrize("field", ["materiality_w1", "materiality_w2", "materiality_w3",
                                    "materiality_w4", "materiality_w5", "materiality_w6"])
 def test_negative_materiality_weight_is_rejected(field):

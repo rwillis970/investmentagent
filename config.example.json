@@ -15,6 +15,7 @@
   "opportunity_screen_interval_minutes": 5,
   "routine_decision_interval_minutes": 240,
   "event_driven_analysis_enabled": true,
+  "reconciliation_cycle_interval_seconds": 300,
   "approval_expiration_minutes": 30,
   "approval_min_display_seconds": 10,
   "max_model_analyses_per_day": 8,

@@ -342,6 +342,28 @@ def trailing_sessions(as_of: date, n: int) -> list[date]:
     return list(reversed(out))
 
 
+def next_trading_day(d: date) -> date:
+    """The next trading session strictly AFTER `d`, skipping weekends and
+    holidays -- the forward-walk counterpart to `trailing_sessions`'
+    backward walk. Answers "when does the next session start", not "is `d`
+    itself one": `d` need not be a trading day itself (a Saturday or a
+    holiday walks forward to the next real session, same as
+    `trailing_sessions` walks backward from one), and even when `d` IS a
+    trading day, the result is the day after it, never `d` itself.
+
+    Built for the scheduled reconciliation loop (§11): sleeping until this
+    date's own session open (via `session_times`) is how that loop avoids
+    polling overnight or across a weekend/holiday, rather than waking up
+    every cadence interval to discover the market is still closed."""
+    _check_range(d, where="next_trading_day")
+    nxt = d + timedelta(days=1)
+    while True:
+        _check_range(nxt, where="next_trading_day")
+        if is_trading_day(nxt):
+            return nxt
+        nxt += timedelta(days=1)
+
+
 def settlement_date(fill_date: date, *, t_plus: int = 1) -> date:
     """The session on which a fill made on `fill_date` settles -- T+1 for US
     equities by default (§4.1). Counts TRADING sessions forward, never

@@ -18,7 +18,8 @@ from agent.market_calendar import (MAX_YEAR, MIN_YEAR, CalendarCoverageError,
                                    CalendarExpiryError, _EXPIRY_WARNING_DAYS,
                                    assert_calendar_coverage_at_startup,
                                    exercises_calendar, is_early_close,
-                                   is_trading_day, session_for_instant,
+                                   is_trading_day, next_trading_day,
+                                   session_for_instant,
                                    session_times, settlement_date,
                                    settlement_instant, trailing_sessions)
 
@@ -195,6 +196,40 @@ def test_trailing_sessions_skips_a_holiday_in_the_window():
 def test_trailing_sessions_rejects_nonpositive_n():
     with pytest.raises(ValueError):
         trailing_sessions(date(2026, 1, 15), 0)
+
+
+# ------------------------------------------------------------ next_trading_day
+# The forward-walk counterpart to trailing_sessions' backward walk -- needed
+# by the scheduled loop (§11) to sleep until the next session's open rather
+# than polling overnight or across a weekend/holiday.
+
+def test_next_trading_day_of_a_trading_day_is_the_day_after():
+    """Strictly AFTER d, even when d itself is a trading day -- this answers
+    'when does the NEXT session start', not 'is today one'."""
+    assert next_trading_day(date(2026, 1, 15)) == date(2026, 1, 16)   # Thu -> Fri
+
+
+def test_next_trading_day_skips_a_weekend():
+    assert next_trading_day(date(2026, 1, 16)) == date(2026, 1, 20)   # Fri -> Mon (1/17-18 weekend, 1/19 MLK Day)
+
+
+def test_next_trading_day_skips_a_holiday():
+    # Thanksgiving 2026 is Thursday 2026-11-26.
+    assert next_trading_day(date(2026, 11, 25)) == date(2026, 11, 27)
+
+
+def test_next_trading_day_from_a_weekend_itself():
+    assert next_trading_day(date(2026, 1, 17)) == date(2026, 1, 20)   # Saturday -> Monday
+
+
+def test_next_trading_day_out_of_range_raises():
+    with pytest.raises(CalendarCoverageError):
+        next_trading_day(date(MAX_YEAR + 1, 1, 1))
+
+
+def test_next_trading_day_walking_past_max_year_raises():
+    with pytest.raises(CalendarCoverageError):
+        next_trading_day(date(MAX_YEAR, 12, 31))
 
 
 # ------------------------------------------------------------- settlement
