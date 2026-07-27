@@ -84,6 +84,34 @@ def is_legal_step(persisted: str, target: str) -> bool:
     return abs(_POSITION[persisted] - _POSITION[target]) == 1
 
 
+# KNOWN GAP -- RUNTIME MODE TRANSITIONS (checked while investigating a
+# calendar-coverage hole in agent/startup.py's delivery). `is_legal_step`
+# above is the general step-legality check; `assert_legal_startup` below is
+# the only thing in this codebase that calls it, and it only runs at
+# process startup (agent.startup.run_startup) or config load
+# (agent.config.load's check_mode_transition option). There is no runtime
+# transition path anywhere in this codebase today -- nothing lets an
+# already-running process move from, say, PAUSED to PRODUCTION_ACTIVE
+# without a full restart through run_startup. Confirmed by inspection: this
+# module and agent/config.py are the only two callers of any mode-fsm
+# function that exist.
+#
+# This matters for calendar coverage: `market_calendar.
+# assert_calendar_coverage_at_startup` only runs as part of run_startup, so
+# it only ever sees `today` as of the moment a process starts. A process
+# that starts in PAUSED (warned, not refused -- PAUSED does not exercise
+# the calendar) and then sits paused for months before a runtime transition
+# resumes it into PRODUCTION_ACTIVE would never re-run that check; the
+# calendar could be well past MAX_YEAR by the time it actually starts
+# trading. WHEN a runtime transition function is built here, it must call
+# `market_calendar.assert_calendar_coverage_at_startup` (or an equivalent
+# runtime check) for `target` whenever `market_calendar.exercises_calendar
+# (target)` is true, exactly as run_startup does today -- not just
+# `is_legal_step`/re-authentication. Not built here; this is deliberately
+# only a comment, not a stub function, per the instruction not to invent a
+# path that doesn't exist yet.
+
+
 def assert_legal_startup(persisted_mode: str | None, target_mode: str, *,
                          confirmed: bool = False) -> None:
     """Raise unless loading `target_mode` is legal given the mode the system

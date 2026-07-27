@@ -103,6 +103,44 @@ class CalendarExpiryError(CalendarCoverageError):
 # tune out.
 _EXPIRY_WARNING_DAYS = 90
 
+# Modes that actually exercise this calendar once startup completes.
+# PRODUCTION_ACTIVE and PAPER both route orders through Gatekeeper.stage,
+# which derives as_of via session_for_instant and calls DayTradeGuard.check/
+# reconcile -- both of which call trailing_sessions, which raises the base
+# CalendarCoverageError (via _check_range) once `today` is out of range.
+# PAPER getting a warning here and a raw CalendarCoverageError three layers
+# down from its first reconcile() was the bug this set fixes.
+#
+# RESEARCH does not: nothing in agent/pipeline.py or agent/daytrade.py
+# routes a RESEARCH-mode order through Gatekeeper.stage or
+# DayTradeGuard.reconcile -- confirmed by inspection, there is no mode-
+# specific branch anywhere in this codebase that touches either. PAUSED
+# likewise originates no new orders. Both are left on the warning side of
+# the line.
+#
+# CAVEAT: this constant only controls THIS function's warn/refuse line. It
+# does not, and cannot, stop a caller from handing agent.startup.
+# run_startup a non-empty `accounts` list for a RESEARCH-mode startup --
+# run_startup reconciles whatever accounts it is given regardless of
+# target_mode (see its own docstring). "RESEARCH does not trade" is a
+# property of how the mode is intended to be used, not one this function or
+# run_startup enforces. If that ever needs enforcing, it belongs in
+# run_startup itself (e.g. refusing non-empty accounts for RESEARCH), not
+# here.
+_CALENDAR_EXERCISING_MODES = frozenset({"PAPER", "PRODUCTION_ACTIVE"})
+
+
+def exercises_calendar(mode: str) -> bool:
+    """Whether `mode` is one of the modes that actually touches this
+    calendar once startup completes -- see `_CALENDAR_EXERCISING_MODES`'s
+    comment for why PAPER and PRODUCTION_ACTIVE do and RESEARCH/PAUSED/
+    DISABLED don't. Exposed as a function, not the set itself, so callers
+    outside this module (agent.startup.run_startup, to refuse handing a
+    non-calendar-exercising mode any accounts to reconcile) go through one
+    named, documented predicate rather than reaching into a private
+    constant."""
+    return mode in _CALENDAR_EXERCISING_MODES
+
 
 # Full-day closures, MIN_YEAR-MAX_YEAR inclusive. New Year's Day, Independence
 # Day and Christmas Day are shifted under the observed-day rule (a Saturday
@@ -176,39 +214,40 @@ def assert_calendar_coverage_at_startup(mode: str, *, today: date) -> str | None
 
     Returns a warning string if `today` is within `_EXPIRY_WARNING_DAYS` of
     the table's last covered date (inclusive) but not yet past it, or if
-    `today` is past it and `mode` is anything other than PRODUCTION_ACTIVE.
+    `today` is past it and `mode` is not one of `_CALENDAR_EXERCISING_MODES`.
     Returns None if there is nothing to say.
 
-    Raises CalendarExpiryError if `mode` is PRODUCTION_ACTIVE and `today` is
-    already past the table's last covered date -- refusing to start live
-    trading against a calendar with no verified coverage for the current
-    date, rather than letting the first live order of the next year
-    discover it. RESEARCH and PAPER do not move real money and are left to
-    run; they remain bounded by `_check_range`'s last-resort raise on any
-    calendar query that actually falls out of range.
+    Raises CalendarExpiryError if `today` is already past the table's last
+    covered date and `mode` is PRODUCTION_ACTIVE or PAPER -- both route
+    orders through Gatekeeper.stage and DayTradeGuard.reconcile, which call
+    trailing_sessions and would otherwise raise the base
+    CalendarCoverageError from inside the order path (three layers down from
+    a startup that had already returned "just a warning"). Refusing at
+    startup surfaces this once, loudly, before either mode is allowed to
+    proceed, rather than letting the first order or reconcile() of the new
+    year discover it. RESEARCH and PAUSED do not originate orders in this
+    codebase and are left to warn.
 
-    Does not itself validate that `mode` is a known mode (see agent.mode) --
-    it only recognises the literal string "PRODUCTION_ACTIVE" as the one
-    value that changes a warning into a refusal.
+    Does not itself validate that `mode` is a known mode (see agent.mode).
     """
     last_covered = date(MAX_YEAR, 12, 31)
     if today > last_covered:
-        if mode == "PRODUCTION_ACTIVE":
+        if exercises_calendar(mode):
             raise CalendarExpiryError(
                 f"market calendar table is verified only through {last_covered} "
                 f"(MAX_YEAR={MAX_YEAR}); current date is {today}. Refusing to "
-                "start PRODUCTION_ACTIVE rather than discover this on the "
-                "first live order of the new year (§8.1). Extend MIN_YEAR/"
+                f"start {mode} rather than discover this on the first "
+                "reconcile()/order of the new year (§8.1). Extend MIN_YEAR/"
                 "MAX_YEAR and the _HOLIDAYS/_EARLY_CLOSES tables in "
                 "agent/market_calendar.py against NYSE's published schedule "
-                "before starting live trading again."
+                f"before starting {mode} again."
             )
         return (
             f"market calendar table is verified only through {last_covered} "
             f"(MAX_YEAR={MAX_YEAR}); current date is {today}. {mode} may "
             "continue, but any calendar query that actually falls out of "
             "range will still raise CalendarCoverageError; extend the table "
-            "before promoting to PRODUCTION_ACTIVE."
+            "before promoting to PAPER or PRODUCTION_ACTIVE."
         )
     if today >= last_covered - timedelta(days=_EXPIRY_WARNING_DAYS):
         return (

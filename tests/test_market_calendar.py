@@ -17,9 +17,10 @@ import pytest
 from agent.market_calendar import (MAX_YEAR, MIN_YEAR, CalendarCoverageError,
                                    CalendarExpiryError, _EXPIRY_WARNING_DAYS,
                                    assert_calendar_coverage_at_startup,
-                                   is_early_close, is_trading_day,
-                                   session_for_instant, session_times,
-                                   settlement_date, trailing_sessions)
+                                   exercises_calendar, is_early_close,
+                                   is_trading_day, session_for_instant,
+                                   session_times, settlement_date,
+                                   trailing_sessions)
 
 # ----------------------------------------------------------- trading-day predicate
 
@@ -304,13 +305,44 @@ def test_calendar_expiry_error_is_a_calendar_coverage_error():
     assert issubclass(CalendarExpiryError, CalendarCoverageError)
 
 
-def test_past_the_table_non_production_modes_warn_instead_of_raising():
-    for mode in ("RESEARCH", "PAPER", "PAUSED"):
+def test_past_the_table_paper_also_refuses_to_start():
+    """PAPER exercises the calendar exactly like PRODUCTION_ACTIVE does --
+    Gatekeeper.stage/DayTradeGuard.reconcile don't distinguish the two, and
+    a warning here used to be followed by a CalendarCoverageError raised
+    three layers down from the first reconcile() call. Past coverage is a
+    refusal for PAPER too, not just PRODUCTION_ACTIVE."""
+    with pytest.raises(CalendarExpiryError):
+        assert_calendar_coverage_at_startup("PAPER", today=_LAST_COVERED + timedelta(days=1))
+    with pytest.raises(CalendarExpiryError):
+        assert_calendar_coverage_at_startup("PAPER", today=date(MAX_YEAR + 2, 3, 1))
+
+
+def test_past_the_table_research_and_paused_still_only_warn():
+    """RESEARCH does not originate orders or reconcile day-trade counts
+    against an account in this codebase -- nothing routes a RESEARCH-mode
+    order through Gatekeeper.stage or DayTradeGuard.reconcile -- so it is
+    left to warn rather than refuse. PAUSED likewise does not originate new
+    orders. See agent/market_calendar.py's _CALENDAR_EXERCISING_MODES for
+    the caveat: this reflects how these modes are intended to be used, not
+    something this function itself can enforce on a caller."""
+    for mode in ("RESEARCH", "PAUSED"):
         warning = assert_calendar_coverage_at_startup(
             mode, today=_LAST_COVERED + timedelta(days=1)
         )
         assert warning is not None
         assert str(MAX_YEAR) in warning
+
+
+def test_exercises_calendar_matches_the_documented_modes():
+    """The public predicate agent.startup.run_startup uses to decide
+    whether a non-empty accounts list is even sensible for a mode -- must
+    stay in lockstep with assert_calendar_coverage_at_startup's own
+    raise/warn line, since it's the same underlying set."""
+    assert exercises_calendar("PAPER") is True
+    assert exercises_calendar("PRODUCTION_ACTIVE") is True
+    assert exercises_calendar("RESEARCH") is False
+    assert exercises_calendar("PAUSED") is False
+    assert exercises_calendar("DISABLED") is False
 
 
 def test_the_warning_window_is_a_named_constant_not_a_magic_number():
