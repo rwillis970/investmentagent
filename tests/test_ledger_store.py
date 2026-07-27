@@ -119,6 +119,52 @@ def test_opening_balance_requires_a_timezone_aware_datetime(tmp_path):
         s.write_opening_balance(500.0, at=datetime(2026, 1, 20, 15, 0))
 
 
+# ------------------------------ REVIEW FIX: opening balance must precede any fill
+# (orchestrator unit, Commit 1). A broker read taken to seed opening_settled_
+# cash already reflects every fill that has ever happened on that account --
+# seeding it AFTER a fill already exists on this ledger double-counts that
+# fill's cash effect. write_fill() itself does not (and should not) require
+# an opening balance first -- see module docstring's discussion for why the
+# refusal belongs on the write_opening_balance side instead.
+
+def test_seeding_the_opening_balance_after_a_fill_already_exists_is_refused(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))
+    with pytest.raises(LedgerStoreError, match="fill"):
+        s.write_opening_balance(500.0, at=T0)
+
+
+def test_the_refused_seed_leaves_no_opening_balance_recorded(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))
+    with pytest.raises(LedgerStoreError):
+        s.write_opening_balance(500.0, at=T0)
+    opening, _, _ = s.load()
+    assert opening is None
+
+
+def test_seeding_after_a_fill_is_refused_even_on_a_reloaded_store(tmp_path):
+    """The defect the review named specifically: a fill written in one
+    process, then a later process (or a later call) tries to seed the
+    opening balance as if this were still a fresh install. The refusal
+    must hold across a reload, not just within one live instance."""
+    path = tmp_path / "ledger.jsonl"
+    s1 = store(path)
+    s1.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))
+
+    s2 = store(path)
+    with pytest.raises(LedgerStoreError, match="fill"):
+        s2.write_opening_balance(500.0, at=T0)
+
+
+def test_seeding_before_any_fill_still_works(tmp_path):
+    """The normal, correct order is unaffected."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))
+    assert s.load()[0] == 500.0
+
+
 # ------------------------------------------------------------- fills/orders
 
 def test_a_written_fill_is_immediately_reflected_in_load(tmp_path):

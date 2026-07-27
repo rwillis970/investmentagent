@@ -96,6 +96,21 @@ approval token, simulated fill, reconciliation, audit — and the first live ord
 approximately Day 30. Nothing is cut; the live adapter and the readiness review simply
 land in the second half. The re-phased schedule is in §11.
 
+**The Alpaca paper adapter moved ahead of the collectors (§11).** One API serves both
+paper and live trading, so the adapter's HTTP and mapping logic — account and position
+reads, settlement tracking, order submission, order lifecycle, idempotent resubmission
+handling — is written once, generically enough to serve the eventual live class with no
+rewrite, rather than as two separate builds at two separate points in the backlog. Building
+the real Alpaca paper adapter (not just the abstract `BrokerAdapter` interface behind a
+simulator) before the market-data/EDGAR/news collectors means capability gate 4 and the
+approval-token consumption path are already live, tested code by the time Day 10 arrives —
+so Day 10 is no longer "build the live adapter." It shrinks to what genuinely cannot be
+pre-built: the live base URL, a separate keychain entry, re-authentication for activation,
+and the import/authorization boundary tests proving the research package cannot reach live
+credentials. Everything else Day 10 used to name — the pre-submit re-check of reserve,
+capability, holding eligibility and the PDT counter — is inherited unchanged the moment the
+live class subclasses the same `BrokerAdapter.submit()` the paper adapter already uses.
+
 **$500 pilot capital.** Sensible for a functional test, and it makes the cost ratio
 decisive: a $75 monthly model budget would be 15% of capital per month. The budget drops
 to **$20/month with a $30 hard stop**, and the analysis cap falls accordingly. At this
@@ -627,6 +642,12 @@ and the walk-forward runner. Month 4 onward runs the pre-registered feature expe
 The point-in-time corpus purchase decision moves here, informed by whether the live system
 has produced anything worth testing.
 
+**Sequenced ahead of the playbook machinery, deliberately (§11).** This track starts on
+Day 4's collected data, weeks before Day 11 builds Class A candidate generation and long
+before Class B has enough accumulated history to act on anything. The ordering is the
+point: pick quality is measurable on its own well before there is a self-directed playbook
+mechanism whose output that measurement would otherwise be the only check on.
+
 **Kill criterion — carried forward unchanged.** If after twelve months of live operation
 the agent has not exceeded a buy-and-hold benchmark at equivalent cash reserve, net of
 costs, model spend and taxes, it is retired and the capital is indexed. Shipping in
@@ -884,26 +905,40 @@ pilot date rather than shipping the day unfinished.
 At 2–3 hours per evening (§1.2) the fourteen numbered days below are **work units, not
 calendar days**. Days 1–10 fit in the first fortnight and land the paper pilot; Days 11–14
 plus the live adapter fall in the following two weeks, putting the first live order near
-calendar Day 30. Two consequences worth naming: Day 3's broker work builds the adapter
-interface and simulator only, and Day 14's live order becomes Day 14's *paper* order, with
-the live equivalent repeated against a real broker before capital is committed.
+calendar Day 30. Two consequences worth naming: Day 14's live order becomes Day 14's
+*paper* order, with the live equivalent repeated against a real broker before capital is
+committed; and, per §1.2's re-sequencing ▲, Day 3's broker work is no longer read-only-plus-
+simulator — it builds the real Alpaca paper adapter (read and write both, one API serving
+paper and live) ahead of Day 4's collectors, which is why Day 8's paper-execution content
+below has folded into Day 3 and Day 10 is now the shrunk live-only remainder. Evaluation and
+attribution (§7.3) are likewise sequenced ahead of Day 11's playbook machinery, not after
+it — see the note below the table.
 
 | Day | Deliverable | Exit criterion |
 |---|---|---|
 | 1 | Repo, local env, config schema with validation, mode state machine defaulting to DISABLED, audit table with hash chain | App starts; tests and lint run; invalid config rejected with a readable error |
 | 2 | Postgres, Parquet store with `observed_at`/`effective_at`, `as_of()` accessor, secrets abstraction, audit events | No credentials in source; property test proves `as_of` cannot read the future |
-| 3 | Broker read-only adapter, account and position reconciliation, settlement tracking, ▲ day-trade counter and broker capability probe | Positions, settled cash, open orders and day-trade count reconcile; fractional and order-type support documented from live API responses |
+| 3 | ▲ Alpaca paper adapter, read AND write — account/position reconciliation, settlement tracking, day-trade counter, broker capability probe, idempotent order submission, order lifecycle, partial fills — built once as one Alpaca-API unit, ahead of the collectors (§1.2) | Positions, settled cash, open orders and day-trade count reconcile; fractional and order-type support documented from live API responses; approved paper orders fill and reconcile; duplicate submit is a no-op |
 | 4 | Market data, EDGAR and news collectors, market calendar, T3 materiality screen with threshold calibration harness | Events and freshness visible; screen produces a ranked candidate list with zero model calls |
 | 5 | Structured research analysis, extraction cache, schema validation, prompt-injection isolation, cost metering | Schema-valid analysis with source timestamps and citations; cache hit costs nothing; cost row written per call |
 | 6 | Risk profiles, target portfolio, dual-basis reserve enforcement, capability policy and all four capability gates | Disabled-capability proposals rejected at every gate; buys resize correctly against settled cash; golden reserve cases pass |
 | 7 | Lot-level holding period, cooldown, early-exit workflow, ▲ PDT guard and tax-lot accounting with wash-sale detection | Golden tests pass for hour, day and week holds; unevidenced early exit rejected; fourth day trade blocked |
-| 8 | Paper execution adapter, idempotent submission, order lifecycle, partial fills, reconciliation | Approved paper orders fill and reconcile; duplicate submit is a no-op |
+| 8 | ▲ Folded into Day 3 above — paper execution is part of the one Alpaca adapter unit, not a separate later build | (see Day 3) |
 | 9 | Approval inbox, single-use tokens with price bands, expiry, notifications, ▲ daily approval cap and decision-time logging | No live path without a valid unexpired token; token cannot be reused; out-of-band price invalidates |
-| 10 | Production adapter behind the disabled state machine, credential isolation, re-authentication, pre-submit re-check | Import and authorization boundary tests pass; research package cannot reach live credentials |
+| 10 | ▲ Shrunk: live base URL, separate keychain entry, re-authentication for activation, import/authorization boundary tests. Gate 4, approval-token consumption and the pre-submit re-check of reserve, capability, holding eligibility and the PDT counter are already shared code, inherited unchanged from the Day-3 adapter — not rebuilt here | Import and authorization boundary tests pass; research package cannot reach live credentials |
 | 11 | Playbook versioning, Class A candidate generation and evaluation, rollback, immutable-boundary enforcement | Candidate evaluated but cannot self-promote; every forbidden write from §7.2 fails; rollback restores prior version |
 | 12 | Failure suite: restart mid-submit, stale data, duplicate callback, sleep/wake, network loss, kill switch, hash-chain verification | Every anomaly resolves to no trade with no duplicate or orphaned order |
 | 13 | Readiness review, operator runbook, backup and restore drill, ▲ adversarial self-review in a fresh session (Appendix C.6) | Checklist approved; restore from backup verified; no unresolved high-severity review finding |
 | 14 | Controlled live pilot: minimum-size order, human approval, full reconciliation, then flat | One approved live order placed, filled, reconciled and closed safely; audit trail complete end to end |
+
+**Evaluation and attribution move ahead of the playbook machinery (§7.3).** Day 11 is
+where Class A candidate generation is built, and Class B (the self-directed one) needs
+months of accumulated history before it has anything to act on. The benchmark harness and
+attribution work in §7.3 does not wait for either: it starts on the same collected-data
+foundation Day 4 lays down, weeks before Day 11's playbook versioning exists at all. The
+practical effect: pick quality — is this system's judgment any good — becomes a measurable
+question months before there is a Class B with enough history to reward or penalise a
+pick, rather than the two tracks being built in the order they are numbered.
 
 Prioritisation rule, adopted verbatim: anything not required for safe end-to-end operation
 by Day 14 is deferred. No premium corpora, no microservices, no elaborate dashboard, no

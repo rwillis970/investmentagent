@@ -97,6 +97,36 @@ order record for a different account is a `CrossAccountError` at
 `Ledger`, which already enforces this), never merely discovered later at
 `to_ledger()` time.
 
+REVIEW FIX -- OPENING BALANCE MUST PRECEDE ANY FILL (orchestrator unit,
+Commit 1). `write_fill` never required `write_opening_balance` to have run
+first -- there was nothing stopping a caller from recording fills, then
+later seeding `opening_settled_cash` from a broker read taken AFTER those
+fills already happened. That broker figure already reflects every one of
+those fills; folding them into `Ledger.settled_cash`'s replay on top of an
+opening balance that already includes them double-counts them. Fixed by
+refusing the write, not by preventing `write_fill` from running first:
+`write_opening_balance` now raises if `self._opening is None` and this
+store's internal `Ledger` already has any fill on it, regardless of the
+amount offered.
+
+ENFORCED IN THE STORE, NOT THE ORCHESTRATOR, AND NOT BOTH. The orchestrator
+(the thing that decides WHEN to call `write_opening_balance` -- seed on a
+first-ever startup, never on a subsequent one) is exactly the kind of
+caller-discipline this codebase does not trust to be the only thing
+standing between correct and double-counted state, the same reasoning
+`Ledger.record_fill`'s own validation already rests on (Commit 1 of the
+prior unit: "nothing reaches disk that a Ledger would reject," enforced in
+one place, not re-implemented at each call site). `agent.account_wiring`
+(the orchestrator module) never needs its own copy of this check: it only
+ever calls `write_opening_balance` when `load()` reports `opening is None`,
+and if that ever coincides with fills already existing -- which should
+never happen in real operation, since nothing produces a fill before this
+wiring seeds the account for the first time -- the store's own refusal is
+what actually makes the double-count impossible, not the orchestrator's
+good behaviour. A duplicate check in the orchestrator would be the same
+one-implementation violation `LedgerStore`'s own Commit-1 fix already
+argued against.
+
 FSYNC: DELIBERATELY NOT USED HERE, UNLIKE MODESTORE. `ModeStore.write`
 justifies fsync on the grounds that a crash must never be mistaken for
 permission to keep trading -- mode has NO independent, external source of
@@ -174,8 +204,25 @@ class LedgerStore:
             self._load_into(self._ledger)
 
     def write_opening_balance(self, amount: float, *, at: datetime) -> None:
+        """Written exactly once, and only BEFORE any fill exists on this
+        ledger -- see module docstring's REVIEW FIX (orchestrator unit,
+        Commit 1) for why. A broker read taken to seed this value already
+        reflects every fill that has ever happened on the real account;
+        seeding it once a fill already exists here would double-count that
+        fill's cash effect on top of a broker figure that already includes
+        it."""
         if at.tzinfo is None:
             raise LedgerStoreError("at must be a timezone-aware datetime")
+        if self._opening is None and self._ledger.fills:
+            raise LedgerStoreError(
+                f"refusing to seed opening_settled_cash: {len(self._ledger.fills)} "
+                "fill(s) already exist on this ledger with no opening balance "
+                "ever recorded. A fresh broker read taken now already reflects "
+                "those fills' cash effect -- seeding it at this point would "
+                "double-count them. opening_settled_cash must be written "
+                "before the first fill, never after (see module docstring's "
+                "REVIEW FIX, orchestrator unit Commit 1)."
+            )
         if self._opening is not None:
             if self._opening == amount:
                 return   # identical re-seed attempt -- safe, idempotent no-op
