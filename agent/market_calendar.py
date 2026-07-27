@@ -363,3 +363,18 @@ def settlement_date(fill_date: date, *, t_plus: int = 1) -> date:
         if is_trading_day(d):
             remaining -= 1
     return d
+
+
+def settlement_instant(filled_at: datetime, *, t_plus: int = 1) -> datetime:
+    """The UTC instant at which a fill made at `filled_at` settles: market
+    OPEN of the settlement session (see `settlement_date`), not midnight of
+    the settlement date. This is the one combinator every settlement-aware
+    caller in this codebase uses -- composing `session_for_instant` +
+    `settlement_date` + `session_times` by hand in more than one place is
+    exactly the kind of duplication `BrokerAdapter.sessions()` was fixed to
+    stop doing (see that method's own docstring): `agent.ledger.Ledger` and
+    `agent.broker.simulator.SimulatorBroker` both call this now, so there
+    is one settlement model, not two."""
+    fill_session = session_for_instant(filled_at)
+    settle_session = settlement_date(fill_session, t_plus=t_plus)
+    return session_times(settle_session).open

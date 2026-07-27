@@ -20,7 +20,7 @@ from agent.market_calendar import (MAX_YEAR, MIN_YEAR, CalendarCoverageError,
                                    exercises_calendar, is_early_close,
                                    is_trading_day, session_for_instant,
                                    session_times, settlement_date,
-                                   trailing_sessions)
+                                   settlement_instant, trailing_sessions)
 
 # ----------------------------------------------------------- trading-day predicate
 
@@ -217,6 +217,36 @@ def test_settlement_supports_a_configurable_t_plus():
 def test_settlement_refuses_a_non_trading_fill_date():
     with pytest.raises(ValueError):
         settlement_date(date(2024, 12, 25))
+
+
+# ---------------------------------------- settlement_instant (the one combinator)
+
+def test_settlement_instant_is_market_open_of_the_settlement_session():
+    """The single combinator every settlement-aware caller should use
+    instead of composing session_for_instant + settlement_date +
+    session_times itself -- SimulatorBroker and Ledger both call this, so
+    there is one settlement model, not two."""
+    filled_at = datetime(2026, 1, 20, 15, 0, tzinfo=timezone.utc)   # Tue, during market hours
+    expected_session = settlement_date(date(2026, 1, 20))            # Wed 2026-01-21
+    assert settlement_instant(filled_at) == session_times(expected_session).open
+
+
+def test_settlement_instant_skips_a_weekend_and_an_adjacent_holiday():
+    """Same Friday-into-MLK-Monday case as settlement_date's own test:
+    settlement_instant must land on Tuesday's market open, not Monday's or
+    Saturday's."""
+    friday_fill = datetime(2026, 1, 16, 15, 0, tzinfo=timezone.utc)
+    assert settlement_instant(friday_fill) == session_times(date(2026, 1, 20)).open
+
+
+def test_settlement_instant_supports_a_configurable_t_plus():
+    filled_at = datetime(2026, 1, 20, 15, 0, tzinfo=timezone.utc)
+    assert settlement_instant(filled_at, t_plus=2) == session_times(date(2026, 1, 22)).open
+
+
+def test_settlement_instant_requires_a_timezone_aware_datetime():
+    with pytest.raises(ValueError):
+        settlement_instant(datetime(2026, 1, 20, 15, 0))
 
 
 # --------------------------------------------------------- coverage boundary

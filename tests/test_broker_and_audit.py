@@ -61,9 +61,9 @@ def gatekeeper(*, live=False):
                       live=live)
 
 
-def broker(cash=500.0, live=False):
+def broker(cash=500.0, live=False, now=None):
     cls = LiveSimulator if live else SimulatorBroker
-    b = cls(account_id=ACCT, cash=cash, now=T0)
+    b = cls(account_id=ACCT, cash=cash, now=now or T0)
     b.set_price("SPY", 500.0)
     gk = gatekeeper(live=live)
     b.attach_staging_key(gk.signing_key)
@@ -142,6 +142,31 @@ def test_sale_proceeds_settle_t_plus_one():
     assert b.account().unsettled_cash == 250.0
     assert b.account().settled_cash == 250.0
     b.advance(timedelta(days=1))
+    assert b.account().unsettled_cash == 0.0
+    assert b.account().settled_cash == 500.0
+
+
+def test_sale_proceeds_settle_on_the_real_next_session_not_a_calendar_day():
+    """Session-aware settlement (agent.market_calendar.settlement_instant),
+    not a naive timedelta(days=1) -- a Friday sale must NOT settle on
+    Saturday, and must skip an adjacent holiday. Same verified week as
+    tests/test_daytrade.py and tests/test_ledger.py: Friday 2026-01-16 into
+    MLK Monday (2026-01-19, not a trading day) settles Tuesday 2026-01-20,
+    not Saturday and not Monday."""
+    from agent import market_calendar as mc
+    friday = datetime(2026, 1, 16, 15, 0, tzinfo=timezone.utc)
+    b, gk = broker(now=friday)
+    b.submit(staged(gk, client_order_id="buy", qty=0.5, now=friday))
+    b.submit(staged(gk, client_order_id="sell", side="SELL", qty=0.5,
+                    lots=[lot(0.5, opened=friday)], now=friday))
+    assert b.account().unsettled_cash == 250.0
+
+    b.advance(timedelta(days=1))   # lands on Saturday -- must still be unsettled
+    assert b.account().unsettled_cash == 250.0
+    assert b.account().settled_cash == 250.0
+
+    settle_at = mc.settlement_instant(friday)
+    b.advance(settle_at - b.now)   # advance the rest of the way to Tuesday's market open
     assert b.account().unsettled_cash == 0.0
     assert b.account().settled_cash == 500.0
 

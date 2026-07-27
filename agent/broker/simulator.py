@@ -135,7 +135,13 @@ class SimulatorBroker(BrokerAdapter):
             self._positions[symbol] = (held - qty, avg)
             self._cash += notional
             self._unsettled += notional
-            self._settlements.append((self._now + timedelta(days=1), notional))
+            # Session-aware settlement (§4.1), not a naive calendar-day
+            # guess: a Friday sale must not settle on Saturday, and an
+            # adjacent holiday must not be invisible. One settlement
+            # model, not two -- agent.ledger.Ledger calls the exact same
+            # combinator (see market_calendar.settlement_instant's own
+            # docstring).
+            self._settlements.append((market_calendar.settlement_instant(self._now), notional))
 
         order = BrokerOrder(
             account_id=self.account_id,
