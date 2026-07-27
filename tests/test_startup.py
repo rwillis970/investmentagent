@@ -267,6 +267,34 @@ def test_reconciliation_catches_up_a_mode_written_but_never_audited():
     assert len(ms.history()) == 1
 
 
+def test_a_single_gap_produces_exactly_one_catch_up_row_across_three_startups():
+    """Regression: _last_claimed_mode used to recognize only mode_transition
+    rows, so the mode_persisted_reconciled row _reconcile_mode_persistence
+    itself appends was invisible to its own next scan. Every subsequent
+    same-mode restart following one write-then-crash gap would see the same
+    stale (pre-gap) claim, diverge again, and append ANOTHER catch-up row --
+    forever, once per startup. Three startups across a single gap must
+    produce exactly one catch-up row, not three."""
+    log = AuditLog()
+    ms = ModeStore()
+    ms.write("PRODUCTION_ACTIVE", changed_at=NOW - timedelta(hours=1))
+    # audit_log is empty -- as if the process crashed between the mode
+    # write and its paired audit row. This is the one and only gap.
+
+    for i in range(3):
+        result = run_startup(target_mode="PRODUCTION_ACTIVE", confirmed=False,
+                             audit_log=log, mode_store=ms, accounts=[],
+                             approval_service=approval_service(),
+                             now=NOW + timedelta(minutes=i))
+        assert result.mode == "PRODUCTION_ACTIVE"
+
+    catch_up_rows = [ev for ev in log.events if ev.action == "mode_persisted_reconciled"]
+    assert len(catch_up_rows) == 1
+    assert catch_up_rows[0].before == {"mode": None}
+    assert catch_up_rows[0].after == {"mode": "PRODUCTION_ACTIVE"}
+    assert len(ms.history()) == 1   # no new mode_store write across any of the three
+
+
 def test_reconciliation_does_not_fire_when_the_log_already_agrees():
     ms, log = agreeing_store_and_log("PAPER")
     run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
@@ -274,16 +302,37 @@ def test_reconciliation_does_not_fire_when_the_log_already_agrees():
     assert "mode_persisted_reconciled" not in [ev.action for ev in log.events]
 
 
-def test_reconciliation_reads_the_latest_mode_transition_not_other_actions():
+def test_reconciliation_reads_the_latest_mode_claim_not_other_actions():
     """Guards the scanner in _last_claimed_mode: it must look specifically
-    for action="mode_transition" rows and ignore everything else (e.g.
-    startup_complete, whose `after` is a plain string mode, not the
-    {"mode": ...} dict shape mode_transition rows use) -- picking the wrong
-    row would either misdetect a gap or crash on `ev.after["mode"]`."""
+    for action in ("mode_transition", "mode_persisted_reconciled") and
+    ignore everything else -- e.g. startup_complete, which carries the same
+    {"mode": ...} dict shape (both do, since the Commit 1 fix) but is not
+    itself a claim about the persisted mode. Picking it up anyway would
+    still (harmlessly, here) agree with the real seed claim, but the
+    scanner's correctness must come from the action-name filter, not from
+    startup_complete happening to agree by coincidence."""
     ms, log = agreeing_store_and_log("PAPER")
     # A later, unrelated action after the real mode_transition seed row.
     log.append(actor="system", action="startup_complete", object_type="mode",
-              object_id="system", before="PAPER", after="PAPER",
+              object_id="system", before={"mode": "PAPER"}, after={"mode": "PAPER"},
+              timestamp=NOW - timedelta(minutes=30))
+    run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
+               accounts=[], approval_service=approval_service(), now=NOW)
+    assert "mode_persisted_reconciled" not in [ev.action for ev in log.events]
+
+
+def test_reconciliation_ignores_a_disagreeing_startup_complete_row():
+    """The stronger version of the test above: a startup_complete row that
+    DISAGREES with the real last claim, placed after it. If the scanner
+    picked this up instead of filtering by action name, it would wrongly
+    conclude mode_store agrees with the log (both say DISABLED) and skip
+    reconciliation -- when the actual last mode_transition claim (PAPER)
+    matches mode_store, so no reconciliation should fire either way, but
+    for the RIGHT reason: the scanner found the PAPER mode_transition row,
+    never looked at the DISABLED startup_complete row at all."""
+    ms, log = agreeing_store_and_log("PAPER")
+    log.append(actor="system", action="startup_complete", object_type="mode",
+              object_id="system", before={"mode": "DISABLED"}, after={"mode": "DISABLED"},
               timestamp=NOW - timedelta(minutes=30))
     run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
                accounts=[], approval_service=approval_service(), now=NOW)

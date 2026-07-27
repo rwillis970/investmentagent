@@ -346,11 +346,25 @@ class StartupResult:
 
 def _last_claimed_mode(audit_log: AuditLog) -> str | None:
     """The mode the audit log most recently claimed was persisted, per its
-    latest `mode_transition` row -- or None if it has never claimed one.
-    Compared against `mode_store.current()` to detect the DECISION 5 gap:
-    a mode written but never audited."""
+    latest `mode_transition` OR `mode_persisted_reconciled` row (both write
+    the same `after={"mode": ...}` shape) -- or None if it has never
+    claimed one. Compared against `mode_store.current()` to detect the
+    DECISION 5 gap: a mode written but never audited.
+
+    MUST include `mode_persisted_reconciled`, not just `mode_transition`:
+    that row is `_reconcile_mode_persistence`'s own catch-up claim, and if
+    this scanner can't see it, it is blind to the very row that closed the
+    gap it detected last time. Concretely: after one write-then-crash gap,
+    the first startup appends a catch-up row claiming the mode mode_store
+    already had. Every subsequent same-mode restart then re-scans the log
+    -- if this function only recognized `mode_transition`, it would find
+    the stale PRE-gap claim (or none at all) every single time, see the
+    same divergence again, and append ANOTHER catch-up row. Forever, once
+    per startup, from a single original gap. Recognizing the catch-up row
+    as a claim closes that: the second startup sees its own log now
+    agrees with mode_store, and appends nothing further."""
     for ev in reversed(audit_log.events):
-        if ev.action == "mode_transition":
+        if ev.action in ("mode_transition", "mode_persisted_reconciled"):
             # .get, not [] -- a malformed row (e.g. tampering) must not
             # crash this scanner; it should read as "no valid claim" and
             # let verify() below report the corruption properly.
@@ -567,9 +581,12 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
                          correlation_id=correlation_id, timestamp=now)
 
     # -- ready to resume (DECISION 4: resume itself is not built here).
+    # before/after are {"mode": ...} dicts, matching every sibling row
+    # (mode_transition, mode_persisted_reconciled) -- this used to pass
+    # bare strings, the one inconsistent row in the log.
     audit_log.append(
         actor="system", action="startup_complete", object_type="mode",
-        object_id="system", before=persisted_mode, after=target_mode,
+        object_id="system", before={"mode": persisted_mode}, after={"mode": target_mode},
         correlation_id=correlation_id, timestamp=now,
     )
 

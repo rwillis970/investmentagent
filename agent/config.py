@@ -144,6 +144,24 @@ class Config:
     budget_warning_usd: float = 15.0
     budget_hard_stop_usd: float = 30.0
 
+    # Alpaca adapter HTTP timeouts/retries (agent/broker/alpaca.py). Real,
+    # required numbers -- added in the same commit that reads them (§9.1).
+    # 10s: generous for a slow response without leaving a submit/read
+    # hanging for minutes on a laptop that may itself be waking from sleep
+    # or on a flaky connection; short enough that a hung call fails fast
+    # into the fail-safe path rather than blocking whatever is waiting on
+    # it. 2 retries (3 attempts total): applies to READS ONLY --
+    # account()/positions()/open_orders()/get_by_client_id() have no side
+    # effects, so retrying a timeout or transport error is safe. Writes
+    # (submit/cancel) NEVER retry regardless of this setting: a write that
+    # times out is the dangerous, ambiguous case (the order may have
+    # reached Alpaca before the response was lost), and retrying it risks
+    # a second, real submission. See agent/broker/alpaca.py's
+    # AmbiguousOrderState for how that case is actually handled --
+    # resolved via get_by_client_id, never blindly resubmitted or retried.
+    broker_http_timeout_seconds: float = 10.0
+    broker_http_max_retries: int = 2
+
     trade_capabilities: dict = field(default_factory=dict)
     sides: dict = field(default_factory=dict)
     funding: dict = field(default_factory=dict)
@@ -348,6 +366,11 @@ def validate(cfg: Config) -> None:
         err.append("max_day_trades_per_5_sessions above 3 risks a PDT restriction (§4.4)")
     if not cfg.budget_warning_usd < cfg.monthly_budget_usd <= cfg.budget_hard_stop_usd:
         err.append("require budget_warning < monthly_budget <= budget_hard_stop")
+
+    if cfg.broker_http_timeout_seconds <= 0:
+        err.append("broker_http_timeout_seconds must be positive")
+    if cfg.broker_http_max_retries < 0:
+        err.append("broker_http_max_retries cannot be negative")
 
     caps = cfg.capability_policy
     # Every dimension must be populated. TradeCapabilityPolicy default-denies,

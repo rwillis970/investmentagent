@@ -176,3 +176,30 @@ def test_config_policy_permits_a_normal_long_order():
     assert caps.allows(gate=Gate.PRE_SUBMIT, live=True, asset_class="ETF",
                        side="BUY", funding="SETTLED_CASH", order_type="LIMIT",
                        session="REGULAR", time_in_force="DAY")
+
+
+def test_example_config_carries_broker_http_defaults():
+    """§9.1: added in the same commit that reads them (agent/broker/alpaca.py).
+    The example config still loads verbatim."""
+    cfg = C.load(base())
+    assert cfg.broker_http_timeout_seconds == 10.0
+    assert cfg.broker_http_max_retries == 2
+
+
+def test_broker_http_timeout_must_be_positive():
+    with pytest.raises(C.ConfigError, match="broker_http_timeout_seconds must be positive"):
+        C.load(base(broker_http_timeout_seconds=0))
+    with pytest.raises(C.ConfigError, match="broker_http_timeout_seconds must be positive"):
+        C.load(base(broker_http_timeout_seconds=-1))
+
+
+def test_broker_http_max_retries_cannot_be_negative():
+    with pytest.raises(C.ConfigError, match="broker_http_max_retries cannot be negative"):
+        C.load(base(broker_http_max_retries=-1))
+
+
+def test_broker_http_max_retries_of_zero_is_allowed():
+    """Zero retries -- exactly one attempt, no retry at all -- is a legitimate
+    conservative choice, not an error."""
+    cfg = C.load(base(broker_http_max_retries=0))
+    assert cfg.broker_http_max_retries == 0

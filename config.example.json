@@ -32,6 +32,8 @@
   "monthly_budget_usd": 20,
   "budget_warning_usd": 15,
   "budget_hard_stop_usd": 30,
+  "broker_http_timeout_seconds": 10,
+  "broker_http_max_retries": 2,
   "trade_capabilities": {
     "US_EQUITY": "PRODUCTION_ALLOWED",
     "ETF": "PRODUCTION_ALLOWED",
