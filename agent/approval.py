@@ -58,6 +58,11 @@ class ApprovalToken:
     decided_at: datetime
     decision_elapsed_ms: int
     consumed_at: datetime | None = None
+    # Set only by ApprovalService.sweep_expired (§8.1 startup), never by
+    # consume() -- kept distinct from consumed_at so a token retired because
+    # it went stale across a restart never reads, in its own audit trail, as
+    # though it had actually been spent on an order.
+    swept_at: datetime | None = None
 
     def consume(self, *, fingerprint: str, price: float, now: datetime) -> None:
         """Atomically spend the token, or raise. Callers must treat any
@@ -67,9 +72,11 @@ class ApprovalToken:
                 f"token {self.token_id} was already consumed at "
                 f"{self.consumed_at.isoformat()}"
             )
-        if now >= self.expires_at:
+        if self.swept_at is not None or now >= self.expires_at:
             raise TokenExpired(
                 f"token {self.token_id} expired at {self.expires_at.isoformat()}"
+                + ("" if self.swept_at is None else
+                   f" and was swept as stale at startup ({self.swept_at.isoformat()})")
             )
         if fingerprint != self.order_fingerprint:
             raise OrderMismatch(
@@ -127,6 +134,23 @@ class ApprovalService:
         )
         self._tokens[token_id] = tok
         return tok
+
+    def sweep_expired(self, *, now: datetime) -> list[ApprovalToken]:
+        """§8.1 startup: `consume()` only ever notices a token is stale when
+        something tries to spend it, so a token that was live at shutdown is
+        still live in memory at startup until an order attempts to use it --
+        which, for a token approved against a specific fingerprint and price
+        band, may never happen again. This walks every issued token once and
+        explicitly retires any that are already past `expires_at` and not
+        yet consumed or already swept, returning them (issuance order) so
+        the caller can audit each one -- this is a state change, not a
+        query, and §8.1 requires it be audited."""
+        swept = []
+        for tok in self._tokens.values():
+            if tok.consumed_at is None and tok.swept_at is None and now >= tok.expires_at:
+                tok.swept_at = now
+                swept.append(tok)
+        return swept
 
     def rubber_stamp_risk(self, decisions: list[ApprovalToken]) -> bool:
         """§3.4 — surfaced on the dashboard, not enforced silently."""
