@@ -60,6 +60,43 @@ repeated `fill_id`. `load()` returns `None` for the opening balance until
 it has been written at all -- the fresh-install case -- so a caller can
 tell "never seeded" apart from "seeded to 0.0" without guessing.
 
+REVIEW FIX -- NOTHING REACHES DISK THAT A `Ledger` WOULD REJECT.
+`write_fill`/`write_order_record` used to append whatever they were given,
+with no validation of their own, while `Ledger.record_fill` enforces
+cross-account, duplicate-fill-id-with-differing-contents, unknown-lot and
+lot-overdraw. Because this store is append-only, a bad row written once
+made `to_ledger()` raise on EVERY future restart, with no way to remove
+it -- a permanently poisoned file. Fixed by ROUTING EVERY WRITE THROUGH AN
+INTERNAL, VALIDATING `Ledger` FIRST, not by re-implementing the same
+checks a second time in this module: `LedgerStore.__init__` builds a
+private `Ledger` (opening_settled_cash is a placeholder 0.0 here -- never
+exposed, used only to replay `record_fill`/`record_order_status` for their
+validation) and replays whatever is already on disk into it.
+`write_fill`/`write_order_record` call that Ledger's own
+`record_fill`/`record_order_status` BEFORE `_append_row` is ever reached;
+a rejection raises the exact same exception a bare `Ledger` would (
+`CrossAccountError`, `DuplicateFillError`, `UnknownLotError`,
+`LotOverdrawnError`, `HoldingViolation`, or plain `LedgerError`) and
+touches disk not at all -- confirmed by
+`tests/test_ledger_store.py::test_writes_reach_disk_only_after_validation_not_before`,
+which patches `_append_row` to explode if a rejected write ever reaches
+it. The alternative considered -- duplicating each check directly inside
+this module -- was rejected for the same "one implementation, not two"
+reason `BrokerAdapter.sessions()` and `market_calendar.settlement_instant`
+already exist to enforce elsewhere in this codebase: `Ledger` already has
+this logic, tested, and any future change to it would otherwise need to
+be made twice to stay in sync.
+
+REVIEW FIX -- BOUND TO ONE `account_id` AT CONSTRUCTION. Like
+`ModeStore`/`DayTradeGuard`/`Ledger`, this store now takes `account_id`
+(and `policy_registry`) in `__init__`, not per-call. `to_ledger()` no
+longer accepts either as an argument -- there is nothing left to supply
+that could disagree with what the store is already bound to. A fill or
+order record for a different account is a `CrossAccountError` at
+`write_fill`/`write_order_record` time (raised by the internal validating
+`Ledger`, which already enforces this), never merely discovered later at
+`to_ledger()` time.
+
 FSYNC: DELIBERATELY NOT USED HERE, UNLIKE MODESTORE. `ModeStore.write`
 justifies fsync on the grounds that a crash must never be mistaken for
 permission to keep trading -- mode has NO independent, external source of
@@ -98,6 +135,7 @@ from pathlib import Path
 
 from .holding import HoldingPolicyRegistry
 from .ledger import Fill, Ledger, OrderRecord
+from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy
 
 
 class LedgerStoreError(Exception):
@@ -106,19 +144,34 @@ class LedgerStoreError(Exception):
 
 class LedgerStore:
     """Append-only (for fills and order records) durable persistence for
-    ONE account's ledger. Own file, own class -- see module docstring for
-    why this is not `FactStore`. `load()` replays the whole file into
+    ONE account's ledger -- bound to that `account_id` (and
+    `policy_registry`) at construction, like `ModeStore`/`DayTradeGuard`/
+    `Ledger`. Own file, own class -- see module docstring for why this is
+    not `FactStore`. `load()` replays the whole file into
     `(opening_settled_cash, fills, order_records)`; nothing here is ever
-    mutated in place on disk."""
+    mutated in place on disk. Every write is validated through an
+    internal `Ledger` BEFORE anything reaches disk -- see module
+    docstring's REVIEW FIX sections."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, account_id: str,
+                policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
+                lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY):
         self._path = Path(path)
+        self.account_id = account_id
+        self._policy_registry = policy_registry
+        self._t_plus = t_plus
+        self._lot_selection_policy = lot_selection_policy
+        self._opening: float | None = None
+        # The validating Ledger's own opening_settled_cash is a PLACEHOLDER
+        # -- never read, never exposed. It exists purely so record_fill/
+        # record_order_status's existing validation logic can be reused
+        # as-is rather than re-implemented here. The REAL opening balance
+        # (self._opening) is tracked separately, alongside it.
+        self._ledger = Ledger(account_id=account_id, opening_settled_cash=0.0,
+                              policy_registry=policy_registry, t_plus=t_plus,
+                              lot_selection_policy=lot_selection_policy)
         if self._path.exists():
-            self._opening, self._fills, self._orders = self._load()
-        else:
-            self._opening: float | None = None
-            self._fills: list[Fill] = []
-            self._orders: list[OrderRecord] = []
+            self._load_into(self._ledger)
 
     def write_opening_balance(self, amount: float, *, at: datetime) -> None:
         if at.tzinfo is None:
@@ -135,39 +188,46 @@ class LedgerStore:
         self._opening = amount
 
     def write_fill(self, fill: Fill) -> None:
-        row = dict(kind="fill", **_encode_fill(fill))
-        self._append_row(row)
-        self._fills.append(fill)
+        """Validated through the internal `Ledger` BEFORE a single byte
+        reaches disk -- a rejection raises exactly what a bare `Ledger`
+        would (CrossAccountError, DuplicateFillError, UnknownLotError,
+        LotOverdrawnError, HoldingViolation, LedgerError) and leaves the
+        file untouched."""
+        already_known = any(f.fill_id == fill.fill_id for f in self._ledger.fills)
+        self._ledger.record_fill(fill)   # raises before anything is persisted
+        if already_known:
+            return   # byte-identical replay -- Ledger already no-op'd it
+        self._append_row(dict(kind="fill", **_encode_fill(fill)))
 
     def write_order_record(self, record: OrderRecord) -> None:
-        row = dict(kind="order_record", **_encode_order_record(record))
-        self._append_row(row)
-        self._orders.append(record)
+        """Same validate-then-persist discipline as `write_fill`."""
+        self._ledger.record_order_status(record)   # raises before anything is persisted
+        self._append_row(dict(kind="order_record", **_encode_order_record(record)))
 
     def load(self) -> tuple[float | None, tuple[Fill, ...], tuple[OrderRecord, ...]]:
-        return self._opening, tuple(self._fills), tuple(self._orders)
+        return self._opening, self._ledger.fills, self._ledger.order_records
 
-    def to_ledger(self, *, account_id: str, policy_registry: HoldingPolicyRegistry,
-                 t_plus: int = 1) -> Ledger:
-        """Reconstruct a working `Ledger` from this store -- the actual
-        restart path this module exists for. Lives here, not on `Ledger`
-        itself, so `Ledger` stays entirely decoupled from persistence (no
-        I/O, no knowledge of `LedgerStore`, matching `HoldingPolicyRegistry`/
-        `DayTradeGuard`'s own no-hidden-I/O style). Refuses to guess when
-        this store has never been seeded: a fresh install with no
-        `opening_settled_cash` recorded must not silently become an
+    def to_ledger(self) -> Ledger:
+        """Reconstruct a fresh, correctly-seeded `Ledger` from this store
+        -- the actual restart path this module exists for. Takes no
+        arguments: `account_id`/`policy_registry` are already bound at
+        construction, so there is nothing left to (mis)supply. Lives here,
+        not on `Ledger` itself, so `Ledger` stays entirely decoupled from
+        persistence (no I/O, no knowledge of `LedgerStore`). Refuses to
+        guess when this store has never been seeded: a fresh install with
+        no `opening_settled_cash` recorded must not silently become an
         opening balance of 0.0 (see module docstring)."""
-        opening, fills, order_records = self.load()
-        if opening is None:
+        if self._opening is None:
             raise LedgerStoreError(
                 "this ledger store has no opening_settled_cash recorded yet -- "
                 "seed it via write_opening_balance(...) before reconstructing "
                 "a Ledger from it; refusing to guess 0.0"
             )
         return Ledger.from_records(
-            account_id=account_id, opening_settled_cash=opening,
-            policy_registry=policy_registry, t_plus=t_plus,
-            fills=fills, order_records=order_records,
+            account_id=self.account_id, opening_settled_cash=self._opening,
+            policy_registry=self._policy_registry, t_plus=self._t_plus,
+            lot_selection_policy=self._lot_selection_policy,
+            fills=self._ledger.fills, order_records=self._ledger.order_records,
         )
 
     def update(self, *a, **k):
@@ -184,30 +244,32 @@ class LedgerStore:
             fh.write(json.dumps(row) + "\n")
             fh.flush()
 
-    def _load(self):
-        # Read the whole file before appending anything, matching
-        # FactStore._load's/ModeStore._load's own reasoning: the reader
-        # must never observe a row written during its own replay.
+    def _load_into(self, ledger: Ledger) -> None:
+        """Read the whole file before replaying anything, matching
+        `FactStore._load`'s/`ModeStore._load`'s own reasoning: the reader
+        must never observe a row written during its own replay. Fills and
+        order records are replayed THROUGH `ledger.record_fill`/
+        `record_order_status` -- the same validation path a fresh write
+        goes through -- rather than appended to a plain list directly, so
+        a file that was somehow hand-edited into an invalid state (a
+        cross-account row, an overdrawn lot) is refused at load time too,
+        not just at write time."""
         with self._path.open(encoding="utf-8") as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
-        opening: float | None = None
-        fills: list[Fill] = []
-        orders: list[OrderRecord] = []
         for line in lines:
             row = json.loads(line)
             kind = row.get("kind")
             if kind == "opening_balance":
-                opening = row["amount"]
+                self._opening = row["amount"]
             elif kind == "fill":
-                fills.append(_decode_fill(row))
+                ledger.record_fill(_decode_fill(row))
             elif kind == "order_record":
-                orders.append(_decode_order_record(row))
+                ledger.record_order_status(_decode_order_record(row))
             else:
                 raise LedgerStoreError(
                     f"unrecognised ledger store row kind {kind!r} -- refusing to "
                     "silently skip a row this version does not understand"
                 )
-        return opening, fills, orders
 
 
 def _encode_fill(f: Fill) -> dict:

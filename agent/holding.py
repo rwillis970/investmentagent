@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 
 from .durations import parse_duration
+from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy, disposal_order
 
 
 class ExitCategory(Enum):
@@ -150,15 +151,54 @@ def open_lots(lots, account_id: str, symbol: str | None = None):
             and (symbol is None or l.symbol == symbol)]
 
 
-def sellable_qty(lots, account_id: str, symbol: str, now: datetime) -> float:
-    """Quantity a normal strategy exit may sell right now, for THIS account."""
-    return sum(l.qty for l in open_lots(lots, account_id, symbol)
-               if l.is_hold_eligible(now) and l.is_settled(now))
+def sellable_qty(lots, account_id: str, symbol: str, now: datetime, *,
+                 lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY
+                 ) -> float:
+    """Quantity a normal strategy exit may sell right now, for THIS account.
+
+    REVIEW FIX (Commit 5): an internal `lot_id` does not control which lot
+    the broker actually disposes of -- Alpaca's confirmed default matches
+    sells in FIFO order across ALL open lots for a symbol, not whichever
+    lot our own bookkeeping happens to think is being sold (see
+    `agent.lot_selection` for the citations). This used to sum the qty of
+    every INDIVIDUALLY hold-eligible-and-settled lot, ignoring order
+    entirely -- which is wrong whenever an older, FIFO-first lot is still
+    inside its hold while a newer lot happens to already be eligible (e.g.
+    opened under a shorter policy version). In that case the broker would
+    consume the older, blocked lot FIRST on any sell, regardless of which
+    lot we believed we were selling -- so that older lot's ineligibility
+    must block everything behind it in FIFO order, not just its own qty.
+
+    The fix: walk lots in the broker's actual disposal order and sum only
+    the MAXIMAL LEADING RUN of lots that are each settled and past their
+    own minimum hold. The first lot that fails either check stops the sum
+    there -- everything from that lot onward is unreachable until it is
+    disposed of, no matter how eligible a later lot looks in isolation.
+
+    NO OVERRIDE OR BYPASS PATH: `disposal_order` raises
+    `UnsupportedLotSelectionPolicy` for any method other than the one
+    confirmed broker default, and that exception is left to propagate
+    here, uncaught -- a gate that falls back to a guessed ordering when it
+    can't determine the real one is not a gate."""
+    ordered = disposal_order(lot_selection_policy, open_lots(lots, account_id, symbol))
+    total = 0.0
+    for l in ordered:
+        if not (l.is_hold_eligible(now) and l.is_settled(now)):
+            break
+        total += l.qty
+    return total
 
 
-def blocked_qty(lots, account_id: str, symbol: str, now: datetime) -> float:
-    return sum(l.qty for l in open_lots(lots, account_id, symbol)
-               if not (l.is_hold_eligible(now) and l.is_settled(now)))
+def blocked_qty(lots, account_id: str, symbol: str, now: datetime, *,
+                lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY
+                ) -> float:
+    """Everything open for this symbol that `sellable_qty` does not count --
+    including lots that would look individually eligible but sit behind an
+    ineligible FIFO predecessor (see `sellable_qty`'s docstring)."""
+    ordered = open_lots(lots, account_id, symbol)
+    total_open = sum(l.qty for l in ordered)
+    return total_open - sellable_qty(lots, account_id, symbol, now,
+                                     lot_selection_policy=lot_selection_policy)
 
 
 def check_normal_exit(lot: Lot, now: datetime) -> None:

@@ -99,6 +99,23 @@ enforced across the whole fill list but implicit in `record_fill`'s
 ordering requirement: a lot's BUY fill must be recorded before any SELL
 fill references it.
 
+DECISION 4 -- RECORDING (NOT CHOOSING) THE BROKER'S ACTUAL DISPOSAL LOT
+(Commit 4, review fix). The paragraph above still holds: `fill.lot_id`
+remains the caller's own, authoritative choice of which lot OUR bookkeeping
+reduces -- this ledger does not override it. But an internal `lot_id` does
+not control which lot Alpaca actually disposes of, and if nothing ever
+compares the two, a strategy could believe it sold a seasoned, hold-eligible
+lot while the broker actually consumed a fresh one -- invisibly. So this
+ledger now ALSO records, for every SELL fill, what Alpaca's confirmed actual
+disposal order (`agent.lot_selection`, BROKER_FIFO -- see that module for
+the citations establishing it) would have consumed first, given the open
+lots for that symbol as of that fill. `disposal_records()` returns one
+entry per SELL fill, intended vs. broker-actual, computed fresh from
+`self._fills` like everything else here -- nothing new is stored, only
+derived. See `agent.holding.sellable_qty` for where the actual gate now
+uses this same disposal order to enforce the minimum hold against reality,
+not against whichever lot_id a caller happened to reference.
+
 `positions()` RETURNS TOTAL HELD QTY, NOT `holding.sellable_qty`. A broker's
 own `/v2/positions` reports everything currently held, settled or not --
 that is what `agent.reconciliation.reconcile_positions` compares this
@@ -124,6 +141,7 @@ from datetime import datetime
 from . import market_calendar
 from .accounts import CrossAccountError
 from .holding import HoldingPolicyRegistry, Lot
+from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy, disposal_order
 
 _SIDES = ("BUY", "SELL")
 _OPEN, _CLOSED = "OPEN", "CLOSED"
@@ -178,6 +196,35 @@ class Fill:
 
 
 @dataclass(frozen=True)
+class DisposalRecord:
+    """One SELL fill's intended lot vs. the lot Alpaca's confirmed actual
+    disposal order would have consumed first (see `Ledger.disposal_records`
+    and DECISION 4 in this module's docstring). `intended_lot_id ==
+    broker_lot_id` is the normal, non-divergent case; recorded either way,
+    not only when they differ, so the absence of a divergence is a positive
+    fact rather than something inferred from silence."""
+    fill_id: str
+    account_id: str
+    symbol: str
+    intended_lot_id: str
+    broker_lot_id: str
+    at: datetime
+
+
+class _OpenLotRef:
+    """Minimal duck-typed stand-in for `agent.lot_selection.disposal_order`,
+    which only needs `.lot_id` and `.opened_at` -- deliberately not a real
+    `holding.Lot` here, since disposal ordering needs neither settlement nor
+    holding-policy state, and building one would require inventing values
+    for fields this computation has no use for."""
+    __slots__ = ("lot_id", "opened_at")
+
+    def __init__(self, lot_id: str, opened_at: datetime):
+        self.lot_id = lot_id
+        self.opened_at = opened_at
+
+
+@dataclass(frozen=True)
 class OrderRecord:
     """One order-lifecycle event. Append-only, same discipline as `Fill`:
     "is this client_order_id open" is DERIVED by replaying these, never
@@ -200,7 +247,8 @@ class Ledger:
     nothing else here is state that could drift from that record."""
 
     def __init__(self, *, account_id: str, opening_settled_cash: float,
-                policy_registry: HoldingPolicyRegistry, t_plus: int = 1):
+                policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
+                lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY):
         if opening_settled_cash < 0:
             raise LedgerError(
                 f"opening_settled_cash must not be negative, got {opening_settled_cash!r}"
@@ -209,6 +257,7 @@ class Ledger:
         self._opening_settled_cash = opening_settled_cash
         self._policy_registry = policy_registry
         self._t_plus = t_plus
+        self._lot_selection_policy = lot_selection_policy
         self._fills: list[Fill] = []
         self._order_records: list[OrderRecord] = []
         self._fill_ids: dict[str, Fill] = {}
@@ -216,6 +265,7 @@ class Ledger:
     @classmethod
     def from_records(cls, *, account_id: str, opening_settled_cash: float,
                      policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
+                     lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY,
                      fills=(), order_records=()) -> "Ledger":
         """Reconstruct a ledger from a previously-recorded (fills,
         order_records) pair alone -- the directly testable form of "this
@@ -227,7 +277,8 @@ class Ledger:
         that calls this constructor; `Ledger` itself still has no I/O and
         no knowledge of that store, by design."""
         ledger = cls(account_id=account_id, opening_settled_cash=opening_settled_cash,
-                    policy_registry=policy_registry, t_plus=t_plus)
+                    policy_registry=policy_registry, t_plus=t_plus,
+                    lot_selection_policy=lot_selection_policy)
         for f in fills:
             ledger.record_fill(f)
         for r in order_records:
@@ -322,7 +373,39 @@ class Ledger:
         state between calls -- always recomputed, so this can never drift
         from `self._fills`. Returned `Lot` objects are real
         `agent.holding.Lot` instances, directly usable by
-        `holding.sellable_qty`/`holding.open_lots` with no adapting."""
+        `holding.sellable_qty`/`holding.open_lots` with no adapting.
+
+        COST BASIS ON A PARTIAL SALE (review fix). `cost_basis` is reduced
+        PROPORTIONALLY to the remaining qty -- not left at the original
+        full notional while only `qty` shrinks. Before this fix,
+        `cost_basis / qty` (the per-share basis) overstated the remaining
+        lot's basis after any partial sale (sell 2 of 5 shares bought for
+        $500 total left `cost_basis=500, qty=3`, implying $166.67/share
+        instead of the real $100/share). This is what
+        `remaining_fraction * base_lot.cost_basis` below fixes: the
+        remaining lot always reports the correct, original per-share
+        price times whatever qty is left.
+
+        THIS IS NOT THE SAME AS TRACKING REALISED BASIS FOR THE SOLD
+        PORTION, AND DELIBERATELY DOES NOT TRY TO BE. `agent.holding.Lot`
+        is checked by `grep`, exhaustively, for every reader of
+        `.cost_basis` anywhere in this codebase: there is exactly one --
+        this function, which WRITES it, not reads it. `agent.tax.classify`
+        takes `cost_basis`/`proceeds` as plain floats supplied directly by
+        whatever future caller invokes it; it does not read `Lot.cost_basis`
+        and nothing else does either. Given that, adding a second field to
+        the shared `holding.Lot` dataclass (rippling through
+        `HoldingPolicyRegistry.make_lot`/`lot_from_row` and every existing
+        fixture in tests/test_holding.py) for a value nothing consumes yet
+        is not justified by this unit's scope. The information is not
+        lost, though: the cost basis of whatever was SOLD is always
+        exactly reconstructable from `self.fills` alone (a SELL fill's own
+        `qty * price` against its lot's BUY fill's own per-share price) --
+        this ledger never discards a fill, append-only, so a future
+        tax-classification unit can compute realised gain per sale
+        directly from the fill log without `Lot` needing to carry it. A
+        fully-closed lot's `cost_basis` is therefore correctly 0.0 here --
+        nothing remains open to hold a basis -- not the original total."""
         buys: dict[str, Fill] = {}
         sold_qty: dict[str, float] = {}
         last_sell_at: dict[str, datetime] = {}
@@ -344,8 +427,48 @@ class Ledger:
             )
             sold = sold_qty.get(lot_id, 0.0)
             remaining = max(base_lot.qty - sold, 0.0)
+            remaining_fraction = (remaining / base_lot.qty) if base_lot.qty else 0.0
+            remaining_cost_basis = base_lot.cost_basis * remaining_fraction
             closed_at = last_sell_at.get(lot_id) if remaining <= 1e-9 else None
-            out.append(replace(base_lot, qty=remaining, closed_at=closed_at))
+            out.append(replace(base_lot, qty=remaining, cost_basis=remaining_cost_basis,
+                               closed_at=closed_at))
+        return out
+
+    def disposal_records(self) -> list[DisposalRecord]:
+        """One `DisposalRecord` per SELL fill: the lot our own bookkeeping
+        intended (`fill.lot_id`) alongside the lot Alpaca's confirmed actual
+        disposal order would have consumed first, given the open lots for
+        that symbol immediately before this fill applied its own reduction.
+        See DECISION 4 in this module's docstring and `agent.lot_selection`
+        for the citations behind BROKER_FIFO.
+
+        Computed by a forward replay of `self._fills` -- like `lots()`, but
+        tracking remaining qty PER POINT IN TIME rather than only the final
+        state, since the disposal order at fill N depends on what was still
+        open just before fill N, not on what is open now."""
+        remaining: dict[str, float] = {}
+        opened_at: dict[str, datetime] = {}
+        symbol_of: dict[str, str] = {}
+        out: list[DisposalRecord] = []
+        for f in self._fills:
+            if f.side.upper() == "BUY":
+                remaining[f.lot_id] = remaining.get(f.lot_id, 0.0) + f.qty
+                opened_at.setdefault(f.lot_id, f.filled_at)
+                symbol_of[f.lot_id] = f.symbol
+            else:
+                open_refs = [
+                    _OpenLotRef(lid, opened_at[lid])
+                    for lid, qty in remaining.items()
+                    if qty > 1e-9 and symbol_of.get(lid) == f.symbol
+                ]
+                ordered = disposal_order(self._lot_selection_policy, open_refs)
+                broker_lot_id = ordered[0].lot_id if ordered else f.lot_id
+                out.append(DisposalRecord(
+                    fill_id=f.fill_id, account_id=f.account_id, symbol=f.symbol,
+                    intended_lot_id=f.lot_id, broker_lot_id=broker_lot_id,
+                    at=f.filled_at,
+                ))
+                remaining[f.lot_id] = remaining.get(f.lot_id, 0.0) - f.qty
         return out
 
     def positions(self) -> dict[str, float]:

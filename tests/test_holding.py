@@ -5,6 +5,8 @@ import pytest
 from agent.holding import (ExitCategory, HoldingPolicy, HoldingPolicyRegistry,
                            HoldingViolation, Lot, blocked_qty,
                            check_normal_exit, request_early_exit, sellable_qty)
+from agent.lot_selection import (LotSelectionMethod, LotSelectionPolicy,
+                                 UnsupportedLotSelectionPolicy)
 
 T0 = datetime(2026, 7, 20, 14, 30, tzinfo=timezone.utc)
 ACCT = "acct-taxable"
@@ -42,12 +44,59 @@ def test_unsettled_lot_is_not_sellable_even_when_eligible():
 
 def test_shortening_policy_does_not_release_open_lots():
     """The lot's minimum_hold is frozen at fill; a new shorter policy is
-    irrelevant to it."""
-    old = lot(lid="old", hours=168)                      # opened under P7D
+    irrelevant to it.
+
+    REVIEW FIX (Commit 5): this used to assert `sellable_qty == 10.0` --
+    "only the new lot" -- on the theory that summing whichever individual
+    lots happen to be eligible is safe. It is not: Alpaca disposes of open
+    lots in FIFO order (see agent.lot_selection), so a sell would actually
+    consume `old` (opened FIRST, still inside its 168h hold) before it ever
+    touched `new`. The previous expectation described a system that BELIEVED
+    it was selling a fresh, already-eligible lot while the broker would have
+    actually sold the seasoned-but-still-held one -- exactly the silent
+    violation the minimum-hold gate exists to prevent. `old` blocks
+    everything behind it in FIFO order, so the correct sellable amount here
+    is 0.0, not 10.0."""
+    old = lot(lid="old", hours=168)                      # opened under P7D, FIFO-first
     new = lot(lid="new", hours=1, opened=T0 + timedelta(hours=1))
     t = T0 + timedelta(hours=3)
-    assert sellable_qty([old, new], ACCT, "SPY", t) == 10.0    # only the new lot
+    assert sellable_qty([old, new], ACCT, "SPY", t) == 0.0
+    assert blocked_qty([old, new], ACCT, "SPY", t) == 20.0
+
+
+def test_an_eligible_lot_is_blocked_by_an_ineligible_fifo_predecessor():
+    """Same shape as the fix above, spelled out directly: `old` is
+    FIFO-first and still inside its hold; `new` (opened later, shorter
+    policy) is individually eligible but unreachable behind it."""
+    old = lot(lid="old", hours=168, qty=4.0)
+    new = lot(lid="new", hours=1, qty=6.0, opened=T0 + timedelta(hours=1))
+    t = T0 + timedelta(hours=3)
+    assert sellable_qty([old, new], ACCT, "SPY", t) == 0.0
     assert blocked_qty([old, new], ACCT, "SPY", t) == 10.0
+
+
+def test_sellable_qty_is_the_maximal_eligible_fifo_prefix():
+    """Two lots eligible up front, then a blocking lot -- only the leading
+    run counts, even though nothing later in the list is itself checked."""
+    a = lot(lid="a", hours=1, qty=3.0, opened=T0)
+    b = lot(lid="b", hours=1, qty=2.0, opened=T0 + timedelta(hours=1))
+    c = lot(lid="c", hours=100, qty=9.0, opened=T0 + timedelta(hours=2))
+    t = T0 + timedelta(hours=4)
+    assert sellable_qty([a, b, c], ACCT, "SPY", t) == 5.0     # a + b, not c
+    assert blocked_qty([a, b, c], ACCT, "SPY", t) == 9.0
+
+
+def test_sellable_qty_refuses_an_unsupported_lot_selection_policy():
+    """No override or bypass path: if the disposal order can't be
+    determined, the gate must fail loudly, not fall back to summing
+    individually-eligible lots (which is the exact bug this policy exists
+    to close)."""
+    a = lot(lid="a", hours=1, qty=3.0)
+    unsupported = LotSelectionPolicy(version="hifo-hypothetical",
+                                     method=LotSelectionMethod.HIFO)
+    with pytest.raises(UnsupportedLotSelectionPolicy, match="not implemented"):
+        sellable_qty([a], ACCT, "SPY", T0 + timedelta(hours=2),
+                     lot_selection_policy=unsupported)
 
 
 def test_partial_sell_consumes_only_eligible_lots():

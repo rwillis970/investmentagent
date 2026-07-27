@@ -297,6 +297,50 @@ this check; see that module's own docstring for why no tolerance is introduced).
 verifies the two *totals* agree — it says nothing about, and cannot say anything about,
 which individual lots are settled.
 
+**Lot disposal order — an internal `lot_id` does not control which lot Alpaca actually
+sells (confirmed 2026-07-27, `agent/lot_selection.py`).** The `sellable_qty` formula above
+was originally evaluated per lot in isolation — summing whichever individual lots happened
+to be hold-eligible and settled, regardless of order. That is unsafe: if an older lot is
+still inside its minimum hold while a newer lot (opened under a shorter policy version)
+already happens to be eligible, a broker that disposes of lots in FIFO order will actually
+consume the older, still-held lot first on any sell, *not* the lot our own bookkeeping
+believed it was selling. The system could therefore record a normal, in-policy exit while
+the broker's own disposal silently violated the very minimum hold the gate exists to
+enforce. `sellable_qty` (`agent/holding.py`) now walks lots in the broker's actual disposal
+order and sums only the maximal leading run that is settled and past its own hold — the
+first ineligible lot blocks everything behind it, with no override or bypass path.
+
+What Alpaca's actual disposal method is, established from primary sources before writing
+any code (not assumed): the Customer Agreement
+(`files.alpaca.markets/disclosures/library/AcctAppMarginAndCustAgmt.pdf`, V25.2026.06) does
+**not** name a disposal method anywhere — its only relevant clause, §39 "Tax Reporting; Tax
+Withholding," says only that cost-basis information will be reported to the IRS "in
+accordance with applicable law." Alpaca's own product documentation does answer it:
+["Position Average Entry Price
+Calculation"](https://docs.alpaca.markets/us/docs/position-average-entry-price-calculation)
+states that Alpaca uses Weighted Average for same-day (intraday) positions and Compressed
+FIFO for end-of-day positions — same-day buys are compressed into one weighted-average lot,
+then day-aggregates are consumed oldest-day-first. No specific-identification, HIFO, LIFO or
+tax-optimised alternative is documented, and none is reachable through the order-submission
+API (`docs.alpaca.markets/us/docs/orders-at-alpaca` lists no lot or tax-lot parameter of any
+kind) — corroborated by Alpaca's own GitHub issue tracker
+(`alpacahq/Alpaca-API#213`, "Selling from a specific lot": *"it's not something we can
+handle on our end"*) and by multiple community forum threads (2020–2024) describing the
+same fixed-FIFO, no-designation behaviour with no contradicting report found.
+
+`agent/lot_selection.py`'s `LotSelectionPolicy` records this as a versioned, single
+supported method (`BROKER_FIFO`); specific identification, HIFO, LIFO and tax-optimised
+selection are enumerated but refuse to run (`UnsupportedLotSelectionPolicy`) rather than
+being silently approximated as FIFO. One known, recorded gap: our own `Lot` is one lot per
+BUY fill, so `disposal_order` approximates Alpaca's method as plain fill-time FIFO across
+all open lots — it does not replicate Alpaca's same-day weighted-average compression across
+multiple same-day buys. Not expected to bind for this pilot's shape (no same-day
+pyramiding into one symbol), but a real approximation, not an exact replica, and named here
+rather than assumed away. `agent.ledger.Ledger.disposal_records()` records, for every SELL
+fill, both the lot our strategy intended and the lot the broker's actual disposal order
+would consume first, so any divergence between the two is visible rather than silently
+invisible.
+
 ### 4.2 Early exit
 
 All six exception categories from Change Request §4.3 are adopted. The mechanism has four
@@ -1300,3 +1344,4 @@ plus a versioned `CapabilityChangeRequest` per §5.
 | v1.1 add | §9.2 mode transitions written out explicitly. Criterion 3 and the Day-1 exit criterion require a transition guard; membership validation alone does not provide one. |
 | v1.1 add | §6 states that the profile table is a preset table — `risk_profile` must drive the defaults and reject contradictory overrides, not sit unread beside independent fields. |
 | v1.1 confirm | §4.1 records a real-account finding (§13 probe, 2026-07-27): Alpaca's cash-account API has no settled/unsettled cash field anywhere. `lot.settled` and cash-account free-riding protection can only be enforced from a local ledger's own T+1 expectation, never from broker-reported state. Settled-cash reconciliation (exact equality, Option A) is unaffected — it checks that two cash *totals* agree, not which lots are settled. The local ledger itself remains unbuilt. |
+| v1.1 confirm | §4.1 records a second confirmed finding (2026-07-27, `agent/lot_selection.py`): an internal `lot_id` does not control which lot Alpaca actually disposes of. Alpaca's own documentation (not the Customer Agreement, which names no method) confirms Compressed FIFO for end-of-day positions, Weighted Average intraday, and no API-level lot designation. `sellable_qty` was evaluating hold-eligibility per lot in isolation, which could believe a seasoned lot was sold while the broker's FIFO order actually disposed of a fresh one — fixed to walk lots in broker-actual disposal order and block on the first ineligible FIFO predecessor, no override path. `Ledger.disposal_records()` now records intended-vs-broker-actual lot per SELL fill. |

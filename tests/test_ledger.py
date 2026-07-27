@@ -23,6 +23,8 @@ from agent.holding import (HoldingPolicy, HoldingPolicyRegistry, HoldingViolatio
                            open_lots, sellable_qty)
 from agent.ledger import (DuplicateFillError, Fill, Ledger, LedgerError,
                           LotOverdrawnError, OrderRecord, UnknownLotError)
+from agent.lot_selection import (ALPACA_DEFAULT_POLICY, LotSelectionMethod,
+                                 LotSelectionPolicy)
 from agent.reconciliation import reconcile_settled_cash
 from agent.broker.base import AccountSnapshot
 
@@ -156,6 +158,53 @@ def test_a_partial_sell_reduces_the_lot_but_leaves_it_open():
     lots = l.lots()
     assert lots[0].is_open() is True
     assert lots[0].qty == 3.0
+
+
+def test_a_partial_sell_reduces_cost_basis_proportionally_not_just_qty():
+    """REVIEW FIX: cost_basis used to stay at the full original notional
+    while only qty shrank, so cost_basis / qty (per-share basis)
+    overstated the remaining lot's basis after ANY partial sale. Buy 5 @
+    $100 (cost_basis 500); sell 2 -- 3 remain, so cost_basis must drop to
+    3/5 of 500 = 300, keeping cost_basis/qty == 100.0, the original
+    per-share price, unchanged."""
+    l = ledger()
+    l.record_fill(buy(qty=5.0, price=100.0, at=FRI))
+    l.record_fill(sell(qty=2.0, price=110.0, at=FRI, fill_id="s1"))
+    lot = l.lots()[0]
+    assert lot.qty == 3.0
+    assert lot.cost_basis == 300.0
+    assert lot.cost_basis / lot.qty == 100.0
+
+
+def test_two_successive_partial_sells_keep_cost_basis_correct_no_compounding_error():
+    """Recomputed fresh from the original buy fill every call (not derived
+    from the PREVIOUS partial result), so two sells in sequence must not
+    compound any rounding or proportion error."""
+    l = ledger()
+    l.record_fill(buy(qty=10.0, price=10.0, at=FRI))            # cost_basis 100.0
+    l.record_fill(sell(qty=4.0, price=12.0, at=FRI, fill_id="s1"))
+    lot = l.lots()[0]
+    assert lot.qty == 6.0 and lot.cost_basis == 60.0
+    l.record_fill(sell(qty=2.0, price=12.0, at=FRI, fill_id="s2"))
+    lot = l.lots()[0]
+    assert lot.qty == 4.0 and lot.cost_basis == 40.0
+
+
+def test_a_fully_sold_lot_has_zero_remaining_cost_basis():
+    """The remaining (open) cost basis of a fully-closed lot is correctly
+    zero -- nothing is left to hold a basis. This does NOT mean the
+    ORIGINAL cost basis of what was sold is lost: it remains fully
+    reconstructable from Ledger.fills (the buy fill's own qty * price),
+    which this ledger never discards. See the module docstring's COST
+    BASIS ON A PARTIAL SALE section for why Lot itself does not also carry
+    a separate realised-basis field."""
+    l = ledger()
+    l.record_fill(buy(qty=2.0, price=100.0, at=FRI))
+    l.record_fill(sell(qty=2.0, price=110.0, at=FRI, fill_id="s1"))
+    lot = l.lots()[0]
+    assert lot.qty == 0.0
+    assert lot.cost_basis == 0.0
+    assert lot.is_open() is False
 
 
 def test_selling_more_than_a_lot_holds_is_rejected():
@@ -315,3 +364,89 @@ def test_fills_and_order_records_are_read_only_tuples():
     l.record_fill(buy(qty=1.0, price=100.0))
     assert isinstance(l.fills, tuple)
     assert isinstance(l.order_records, tuple)
+
+
+# --------------------------------------------------------- disposal records
+# Commit 4: an internal lot_id does not control which lot the broker
+# actually disposes of. These record, for every SELL fill, both the lot our
+# strategy INTENDED (fill.lot_id) and the lot Alpaca's confirmed actual
+# disposal order (agent.lot_selection, BROKER_FIFO) would consume first --
+# so the divergence is visible rather than silently invisible.
+
+def test_ledger_defaults_to_the_confirmed_alpaca_disposal_policy():
+    l = ledger()
+    assert l._lot_selection_policy is ALPACA_DEFAULT_POLICY
+
+
+def test_selling_the_only_open_lot_has_no_divergence():
+    l = ledger()
+    l.record_fill(buy(lot_id="l1", qty=5.0, price=100.0, at=FRI))
+    l.record_fill(sell(lot_id="l1", qty=2.0, price=110.0, at=FRI, fill_id="s1"))
+    [rec] = l.disposal_records()
+    assert rec.intended_lot_id == rec.broker_lot_id == "l1"
+
+
+def test_selling_the_oldest_lot_first_has_no_divergence():
+    l = ledger()
+    l.record_fill(buy(lot_id="old", qty=3.0, price=100.0, at=FRI))
+    l.record_fill(buy(lot_id="new", qty=3.0, price=100.0, at=FRI + timedelta(hours=1)))
+    l.record_fill(sell(lot_id="old", qty=1.0, price=110.0, at=FRI, fill_id="s1"))
+    [rec] = l.disposal_records()
+    assert rec.intended_lot_id == "old"
+    assert rec.broker_lot_id == "old"
+
+
+def test_selling_a_newer_lot_while_an_older_one_is_still_open_diverges():
+    """The exact scenario the module exists to expose: the strategy recorded
+    a sell against the NEWER lot, but Alpaca's actual FIFO would have
+    consumed the OLDER lot first -- our bookkeeping and the broker's own
+    disposal disagree about which shares are gone."""
+    l = ledger()
+    l.record_fill(buy(lot_id="old", qty=3.0, price=100.0, at=FRI))
+    l.record_fill(buy(lot_id="new", qty=3.0, price=100.0, at=FRI + timedelta(hours=1)))
+    l.record_fill(sell(lot_id="new", qty=1.0, price=110.0, at=FRI, fill_id="s1"))
+    [rec] = l.disposal_records()
+    assert rec.fill_id == "s1"
+    assert rec.account_id == ACCT
+    assert rec.symbol == "SPY"
+    assert rec.intended_lot_id == "new"
+    assert rec.broker_lot_id == "old"
+
+
+def test_disposal_records_track_the_running_open_set_across_multiple_sells():
+    l = ledger()
+    l.record_fill(buy(lot_id="a", qty=2.0, price=100.0, at=FRI))
+    l.record_fill(buy(lot_id="b", qty=2.0, price=100.0, at=FRI + timedelta(hours=1)))
+    # First sell fully closes "a" (the FIFO-first lot) -- no divergence.
+    l.record_fill(sell(lot_id="a", qty=2.0, price=110.0, at=FRI, fill_id="s1"))
+    # Second sell references "b"; with "a" now closed, "b" IS the FIFO-first
+    # remaining open lot -- also no divergence.
+    l.record_fill(sell(lot_id="b", qty=1.0, price=110.0, at=FRI, fill_id="s2"))
+    recs = {r.fill_id: r for r in l.disposal_records()}
+    assert recs["s1"].intended_lot_id == recs["s1"].broker_lot_id == "a"
+    assert recs["s2"].intended_lot_id == recs["s2"].broker_lot_id == "b"
+
+
+def test_disposal_records_only_cover_sells_for_this_symbol():
+    l = ledger()
+    l.record_fill(buy(lot_id="spy1", symbol="SPY", qty=2.0, price=100.0, at=FRI))
+    l.record_fill(buy(lot_id="qqq1", symbol="QQQ", qty=2.0, price=100.0,
+                      at=FRI - timedelta(hours=1)))
+    l.record_fill(sell(lot_id="spy1", symbol="SPY", qty=1.0, price=110.0,
+                       at=FRI, fill_id="s1"))
+    [rec] = l.disposal_records()
+    assert rec.symbol == "SPY"
+    assert rec.broker_lot_id == "spy1"    # not qqq1, despite being older
+
+
+def test_an_unsupported_lot_selection_policy_is_refused_not_approximated():
+    reg = registry()
+    unsupported = LotSelectionPolicy(version="hifo-hypothetical",
+                                     method=LotSelectionMethod.HIFO)
+    l = Ledger(account_id=ACCT, opening_settled_cash=500.0, policy_registry=reg,
+              lot_selection_policy=unsupported)
+    l.record_fill(buy(lot_id="a", qty=2.0, price=100.0, at=FRI))
+    l.record_fill(buy(lot_id="b", qty=2.0, price=100.0, at=FRI + timedelta(hours=1)))
+    l.record_fill(sell(lot_id="b", qty=1.0, price=110.0, at=FRI, fill_id="s1"))
+    with pytest.raises(Exception, match="not implemented"):
+        l.disposal_records()
