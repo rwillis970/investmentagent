@@ -76,11 +76,19 @@ ORDER_SIDES = ("BUY", "SELL", "CANCEL", "CLOSE", "REPLACE")
 # order being created; for CANCEL it is the id of the existing order being
 # cancelled. Either way it is signed, so a StagedOrder minted to cancel order
 # A cannot be altered to cancel order B without invalidating the signature.
+#
+# `lot_id` (Commit b, fills-reach-the-ledger unit): the lot our strategy
+# intends to reduce is part of what a human approves for a SELL -- holding
+# period, wash-sale classification and cost basis all depend on which lot
+# this is. Covered here so it cannot be swapped post-staging without
+# invalidating the signature the same way `symbol`/`side`/`authorized_qty`
+# already can't be -- see test_gate_integrity.py's tampering test, extended
+# to cover this field too.
 _SIGNABLE_FIELDS = (
     "account_id", "client_order_id", "symbol", "side", "requested_qty",
     "authorized_qty", "order_type", "time_in_force", "limit_price",
     "asset_class", "funding", "session", "requested_notional", "notional",
-    "gates_passed", "binding",
+    "gates_passed", "binding", "lot_id",
 )
 
 
@@ -133,6 +141,14 @@ class StagedOrder:
     gates_passed: tuple[str, ...]
     binding: tuple[str, ...]            # every constraint that resized or would have rejected
     signature: str
+    # The lot our strategy intends to reduce. Meaningful for SELL only --
+    # None for BUY (a buy creates a new lot, it doesn't reduce one), and
+    # None for CANCEL/CLOSE (a cancel touches no lot; a close's qty spans
+    # whatever's open across possibly-multiple lots, which this one-lot_id
+    # field cannot represent -- see Gatekeeper.stage's own validation and
+    # this unit's delivery report for that named, unsolved gap). Covered by
+    # the signature -- see _SIGNABLE_FIELDS above.
+    lot_id: str | None = None
 
     @property
     def qty(self) -> float:
@@ -183,7 +199,8 @@ class Gatekeeper:
               opens_day_trade: bool = False,
               sectors: dict[str, str] | None = None,
               current_weights: dict[str, float] | None = None,
-              broker_position_qty: float | None = None) -> StagedOrder:
+              broker_position_qty: float | None = None,
+              lot_id: str | None = None) -> StagedOrder:
         side_u = side.upper()
 
         if side_u == "REPLACE":
@@ -217,6 +234,39 @@ class Gatekeeper:
         except PolicyViolation as exc:
             raise Rejected("capability:universe", str(exc)) from exc
         passed.append("capability:universe")
+
+        # lot_id (Commit b): meaningful for a SELL only, and required there --
+        # the lot our strategy intends to reduce is part of what gets
+        # approved (holding period, wash-sale classification and cost basis
+        # all depend on which lot this is), so it is validated here, before
+        # any gate below, and carried into the signed fields. A BUY creates
+        # a new lot rather than reducing one; CANCEL touches no lot; CLOSE's
+        # quantity can span multiple open lots, which this single lot_id
+        # field cannot represent (a known, unsolved gap -- see this unit's
+        # delivery report) -- so all three require lot_id to be None, not
+        # silently ignored if supplied.
+        if side_u == "SELL":
+            if lot_id is None:
+                raise Rejected(
+                    "holding",
+                    "a SELL must specify the intended lot_id (the lot the "
+                    "strategy intends to reduce); it is part of what is "
+                    "approved and is covered by the StagedOrder signature",
+                )
+            if not any(l.lot_id == lot_id and l.account_id == self.account_id
+                      and l.symbol == symbol and l.is_open() for l in lots):
+                raise Rejected(
+                    "holding",
+                    f"lot_id {lot_id!r} is not an open lot for {symbol} in "
+                    f"account {self.account_id!r}; refusing to sign a SELL "
+                    "against a lot that does not exist",
+                )
+        elif lot_id is not None:
+            raise Rejected(
+                "holding",
+                f"lot_id is only meaningful for a SELL; got side={side_u!r} "
+                f"with lot_id={lot_id!r}",
+            )
 
         if side_u == "CANCEL":
             return self._stage_cancel(
@@ -351,6 +401,7 @@ class Gatekeeper:
             limit_price=limit_price, asset_class=asset_class, funding=funding,
             session=session, requested_notional=requested_notional,
             notional=notional, gates_passed=tuple(passed), binding=binding,
+            lot_id=lot_id,
         )
         signature = sign_staged_order(fields, self.signing_key)
         return StagedOrder(**fields, signature=signature)
@@ -381,7 +432,7 @@ class Gatekeeper:
             order_type=order_type, time_in_force=time_in_force,
             limit_price=limit_price, asset_class=asset_class, funding=funding,
             session=session, requested_notional=0.0, notional=0.0,
-            gates_passed=tuple(passed), binding=(),
+            gates_passed=tuple(passed), binding=(), lot_id=None,
         )
         signature = sign_staged_order(fields, self.signing_key)
         return StagedOrder(**fields, signature=signature)

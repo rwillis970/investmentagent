@@ -342,4 +342,6 @@ def _encode_order_record(r: OrderRecord) -> dict:
 
 def _decode_order_record(d: dict) -> OrderRecord:
     return OrderRecord(client_order_id=d["client_order_id"], account_id=d["account_id"],
-                       status=d["status"], at=datetime.fromisoformat(d["at"]))
+                       status=d["status"], at=datetime.fromisoformat(d["at"]),
+                       lot_id=d.get("lot_id"),
+                       holding_policy_version=d.get("holding_policy_version"))

@@ -79,9 +79,10 @@ def test_a_normal_buy_passes_every_gate_in_order():
 
 def test_a_normal_sell_of_an_eligible_lot_passes():
     reg = registry()
-    o = stage(side="SELL", qty=1.0,
+    o = stage(side="SELL", qty=1.0, lot_id="l1",
               lots=lots(reg, "short", opened=T0 - timedelta(hours=2)))
     assert "holding" in o.gates_passed
+    assert o.lot_id == "l1"
 
 
 # ------------------------------------------------------- capability gate
@@ -110,7 +111,7 @@ def test_short_side_is_rejected():
 def test_selling_inside_the_minimum_hold_is_rejected():
     reg = registry()
     with pytest.raises(Rejected) as exc:
-        stage(side="SELL", qty=1.0, lots=lots(reg, "long"))
+        stage(side="SELL", qty=1.0, lot_id="l1", lots=lots(reg, "long"))
     assert exc.value.gate == "holding"
     assert "minimum hold" in exc.value.reason
 
@@ -118,7 +119,7 @@ def test_selling_inside_the_minimum_hold_is_rejected():
 def test_selling_an_unsettled_lot_is_rejected():
     reg = registry()
     with pytest.raises(Rejected) as exc:
-        stage(side="SELL", qty=1.0,
+        stage(side="SELL", qty=1.0, lot_id="l1",
               lots=lots(reg, "short", opened=T0 - timedelta(hours=2),
                         settles=T0 + timedelta(days=1)))
     assert exc.value.gate == "holding"
@@ -126,9 +127,52 @@ def test_selling_an_unsettled_lot_is_rejected():
 
 def test_partial_sell_within_eligible_quantity_is_allowed():
     reg = registry()
-    o = stage(side="SELL", qty=0.4,
+    o = stage(side="SELL", qty=0.4, lot_id="l1",
               lots=lots(reg, "short", opened=T0 - timedelta(hours=2), qty=1.0))
     assert o.qty == 0.4
+
+
+# ------------------------------------------------------ lot_id (Commit b)
+# The lot our strategy intends to reduce is part of what gets approved, so
+# it travels inside StagedOrder's own signable fields (see
+# test_gate_integrity.py for the HMAC-coverage proof) -- not just as a
+# caller-supplied value nothing verifies.
+
+def test_a_sell_without_a_lot_id_is_rejected():
+    reg = registry()
+    with pytest.raises(Rejected) as exc:
+        stage(side="SELL", qty=1.0,
+              lots=lots(reg, "short", opened=T0 - timedelta(hours=2)))
+    assert exc.value.gate == "holding"
+    assert "lot_id" in exc.value.reason
+
+
+def test_a_sell_referencing_a_lot_id_not_among_the_open_lots_is_rejected():
+    reg = registry()
+    with pytest.raises(Rejected) as exc:
+        stage(side="SELL", qty=1.0, lot_id="nonexistent",
+              lots=lots(reg, "short", opened=T0 - timedelta(hours=2)))
+    assert exc.value.gate == "holding"
+    assert "nonexistent" in exc.value.reason
+
+
+def test_a_buy_with_a_lot_id_is_rejected():
+    """A BUY creates a new lot; it does not reduce an existing one, so a
+    caller-supplied lot_id here is a bug, not something to silently ignore."""
+    with pytest.raises(Rejected) as exc:
+        stage(side="BUY", lot_id="l1")
+    assert "lot_id" in exc.value.reason
+
+
+def test_a_cancel_with_a_lot_id_is_rejected():
+    with pytest.raises(Rejected) as exc:
+        stage(side="CANCEL", lot_id="l1")
+    assert "lot_id" in exc.value.reason
+
+
+def test_a_normal_buy_has_no_lot_id():
+    o = stage()
+    assert o.lot_id is None
 
 
 # ---------------------------------------------------------- day-trade gate
@@ -203,6 +247,6 @@ def test_unsettled_cash_leaves_nothing_to_authorize():
 
 def test_sells_are_not_risk_constrained():
     reg = registry()
-    o = stage(side="SELL", qty=1.0,
+    o = stage(side="SELL", qty=1.0, lot_id="l1",
               lots=lots(reg, "short", opened=T0 - timedelta(hours=2)))
     assert "risk" not in o.gates_passed

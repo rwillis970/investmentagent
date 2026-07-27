@@ -122,6 +122,33 @@ class Position:
 
 
 @dataclass(frozen=True)
+class Execution:
+    """One broker-reported fill INCREMENT -- not an order snapshot. This is
+    what `fills()` returns and what `agent.fill_sync.sync_fills` turns into
+    ledger `Fill` records, one per increment (never one per order, never
+    only at terminal status -- see that module's docstring).
+
+    `execution_id` must be STABLE and per-execution: re-polling an
+    unchanged execution must yield the same id, so `sync_fills` can no-op
+    on it. `qty`/`price` are THIS increment's own quantity and the price it
+    occurred at -- not cumulative and not a running average.
+    `cum_qty` is the cumulative filled quantity as of this increment,
+    reported separately because some broker APIs (Alpaca's `/v2/orders`)
+    only expose the cumulative figure directly; `fills()` implementations
+    that source per-execution records (Alpaca's Account Activities
+    `FILL`/`TradeActivity`) report both from the same underlying record."""
+    execution_id: str
+    account_id: str
+    client_order_id: str
+    symbol: str
+    side: str
+    qty: float
+    price: float
+    cum_qty: float
+    filled_at: datetime
+
+
+@dataclass(frozen=True)
 class BrokerOrder:
     account_id: str
     client_order_id: str
@@ -165,7 +192,7 @@ class BrokerAdapter(ABC):
     # explicitly via its own `_extra_public_methods` class attribute.
     _known_public_surface: frozenset[str] = frozenset({
         "account", "positions", "open_orders", "get_by_client_id", "sessions",
-        "submit", "cancel", "clock", "posture", "supported_matrix",
+        "submit", "cancel", "clock", "posture", "supported_matrix", "fills",
         "attach_capability_policy", "attach_staging_key",
     })
 
@@ -285,6 +312,17 @@ class BrokerAdapter(ABC):
         say) -- see `SimulatorBroker.sessions` for the reference
         implementation. There is meant to be exactly one holiday-aware
         trailing-sessions implementation in this codebase."""
+
+    @abstractmethod
+    def fills(self) -> list[Execution]:
+        """Every broker-reported fill INCREMENT this adapter can currently
+        see -- not deduplicated, not filtered to "new since last call".
+        `agent.fill_sync.sync_fills` is what turns this into ledger
+        writes, deciding what's new by `execution_id`. Implementations
+        should prefer a real per-execution record over a per-order
+        cumulative/averaged one where the broker's API offers it (see
+        `AlpacaPaperAdapter.fills`, which uses Account Activities rather
+        than `/v2/orders`, for exactly this reason)."""
 
     # -- write --------------------------------------------------------------
     def submit(self, staged: StagedOrder, *,

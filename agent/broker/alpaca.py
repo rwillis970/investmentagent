@@ -136,7 +136,8 @@ from ..pipeline import StagedOrder
 from ..policy import TradeCapabilityPolicy
 from .. import market_calendar
 from ..secrets_provider import SecretsProvider
-from .base import AccountSnapshot, AdapterError, BrokerAdapter, BrokerOrder, Position
+from .base import (AccountSnapshot, AdapterError, BrokerAdapter, BrokerOrder,
+                   Execution, Position)
 from .transport import Transport, TransportError, UrllibTransport
 
 _EXPECTED_SECRETS_MODE = "PAPER"
@@ -417,6 +418,84 @@ class AlpacaPaperAdapter(BrokerAdapter):
         itself: there is meant to be exactly one holiday-aware
         implementation, and market_calendar.trailing_sessions is it."""
         return market_calendar.trailing_sessions(through, count)
+
+    def fills(self) -> list[Execution]:
+        """Alpaca's Account Activities `FILL` type -- confirmed, not
+        assumed, via `alpaca-py`'s own `TradeActivity` model
+        (github.com/alpacahq/alpaca-py, alpaca/trading/models.py, fetched
+        2026-07-27) -- is the one place this adapter reads a PER-EXECUTION
+        record rather than a per-order cumulative/averaged one (see
+        `Execution`'s own docstring). `id` is a stable, per-execution id
+        ("timestamp::uuid" per `BaseActivity`'s own docstring); `price` is
+        the per-share price THIS execution occurred at (NOT a running
+        average -- that's `/v2/orders`' `filled_avg_price`, deliberately
+        not used here); `qty` is this increment only; `cum_qty` is the
+        cumulative total as of this increment.
+
+        WRONG PREMISE, FOUND WHILE IMPLEMENTING (not assumed away): a
+        `TradeActivity` does NOT carry `client_order_id` -- only Alpaca's
+        own broker-side `order_id` (a UUID). `Execution.client_order_id`
+        is required by this adapter's contract (it is how `sync_fills`
+        looks up the `OrderRecord` this order was staged with), so each
+        DISTINCT `order_id` seen in a page of activities is resolved to
+        its `client_order_id` via one `GET /v2/orders/{order_id}` call,
+        memoized within this single `fills()` call so an order with many
+        partial-fill activities costs one extra request, not N.
+
+        PAGINATION: pages forward with `direction=asc` (oldest first) and
+        Alpaca's own `page_token` (the last-seen activity's `id`), in
+        batches of `page_size`, until a page comes back shorter than
+        `page_size` -- the documented signal that there is nothing left to
+        fetch. This is the actual, complete implementation: every
+        activity, oldest to newest, across as many pages as exist. It does
+        not special-case a tie in `transaction_time` at a page boundary
+        beyond what `page_token` itself provides."""
+        activities: list[dict] = []
+        page_token: str | None = None
+        page_size = 100
+        while True:
+            params: dict = {"direction": "asc", "page_size": str(page_size)}
+            if page_token is not None:
+                params["page_token"] = page_token
+            _, data = self._request(
+                "GET", "/v2/account/activities/FILL", params=params, retryable=True)
+            if not data:
+                break
+            activities.extend(data)
+            if len(data) < page_size:
+                break
+            page_token = data[-1]["id"]
+
+        client_order_ids: dict[str, str] = {}
+        executions = []
+        for a in activities:
+            order_id = a["order_id"]
+            client_order_id = client_order_ids.get(order_id)
+            if client_order_id is None:
+                client_order_id = self._client_order_id_for(order_id)
+                client_order_ids[order_id] = client_order_id
+            executions.append(self._to_execution(a, client_order_id))
+        return executions
+
+    def _client_order_id_for(self, broker_order_id: str) -> str:
+        """Resolve an Alpaca broker-side order id to the `client_order_id`
+        it was submitted with -- `TradeActivity` reports only the former
+        (see `fills()`'s docstring)."""
+        _, data = self._request("GET", f"/v2/orders/{broker_order_id}", retryable=True)
+        return data["client_order_id"]
+
+    def _to_execution(self, a: dict, client_order_id: str) -> Execution:
+        return Execution(
+            execution_id=a["id"],
+            account_id=self.account_id,
+            client_order_id=client_order_id,
+            symbol=a["symbol"],
+            side=a["side"].upper(),
+            qty=float(a["qty"]),
+            price=float(a["price"]),
+            cum_qty=float(a["cum_qty"]),
+            filled_at=_parse_ts(a["transaction_time"]),
+        )
 
     def supported_matrix(self) -> dict[str, list[str]]:
         """§13 empirical probe, capture dates 2026-07-27 (account.json) and

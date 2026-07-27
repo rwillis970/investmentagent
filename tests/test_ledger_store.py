@@ -181,6 +181,18 @@ def test_a_written_order_record_is_immediately_reflected_in_load(tmp_path):
     assert orders == (order_record(),)
 
 
+def test_an_order_records_lot_id_and_holding_policy_version_round_trip(tmp_path):
+    """These carry sync_fills' recovered intent (see agent/ledger.py's
+    OrderRecord docstring) -- must survive a real encode/decode through
+    the store, not just live as in-memory defaults."""
+    s = store(tmp_path / "ledger.jsonl")
+    rec = OrderRecord(client_order_id="c1", account_id=ACCT, status="OPEN",
+                      at=T0, lot_id="l1", holding_policy_version="hp-v1")
+    s.write_order_record(rec)
+    _, _, orders = s.load()
+    assert orders == (rec,)
+
+
 def test_multiple_fills_and_orders_preserve_insertion_order(tmp_path):
     s = store(tmp_path / "ledger.jsonl")
     s.write_fill(fill(fill_id="f1", lot_id="l1", qty=2.0))

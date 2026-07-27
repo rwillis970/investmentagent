@@ -18,7 +18,8 @@ import pytest
 from agent.accounts import BrokerCredentials, CrossAccountError
 from agent.broker.alpaca import (STATUS_MAP, AlpacaError, AlpacaPaperAdapter,
                                  AmbiguousOrderState, UnsupportedOrderShape)
-from agent.broker.base import AccountSnapshot, BrokerOrder, Position, StagingKeyUnset
+from agent.broker.base import (AccountSnapshot, BrokerOrder, Execution, Position,
+                               StagingKeyUnset)
 from agent.broker.transport import ScriptedTransport, TransportError, TransportTimeout
 from agent.pipeline import Gatekeeper
 from agent.risk import PortfolioState
@@ -561,3 +562,84 @@ def test_cancel_timeout_raises_ambiguous_order_state():
     with pytest.raises(AmbiguousOrderState):
         a.cancel(cancel_order)
     assert len(t.calls) == 2  # the lookup, plus exactly one DELETE attempt -- no retry
+
+
+# ------------------------------------------------------------------ fills()
+# Account Activities' TradeActivity (alpaca-py's own model, not this
+# codebase's guess) carries no client_order_id -- only Alpaca's own
+# order_id. fills() must resolve that via GET /v2/orders/{order_id}, once
+# per distinct order_id, not once per activity.
+
+def activity_json(**over):
+    base = dict(id="20260720000000000::aaaa-1", account_id=ACCT,
+               activity_type="FILL", transaction_time="2026-07-20T13:00:05Z",
+               type="fill", price="499.50", qty="1", side="buy", symbol="SPY",
+               leaves_qty="0", order_id="alpaca-order-1", cum_qty="1",
+               order_status="filled")
+    base.update(over)
+    return base
+
+
+def test_fills_requests_the_fill_activity_type_with_ascending_direction():
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    adapter(t).fills()
+    call = t.calls[0]
+    assert call["path"] == "https://paper-api.alpaca.markets/v2/account/activities/FILL"
+    assert call["params"]["direction"] == "asc"
+
+
+def test_fills_maps_price_qty_and_cum_qty_as_reported_not_averaged():
+    t = ScriptedTransport()
+    t.enqueue(200, [activity_json(qty="1", price="499.50", cum_qty="1")])
+    t.enqueue(200, order_json(client_order_id="c1"))
+    fills = adapter(t).fills()
+    assert fills == [Execution(
+        execution_id="20260720000000000::aaaa-1", account_id=ACCT,
+        client_order_id="c1", symbol="SPY", side="BUY", qty=1.0, price=499.5,
+        cum_qty=1.0, filled_at=datetime(2026, 7, 20, 13, 0, 5, tzinfo=timezone.utc),
+    )]
+
+
+def test_fills_resolves_client_order_id_via_the_order_lookup():
+    t = ScriptedTransport()
+    t.enqueue(200, [activity_json(order_id="alpaca-order-9")])
+    t.enqueue(200, order_json(client_order_id="c9"))
+    fills = adapter(t).fills()
+    assert fills[0].client_order_id == "c9"
+    lookup_call = t.calls[1]
+    assert lookup_call["path"] == "https://paper-api.alpaca.markets/v2/orders/alpaca-order-9"
+
+
+def test_fills_resolves_client_order_id_once_per_distinct_order_id():
+    t = ScriptedTransport()
+    t.enqueue(200, [
+        activity_json(id="a1", order_id="alpaca-order-1", qty="1", cum_qty="1"),
+        activity_json(id="a2", order_id="alpaca-order-1", qty="1", cum_qty="2"),
+    ])
+    t.enqueue(200, order_json(client_order_id="c1"))
+    fills = adapter(t).fills()
+    assert [f.client_order_id for f in fills] == ["c1", "c1"]
+    # one activities page + exactly one order lookup, not two
+    assert len(t.calls) == 2
+
+
+def test_fills_pages_forward_until_a_short_page_is_returned():
+    t = ScriptedTransport()
+    full_page = [activity_json(id=f"a{i}", order_id="alpaca-order-1") for i in range(100)]
+    t.enqueue(200, full_page)
+    t.enqueue(200, [activity_json(id="a100", order_id="alpaca-order-1")])
+    t.enqueue(200, order_json(client_order_id="c1"))
+    fills = adapter(t).fills()
+    assert len(fills) == 101
+    first_page_call, second_page_call, _ = t.calls
+    assert "page_token" not in first_page_call["params"]
+    assert second_page_call["params"]["page_token"] == "a99"
+
+
+def test_fills_stops_paging_on_an_empty_page():
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    fills = adapter(t).fills()
+    assert fills == []
+    assert len(t.calls) == 1

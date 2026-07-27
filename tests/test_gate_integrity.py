@@ -21,7 +21,7 @@ FIELDS = dict(
     time_in_force="DAY", limit_price=500.0, asset_class="US_EQUITY",
     funding="SETTLED_CASH", session="REGULAR", requested_notional=500.0,
     notional=400.0, gates_passed=("capability:universe", "risk", "capability:pre_submit"),
-    binding=("settled_cash_reserve",),
+    binding=("settled_cash_reserve",), lot_id=None,
 )
 KEY = b"k" * 32
 
@@ -100,6 +100,7 @@ def test_verify_fails_with_no_signature():
     ("notional", 1_000_000.0),
     ("gates_passed", ()),
     ("binding", ()),
+    ("lot_id", "swapped-lot"),
 ])
 def test_tampering_with_any_signable_field_invalidates_the_signature(field, new_value):
     """dataclasses.replace happily builds a new frozen instance with a now

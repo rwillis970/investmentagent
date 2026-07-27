@@ -234,11 +234,22 @@ class OrderRecord:
     being open. Ordering: the LAST-RECORDED status for a given
     `client_order_id` (by insertion order into this ledger, not by `at`) is
     authoritative -- callers must record status changes in the order they
-    actually happened."""
+    actually happened.
+
+    `lot_id`/`holding_policy_version` carry the INTENT decided at staging
+    time (mirroring `agent.pipeline.StagedOrder.lot_id`), durably, so a
+    poll-based fill sync -- possibly running long after staging, in a
+    different process, with nothing held in memory -- can recover which
+    lot a SELL intended to reduce, or which holding-policy version a BUY's
+    new lot should be opened under, without guessing. Both are nullable:
+    `lot_id` is meaningful only for a SELL, `holding_policy_version` only
+    for a BUY (see agent/fill_sync.py)."""
     client_order_id: str
     account_id: str
     status: str                            # "OPEN" or "CLOSED"
     at: datetime
+    lot_id: str | None = None
+    holding_policy_version: str | None = None
 
 
 class Ledger:
@@ -517,3 +528,16 @@ class Ledger:
         for r in self._order_records:
             latest[r.client_order_id] = r.status
         return frozenset(cid for cid, status in latest.items() if status == _OPEN)
+
+    def latest_order_record(self, client_order_id: str) -> OrderRecord | None:
+        """The LAST-recorded `OrderRecord` (by insertion order) for this
+        `client_order_id`, or `None` if it was never recorded. Same
+        "latest wins" derivation as `open_order_ids`, but returns the
+        whole record -- this is how a poll-based fill sync recovers the
+        intended `lot_id`/`holding_policy_version` for an order it did not
+        itself stage."""
+        latest: OrderRecord | None = None
+        for r in self._order_records:
+            if r.client_order_id == client_order_id:
+                latest = r
+        return latest

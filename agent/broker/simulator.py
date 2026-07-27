@@ -18,7 +18,7 @@ from ..accounts import BrokerCredentials
 from ..pipeline import StagedOrder
 from ..policy import TradeCapabilityPolicy, initial_policy
 from .base import (AccountPosture, AccountSnapshot, BrokerAdapter, BrokerOrder,
-                   Position)
+                   Execution, Position)
 
 
 class SimulatorBroker(BrokerAdapter):
@@ -195,3 +195,27 @@ class SimulatorBroker(BrokerAdapter):
     def supported_matrix(self) -> dict[str, list[str]]:
         return {"order_type": ["MARKET", "LIMIT"], "time_in_force": ["DAY"],
                 "session": ["REGULAR"], "fractional": ["MARKET", "LIMIT"]}
+
+    def fills(self) -> list[Execution]:
+        """The simulator's `_submit_impl` fills synchronously and
+        completely -- no partial fills are modeled here (see this
+        module's own docstring) -- so there is exactly one Execution per
+        filled order, and `cum_qty` always equals `qty`. The id is
+        deterministic and stable across repeated calls: `sync_fills`
+        re-polling the same filled order must see the same
+        `execution_id` and no-op, never re-record it."""
+        return [
+            Execution(
+                execution_id=f"sim::{o.client_order_id}",
+                account_id=self.account_id,
+                client_order_id=o.client_order_id,
+                symbol=o.symbol,
+                side=o.side,
+                qty=o.filled_qty,
+                price=o.avg_fill_price if o.avg_fill_price is not None else 0.0,
+                cum_qty=o.filled_qty,
+                filled_at=o.filled_at,
+            )
+            for o in self._orders.values()
+            if o.status == "filled" and o.filled_qty > 0
+        ]

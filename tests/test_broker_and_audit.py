@@ -102,7 +102,7 @@ def make_staged(key, **over):
         funding="SETTLED_CASH", session="REGULAR", requested_notional=100.0,
         notional=100.0,
         gates_passed=("capability:universe", "risk", "capability:pre_submit"),
-        binding=(),
+        binding=(), lot_id=None,
     )
     fields.update(over)
     signature = sign_staged_order(fields, key)
@@ -128,6 +128,31 @@ def test_submit_is_idempotent_on_client_order_id():
     assert b.get_by_client_id("c1").status == "filled"
 
 
+def test_fills_returns_one_execution_per_filled_order_with_a_stable_id():
+    """No partial fills are modeled by the simulator (see
+    SimulatorBroker.fills's own docstring) -- one Execution per filled
+    order, qty == cum_qty, and a deterministic id so a re-poll produces
+    the exact same Execution, not a new one."""
+    b, gk = broker()
+    b.submit(staged(gk))
+    execs = b.fills()
+    assert len(execs) == 1
+    e = execs[0]
+    assert e.execution_id == "sim::c1"
+    assert e.client_order_id == "c1"
+    assert e.qty == 0.2
+    assert e.cum_qty == 0.2
+    assert e.price == 500.0
+    # re-polling with no new activity yields the identical Execution
+    assert b.fills() == execs
+
+
+def test_fills_excludes_rejected_and_unfilled_orders():
+    b, gk = broker(cash=50.0)
+    b.submit(staged(gk, qty=1.0))   # rejected: insufficient settled cash
+    assert b.fills() == []
+
+
 def test_insufficient_settled_cash_is_rejected():
     b, gk = broker(cash=50.0)
     o = b.submit(staged(gk, qty=1.0))
@@ -138,7 +163,7 @@ def test_sale_proceeds_settle_t_plus_one():
     b, gk = broker()
     b.submit(staged(gk, client_order_id="buy", qty=0.5))
     b.submit(staged(gk, client_order_id="sell", side="SELL", qty=0.5,
-                    lots=[lot(0.5)]))
+                    lot_id="l1", lots=[lot(0.5)]))
     assert b.account().unsettled_cash == 250.0
     assert b.account().settled_cash == 250.0
     b.advance(timedelta(days=1))
@@ -158,7 +183,7 @@ def test_sale_proceeds_settle_on_the_real_next_session_not_a_calendar_day():
     b, gk = broker(now=friday)
     b.submit(staged(gk, client_order_id="buy", qty=0.5, now=friday))
     b.submit(staged(gk, client_order_id="sell", side="SELL", qty=0.5,
-                    lots=[lot(0.5, opened=friday)], now=friday))
+                    lot_id="l1", lots=[lot(0.5, opened=friday)], now=friday))
     assert b.account().unsettled_cash == 250.0
 
     b.advance(timedelta(days=1))   # lands on Saturday -- must still be unsettled

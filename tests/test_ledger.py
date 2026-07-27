@@ -336,6 +336,44 @@ def test_order_status_for_the_wrong_account_halts():
                                           status="OPEN", at=FRI))
 
 
+# --------------------------------------- OrderRecord intent (fill-sync unit)
+# `lot_id`/`holding_policy_version` on OrderRecord carry the intent decided
+# at staging time (mirroring StagedOrder.lot_id) so a poll-based fill sync,
+# possibly running long after staging or in a different process, can
+# recover it without guessing. See agent/fill_sync.py's own module
+# docstring for the full reasoning.
+
+def test_order_record_defaults_lot_id_and_holding_policy_version_to_none():
+    r = OrderRecord(client_order_id="c1", account_id=ACCT, status="OPEN", at=FRI)
+    assert r.lot_id is None
+    assert r.holding_policy_version is None
+
+
+def test_latest_order_record_returns_none_when_never_recorded():
+    l = ledger()
+    assert l.latest_order_record("c1") is None
+
+
+def test_latest_order_record_returns_the_last_recorded_by_insertion_order():
+    l = ledger()
+    l.record_order_status(OrderRecord(client_order_id="c1", account_id=ACCT,
+                                      status="OPEN", at=FRI, holding_policy_version="hp-v1"))
+    l.record_order_status(OrderRecord(client_order_id="c1", account_id=ACCT,
+                                      status="CLOSED", at=FRI, holding_policy_version="hp-v1"))
+    rec = l.latest_order_record("c1")
+    assert rec.status == "CLOSED"
+
+
+def test_latest_order_record_is_scoped_to_its_own_client_order_id():
+    l = ledger()
+    l.record_order_status(OrderRecord(client_order_id="c1", account_id=ACCT,
+                                      status="OPEN", at=FRI, lot_id="l1"))
+    l.record_order_status(OrderRecord(client_order_id="c2", account_id=ACCT,
+                                      status="OPEN", at=FRI, lot_id="l2"))
+    assert l.latest_order_record("c1").lot_id == "l1"
+    assert l.latest_order_record("c2").lot_id == "l2"
+
+
 # -------------------------------------------------------- reconstructibility
 
 def test_ledger_is_fully_reconstructible_from_its_own_record_alone():
