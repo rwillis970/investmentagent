@@ -99,8 +99,16 @@ class AccountSnapshot:
     unsettled_cash: float
     buying_power: float
     multiplier: float               # 1.0 = cash account
-    pattern_day_trader: bool
-    day_trade_count: int
+    # `None` means the broker did not report this at all -- genuinely
+    # UNKNOWN, not "confirmed false"/"confirmed zero". See
+    # agent.broker.alpaca.AlpacaPaperAdapter.account() (§13 probe,
+    # 2026-07-27): a real Alpaca cash account omits both fields entirely on
+    # an account with no PDT history, and Appendix E's fail-safe-to-NO-TRADE
+    # forbids silently inventing a concrete value for an absent
+    # safety-relevant field. `SimulatorBroker` always knows both (never
+    # `None`) because it tracks day trades itself.
+    pattern_day_trader: bool | None
+    day_trade_count: int | None
     fetched_at: datetime
 
 

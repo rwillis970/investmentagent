@@ -3,7 +3,8 @@ from datetime import date
 import pytest
 
 from agent.accounts import CrossAccountError
-from agent.daytrade import DayTradeBlocked, DayTradeGuard, PostureMismatch
+from agent.daytrade import (DayTradeBlocked, DayTradeGuard, PostureMismatch,
+                            UnverifiableDayTradeCount)
 
 ACCT = "acct-taxable"
 
@@ -75,6 +76,45 @@ def test_reconcile_refuses_a_different_accounts_snapshot():
     g.record(MON, "SPY")
     with pytest.raises(CrossAccountError):
         g.reconcile(account_id="acct-ira", broker_reported=1, as_of=FRI)
+
+
+def test_reconcile_with_unknown_broker_count_and_zero_local_is_agreement():
+    """Alpaca omits daytrade_count entirely on a fresh/never-day-traded cash
+    account (§13 probe, 2026-07-27) -- that is genuinely different from
+    Alpaca reporting 0. With nothing recorded locally either, there is
+    nothing to disagree about: this must NOT halt, or a real system with a
+    brand-new account could never get past startup."""
+    g = DayTradeGuard(account_id=ACCT)
+    g.reconcile(account_id=ACCT, broker_reported=None, as_of=FRI)  # no raise
+
+
+def test_reconcile_with_unknown_broker_count_and_nonzero_local_halts():
+    """Symmetric case: the local guard claims a real day trade happened, but
+    the broker reported no count at all to check that claim against. Per
+    Appendix E's fail-safe-to-NO-TRADE, this halts -- there is nothing to
+    verify the local claim against, which is exactly the kind of data
+    uncertainty that invariant exists for."""
+    g = DayTradeGuard(account_id=ACCT)
+    g.record(MON, "SPY")
+    with pytest.raises(UnverifiableDayTradeCount):
+        g.reconcile(account_id=ACCT, broker_reported=None, as_of=FRI)
+
+
+def test_unverifiable_day_trade_count_is_a_posture_mismatch():
+    """A subclass, not a new sibling exception, specifically so
+    `run_startup`'s existing `except PostureMismatch` catches this new case
+    with no change to that except clause."""
+    assert issubclass(UnverifiableDayTradeCount, PostureMismatch)
+
+
+def test_reconcile_still_halts_on_a_genuine_numeric_mismatch_when_known():
+    """The pre-existing behaviour (a real, non-None broker count that
+    disagrees with the local one halts) must survive the None-handling
+    change unchanged."""
+    g = DayTradeGuard(account_id=ACCT)
+    g.record(MON, "SPY")
+    with pytest.raises(PostureMismatch, match="stale count"):
+        g.reconcile(account_id=ACCT, broker_reported=0, as_of=FRI)
 
 
 def test_as_of_on_a_weekend_still_derives_a_window():

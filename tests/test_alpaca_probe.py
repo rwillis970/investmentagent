@@ -1,23 +1,35 @@
 """scripts/alpaca_probe.py -- a standalone, read-only operator tool, NOT
 part of the runtime package.
 
-Two things are worth automated testing here: the pure logic (`_redact`,
-`_get`), and the structural (not just documentary) guarantee that this
-script has no write code path at all. The probe itself (`main`/`probe`)
-requires a real Alpaca paper account and real credentials resolved through
-`KeychainSecretsProvider` -- neither exists in this test environment, and
-none of these tests attempt to fake one. See the delivery report for why
-this unit could not be completed end-to-end.
+Three things are worth automated testing here: the pure logic (`_redact`,
+`_get`), the orchestration in `probe()` (now injectable: `transport` and
+`secrets_provider` are optional constructor-style arguments, the same
+dependency-injection shape `AlpacaPaperAdapter` uses, added specifically so
+this doesn't require a real account or real credentials to test), and the
+structural (not just documentary) guarantee that this script has no write
+code path at all. `main()`'s default wiring (real `KeychainSecretsProvider`,
+real `UrllibTransport`) is NOT exercised by any test here -- that still
+requires a real Alpaca paper account, which this test environment does not
+have. See the delivery report for why the capture-and-answer half of this
+unit's predecessor could not be completed end-to-end from here.
 """
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 from agent.broker.transport import ScriptedTransport
-from scripts.alpaca_probe import _get, _redact
+from agent.secrets_provider import InMemorySecretsProvider
+from scripts.alpaca_probe import DEFAULT_SYMBOLS, _get, _redact, probe
 
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "alpaca_probe.py"
+
+
+def secrets_provider(secret_ref="alpaca-secret", value="s3cr3t"):
+    p = InMemorySecretsProvider(mode="PAPER")
+    p.put(secret_ref, value)
+    return p
 
 
 # --------------------------------------------------------------------- _redact
@@ -72,6 +84,66 @@ def test_get_helper_forwards_params():
     t.enqueue(200, [])
     _get(t, {}, "/v2/orders", params={"status": "all"})
     assert t.calls[0]["params"] == {"status": "all"}
+
+
+# --------------------------------------------------------------- probe()
+
+def _queued_transport(symbols):
+    """A ScriptedTransport pre-loaded with one response per endpoint, in the
+    exact order `probe()` is expected to call them: the original four,
+    then configurations, then one /v2/assets/{symbol} per symbol."""
+    t = ScriptedTransport()
+    t.enqueue(200, {"cash": "500"})       # account
+    t.enqueue(200, [])                    # positions
+    t.enqueue(200, [])                    # orders
+    t.enqueue(200, [])                    # activities
+    t.enqueue(200, {"fractional_trading": True, "no_shorting": False})  # configurations
+    for _ in symbols:
+        t.enqueue(200, {"fractionable": True, "shortable": True})       # /v2/assets/{symbol}
+    return t
+
+
+def test_probe_hits_account_configurations_endpoint():
+    t = _queued_transport(("SPY", "QQQ"))
+    probe("AK123", "alpaca-secret", Path("/tmp/unused-probe-out"),
+         symbols=("SPY", "QQQ"), transport=t, secrets_provider=secrets_provider())
+    paths = [c["path"] for c in t.calls]
+    assert "https://paper-api.alpaca.markets/v2/account/configurations" in paths
+
+
+def test_probe_hits_assets_endpoint_for_every_symbol_in_the_small_set():
+    t = _queued_transport(("SPY", "QQQ"))
+    probe("AK123", "alpaca-secret", Path("/tmp/unused-probe-out"),
+         symbols=("SPY", "QQQ"), transport=t, secrets_provider=secrets_provider())
+    paths = [c["path"] for c in t.calls]
+    assert "https://paper-api.alpaca.markets/v2/assets/SPY" in paths
+    assert "https://paper-api.alpaca.markets/v2/assets/QQQ" in paths
+
+
+def test_probe_writes_configurations_and_assets_json_files(tmp_path):
+    t = _queued_transport(("SPY",))
+    probe("AK123", "alpaca-secret", tmp_path, symbols=("SPY",),
+         transport=t, secrets_provider=secrets_provider())
+    configs = json.loads((tmp_path / "configurations.json").read_text())
+    assert configs["body"]["fractional_trading"] is True
+    assets = json.loads((tmp_path / "assets.json").read_text())
+    assert assets["SPY"]["body"]["fractionable"] is True
+
+
+def test_probe_manifest_lists_the_new_endpoints(tmp_path):
+    t = _queued_transport(("SPY",))
+    probe("AK123", "alpaca-secret", tmp_path, symbols=("SPY",),
+         transport=t, secrets_provider=secrets_provider())
+    manifest = json.loads((tmp_path / "capture_manifest.json").read_text())
+    assert "/v2/account/configurations" in manifest["endpoints"]
+    assert "/v2/assets/SPY" in manifest["endpoints"]
+
+
+def test_default_symbols_is_a_small_fixed_set():
+    """"a small set of symbols" per the prompt -- not the whole tradable
+    universe, and not configurable-by-surprise: a fixed, named default."""
+    assert 1 <= len(DEFAULT_SYMBOLS) <= 5
+    assert len(DEFAULT_SYMBOLS) == len(set(DEFAULT_SYMBOLS))
 
 
 # ---------------------------------------------- structural no-write-path proof

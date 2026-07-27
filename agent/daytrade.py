@@ -42,6 +42,22 @@ class PostureMismatch(Exception):
     pass
 
 
+class UnverifiableDayTradeCount(PostureMismatch):
+    """The broker OMITTED its day-trade count entirely -- not a reported 0,
+    an absent field -- while the local guard has recorded at least one round
+    trip. Alpaca does this for a fresh/never-day-traded cash account (§13
+    probe, 2026-07-27: see agent/broker/alpaca.py's account()); the field's
+    absence must not be read as "zero day trades" (Appendix E's
+    fail-safe-to-NO-TRADE -- see AccountSnapshot.day_trade_count). Once the
+    local side claims a real day trade, there is nothing broker-side left to
+    verify that claim against, so this halts, same as a genuine numeric
+    mismatch.
+
+    A SUBCLASS of `PostureMismatch`, not a new sibling: `run_startup`'s
+    `except (CrossAccountError, PostureMismatch, ...)` already halts on
+    `PostureMismatch` and needs no change to also halt on this."""
+
+
 @dataclass
 class DayTradeGuard:
     account_id: str
@@ -71,14 +87,33 @@ class DayTradeGuard:
                 "Order rejected before approval."
             )
 
-    def reconcile(self, *, account_id: str, broker_reported: int,
+    def reconcile(self, *, account_id: str, broker_reported: int | None,
                  as_of: date) -> None:
+        """`broker_reported=None` means the broker OMITTED its day-trade
+        count (not that it reported zero) -- see `UnverifiableDayTradeCount`.
+        Unknown + a local count of zero is treated as agreement: there is
+        nothing local to contradict an absent broker figure, and refusing to
+        proceed here would mean a brand-new account -- which is exactly what
+        produces this omission -- could never pass reconciliation at all.
+        Unknown + any local count above zero halts: the local side is
+        claiming something real happened that the broker gave no figure to
+        verify it against."""
         if account_id != self.account_id:
             raise CrossAccountError(self.account_id, account_id,
                                     "DayTradeGuard.reconcile")
-        if broker_reported != self.count(as_of):
+        local_count = self.count(as_of)
+        if broker_reported is None:
+            if local_count == 0:
+                return
+            raise UnverifiableDayTradeCount(
+                f"account {self.account_id}: local count is {local_count} "
+                "day trade(s), but the broker reported no day-trade count "
+                "at all (an omitted field, not a reported zero) -- there is "
+                "nothing to verify the local count against. Halting."
+            )
+        if broker_reported != local_count:
             raise PostureMismatch(
                 f"account {self.account_id}: broker reports {broker_reported} "
-                f"day trades, local count is {self.count(as_of)}. Halting: "
+                f"day trades, local count is {local_count}. Halting: "
                 "the guard must not run on a stale count."
             )

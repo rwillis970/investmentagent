@@ -10,10 +10,16 @@ answer, from evidence:
   1. Settled vs unsettled cash -- is there any field that distinguishes
      them in a cash account?
   2. Which of the 17 modeled order statuses actually appear, and does the
-     live payload contradict any of the five uncertain mappings?
-  3. Does the account's own metadata (fractional eligibility, supported
-     time-in-force, extended-hours flags) confirm or contradict the static
-     `supported_matrix()` guess?
+     live payload contradict any of the five uncertain mappings? (Needs
+     real order history -- see the 2026-07-27 fixture README: this remains
+     a known-deferred question, not an open guess, until paper trading is
+     actually running and produces fills.)
+  3. Does `supported_matrix()`'s guess about fractional eligibility,
+     supported time-in-force, and extended-hours match reality? The FIRST
+     capture (2026-07-27) found `/v2/account` carries none of this -- it
+     lives on `/v2/account/configurations` (fractional_trading, no_shorting,
+     pdt_check) and per-symbol `/v2/assets/{symbol}` (fractionable,
+     shortable, marginable). This script now hits both.
 
 READ-ONLY, BY CONSTRUCTION, NOT BY COMMENT. Every HTTP call in this file
 goes through `_get()`, and `_get()` is hardcoded to call
@@ -39,12 +45,15 @@ and (b) has outbound network access to paper-api.alpaca.markets):
 
     python scripts/alpaca_probe.py --key-id <your Alpaca paper key id> \\
         --secret-ref <keychain account name the secret is stored under> \\
-        --out scripts/fixtures/
+        --out scripts/fixtures/ [--symbols SPY,QQQ,AAPL]
 
-This writes four JSON files (account.json, positions.json, orders.json,
-activities.json) plus capture_manifest.json (capture timestamp, base URL,
-endpoints hit) into --out, and prints a one-line summary per endpoint to
-stdout.
+This writes account.json, positions.json, orders.json, activities.json,
+configurations.json (`/v2/account/configurations`), assets.json (one entry
+per `--symbols` symbol, from `/v2/assets/{symbol}`), and
+capture_manifest.json (capture timestamp, base URL, every endpoint hit)
+into --out, and prints a one-line summary per endpoint to stdout.
+`--symbols` defaults to `DEFAULT_SYMBOLS` below -- a small, fixed set, not
+the whole tradable universe.
 
 REDACTION: `_redact` recursively blanks any dict value whose key looks
 credential-shaped (secret, api_key, password, token, and Alpaca's own
@@ -65,8 +74,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent.broker.transport import UrllibTransport
-from agent.secrets_provider import KeychainSecretsProvider
+from agent.broker.transport import Transport, UrllibTransport
+from agent.secrets_provider import KeychainSecretsProvider, SecretsProvider
 
 BASE_URL = "https://paper-api.alpaca.markets"
 
@@ -80,7 +89,13 @@ _ENDPOINTS = (
     ("positions", "/v2/positions", None),
     ("orders", "/v2/orders", {"status": "all"}),
     ("activities", "/v2/account/activities", None),
+    ("configurations", "/v2/account/configurations", None),
 )
+
+# A small, fixed set -- not the tradable universe. Enough to see whether
+# `fractionable`/`shortable`/`marginable` vary at all across a couple of
+# ordinary large-cap names, without turning this into a universe crawl.
+DEFAULT_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ", "AAPL")
 
 
 def _redact(obj):
@@ -107,35 +122,58 @@ def _get(transport, headers, path, *, params=None, timeout=10.0):
     return status, body
 
 
-def probe(key_id: str, secret_ref: str, out_dir: Path) -> dict:
-    """Resolve real paper credentials via `KeychainSecretsProvider`, GET
-    each of the four endpoints in `_ENDPOINTS`, write each raw (redacted)
-    response to `out_dir`, and write a capture manifest alongside them.
-    Returns the in-memory results too, for the caller's own summary."""
-    provider = KeychainSecretsProvider(mode="PAPER")
+def probe(key_id: str, secret_ref: str, out_dir: Path, *,
+         symbols: tuple[str, ...] = DEFAULT_SYMBOLS,
+         transport: Transport | None = None,
+         secrets_provider: SecretsProvider | None = None) -> dict:
+    """Resolve real paper credentials via `KeychainSecretsProvider` (or the
+    injected `secrets_provider`, for tests), GET each of the endpoints in
+    `_ENDPOINTS` plus one `/v2/assets/{symbol}` per entry in `symbols`,
+    write each raw (redacted) response to `out_dir`, and write a capture
+    manifest alongside them. Returns the in-memory results too, for the
+    caller's own summary.
+
+    `transport`/`secrets_provider` default to the real `UrllibTransport`/
+    `KeychainSecretsProvider` when not supplied -- the same
+    "inject for tests, default to real for the operator" shape
+    `AlpacaPaperAdapter` uses (agent/broker/alpaca.py), added specifically
+    so this orchestration is testable without a real account."""
+    provider = secrets_provider or KeychainSecretsProvider(mode="PAPER")
     secret = provider.resolve(secret_ref)
     headers = {
         "APCA-API-KEY-ID": key_id,
         "APCA-API-SECRET-KEY": secret,
         "Content-Type": "application/json",
     }
-    transport = UrllibTransport()
+    transport = transport or UrllibTransport()
 
     out_dir.mkdir(parents=True, exist_ok=True)
     captured_at = datetime.now(timezone.utc).isoformat()
     results: dict[str, dict] = {}
+    endpoints_hit: list[str] = []
 
     for name, path, params in _ENDPOINTS:
         status, body = _get(transport, headers, path, params=params)
         payload = {"status": status, "body": _redact(body)}
         (out_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
         results[name] = payload
+        endpoints_hit.append(f"{path}?{params}" if params else path)
         print(f"{name}: HTTP {status}, {len(json.dumps(body))} bytes captured")
+
+    assets: dict[str, dict] = {}
+    for symbol in symbols:
+        path = f"/v2/assets/{symbol}"
+        status, body = _get(transport, headers, path)
+        assets[symbol] = {"status": status, "body": _redact(body)}
+        endpoints_hit.append(path)
+        print(f"assets[{symbol}]: HTTP {status}, {len(json.dumps(body))} bytes captured")
+    (out_dir / "assets.json").write_text(json.dumps(assets, indent=2, sort_keys=True))
+    results["assets"] = assets
 
     manifest = {
         "captured_at": captured_at,
         "base_url": BASE_URL,
-        "endpoints": [f"{path}?{params}" if params else path for _, path, params in _ENDPOINTS],
+        "endpoints": endpoints_hit,
         "note": "READ-ONLY capture. No order was placed, cancelled, or modified.",
     }
     (out_dir / "capture_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -151,8 +189,14 @@ def main() -> int:
              "SecretsProvider -- never pass the raw secret value on the command line",
     )
     parser.add_argument("--out", default="scripts/fixtures", help="output directory")
+    parser.add_argument(
+        "--symbols", default=",".join(DEFAULT_SYMBOLS),
+        help="comma-separated symbols to GET /v2/assets/{symbol} for (small set, "
+             f"not a universe crawl; default: {','.join(DEFAULT_SYMBOLS)})",
+    )
     args = parser.parse_args()
-    probe(args.key_id, args.secret_ref, Path(args.out))
+    symbols = tuple(s.strip() for s in args.symbols.split(",") if s.strip())
+    probe(args.key_id, args.secret_ref, Path(args.out), symbols=symbols)
     return 0
 
 

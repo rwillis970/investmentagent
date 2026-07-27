@@ -276,6 +276,27 @@ retroactively release positions that were opened under a longer commitment. Leng
 likewise does not trap existing lots. This is the same immutability principle as the
 evidence store, applied to policy.
 
+**Confirmed against a real Alpaca paper account (§13 probe, 2026-07-27; see
+`scripts/fixtures/`, `agent/broker/alpaca.py`)**: there is no field anywhere in Alpaca's
+cash-account API surface — not `/v2/account`, not Account Activities — that distinguishes
+settled from unsettled cash. `lot.settled` above therefore cannot be read from the broker at
+all; it can only be a locally computed expectation (fill time plus the account's known T+1
+settlement lag), owned by whatever local ledger eventually tracks lots — that ledger is not
+yet built. `AccountSnapshot.settled_cash`/`unsettled_cash` (`agent/broker/base.py`) are
+consequently an approximation of the account's cash *total*
+(`settled_cash = cash, unsettled_cash = 0.0`, always), not a source `sellable_qty` can
+consult per lot; the broker simply does not expose the distinction this formula's
+`lot.settled` term needs. Free-riding protection under a cash account (§4.4) is bound by the
+same limit: it can only be enforced from the local ledger's own settlement expectations,
+never from broker-reported state, because no broker-reported state carries it.
+
+Settled-cash *reconciliation* is a separate, narrower check and is unaffected by this gap:
+`agent.reconciliation.reconcile_settled_cash` compares the broker's cash total against a
+local total by exact equality, never a tolerance (Option A of the options considered for
+this check; see that module's own docstring for why no tolerance is introduced). That
+verifies the two *totals* agree — it says nothing about, and cannot say anything about,
+which individual lots are settled.
+
 ### 4.2 Early exit
 
 All six exception categories from Change Request §4.3 are adopted. The mechanism has four
@@ -1278,3 +1299,4 @@ plus a versioned `CapabilityChangeRequest` per §5.
 | v1.1 fix | §9.1 config example replaced with the repository's actual `config.example.json`. The previous example omitted `sides`, `funding`, `max_position_pct`, `max_sector_pct`, `drawdown_pause_pct`, `max_new_positions_per_day` and `approval_min_display_seconds`, and included `full_portfolio_review_schedule`, which the schema does not yet accept. |
 | v1.1 add | §9.2 mode transitions written out explicitly. Criterion 3 and the Day-1 exit criterion require a transition guard; membership validation alone does not provide one. |
 | v1.1 add | §6 states that the profile table is a preset table — `risk_profile` must drive the defaults and reject contradictory overrides, not sit unread beside independent fields. |
+| v1.1 confirm | §4.1 records a real-account finding (§13 probe, 2026-07-27): Alpaca's cash-account API has no settled/unsettled cash field anywhere. `lot.settled` and cash-account free-riding protection can only be enforced from a local ledger's own T+1 expectation, never from broker-reported state. Settled-cash reconciliation (exact equality, Option A) is unaffected — it checks that two cash *totals* agree, not which lots are settled. The local ledger itself remains unbuilt. |

@@ -320,7 +320,13 @@ class AccountReconciliation:
     answer, kept whole for the same account_id-checking reason."""
     account_id: str
     day_trade_guard: DayTradeGuard
-    broker_reported_day_trades: int
+    # `None` means the broker omitted its day-trade count entirely -- see
+    # `agent.daytrade.DayTradeGuard.reconcile` (§13 probe, 2026-07-27) for
+    # how that's distinguished from a reported zero, and
+    # `agent.broker.base.AccountSnapshot.day_trade_count` for where this
+    # value actually comes from when a real caller wires this field up
+    # (nothing does yet -- see the delivery report).
+    broker_reported_day_trades: int | None
     local_positions: dict[str, float]
     broker_positions: tuple[Position, ...]
     local_settled_cash: float

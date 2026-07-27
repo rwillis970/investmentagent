@@ -57,10 +57,38 @@ verification against a real paper account's actual behaviour across a T+1
 settlement, or a better source (e.g. the Account Activities endpoint, which
 lists settlement-relevant non-trade activity) -- neither was in scope here.
 
+EMPIRICALLY CONFIRMED (§13 probe, scripts/alpaca_probe.py, captured
+2026-07-27T18:00:18Z -- see scripts/fixtures/): a real paper `/v2/account`
+response for a brand-new $500 cash account was dumped verbatim -- 36 top-
+level fields, none named anything like "settled cash" or "cash_withdrawable".
+This isn't just re-confirming the alpaca-py model read above; it's the raw
+wire response. So the answer to "can settled be distinguished from unsettled
+in a cash account" is a confirmed NO, not an inferred one: there is no field,
+anywhere in `/v2/account`, that could be remapped onto a settled/unsettled
+split. `AccountSnapshot` is NOT changed as a result -- there is nothing to
+change it TO. What this DOES leave open, because the captured account had
+never placed an order: whether Alpaca's `cash` figure itself moves the
+instant a sale fills (i.e., whether `cash` ever transiently includes
+unsettled proceeds at all) is still unobserved. That would need a second
+capture bracketing a real sell + T+1 cycle -- a different, larger unit than
+this one, since it requires placing and holding a real order, not just
+reading account state.
+
 STATUS MAPPING -- see `STATUS_MAP` below for the full table and which of
 Alpaca's seventeen `OrderStatus` values do not map cleanly onto this
 codebase's five-state vocabulary (new/partially_filled/filled/canceled/
 rejected, per `agent.broker.base.BrokerOrder`).
+
+STATUS MAPPING REMAINS UNCONFIRMED AGAINST A REAL ACCOUNT (§13 probe,
+2026-07-27 -- see scripts/fixtures/orders.json). The captured account had
+never placed an order, so `orders.json` is `[]`: zero of the seventeen
+statuses were observed, and none of the five judgment-call mappings below
+were exercised. `STATUS_MAP` is UNCHANGED -- there is no evidence either
+way. This is a structural limitation of a read-only probe against a fresh
+account, not an oversight: confirming real status vocabulary requires an
+account with actual order history, which means either placing real orders
+(out of scope for a read-only unit) or capturing again once the paper
+account has some.
 
 TIMEOUTS AND RETRIES -- see `Config.broker_http_timeout_seconds`/
 `broker_http_max_retries` (agent/config.py, §9.1). Retries apply ONLY to
@@ -277,8 +305,28 @@ class AlpacaPaperAdapter(BrokerAdapter):
             unsettled_cash=0.0,
             buying_power=float(data["buying_power"]),
             multiplier=float(data["multiplier"]),
-            pattern_day_trader=bool(data.get("pattern_day_trader", False)),
-            day_trade_count=int(data.get("daytrade_count", 0)),
+            # FINDING (§13 probe, 2026-07-27 -- scripts/fixtures/account.json):
+            # a real cash account omits BOTH of these keys entirely -- not
+            # `false`/`0`, absent. alpaca-py's own TradeAccount models both as
+            # Optional[None] (fetched from github.com/alpacahq/alpaca-py),
+            # confirming this is Alpaca's real behaviour, not a capture
+            # artifact. Every OTHER boolean on this account (trading_blocked,
+            # transfers_blocked, shorting_enabled, ...) IS present even when
+            # false, which is what makes this pair's absence notable rather
+            # than "Alpaca omits falsy fields" in general.
+            #
+            # `.get(key)` with NO default -- an absent key maps to Python
+            # `None`, which `AccountSnapshot.pattern_day_trader`/
+            # `day_trade_count` now model explicitly as UNKNOWN, never
+            # silently coerced to `False`/`0`. Appendix E's
+            # fail-safe-to-NO-TRADE forbids inventing a concrete value for an
+            # absent safety-relevant field; see
+            # `agent.daytrade.DayTradeGuard.reconcile` for how the unknown
+            # count is actually handled at the point it matters.
+            pattern_day_trader=(bool(data["pattern_day_trader"])
+                               if data.get("pattern_day_trader") is not None else None),
+            day_trade_count=(int(data["daytrade_count"])
+                            if data.get("daytrade_count") is not None else None),
             fetched_at=datetime.now(timezone.utc),
         )
 
@@ -375,7 +423,26 @@ class AlpacaPaperAdapter(BrokerAdapter):
         NOT empirically probed against a live account. §13 asks for this
         to be probed; that requires a real (paper or live) account and has
         not been done as part of this unit. Treat this as a documented
-        starting point for that probe, not its result."""
+        starting point for that probe, not its result.
+
+        §13 PROBE ATTEMPTED, 2026-07-27 (scripts/fixtures/account.json):
+        `/v2/account` -- the only endpoint this unit's read-only script
+        hit that could plausibly carry this -- has NO fields for fractional
+        eligibility, supported time-in-force, or extended-hours. Checked
+        against alpaca-py's own `TradeAccount` model (github.com/alpacahq/
+        alpaca-py): that information lives on a DIFFERENT model,
+        `AccountConfiguration` (`/v2/account/configurations`:
+        `fractional_trading`, `no_shorting`, `max_margin_multiplier`,
+        `pdt_check`), and on per-symbol `/v2/assets/{symbol}`
+        (`fractionable`, `shortable`, `marginable`). Neither endpoint was
+        probed here. So this matrix is NEITHER confirmed NOR contradicted --
+        the premise that account-level metadata would settle this was wrong
+        for this endpoint; a real answer needs those two endpoints added to
+        `scripts/alpaca_probe.py`. One incidental, confirmed fact from the
+        real capture: `shorting_enabled` was `false` account-wide, consistent
+        with (not a new constraint beyond) the capability layer's own
+        independent no-short policy -- this matrix has no "side" axis to
+        update as a result."""
         return {
             "order_type": ["MARKET", "LIMIT", "STOP", "STOP_LIMIT", "TRAILING_STOP"],
             "time_in_force": ["DAY", "GTC", "OPG", "CLS", "IOC", "FOK"],

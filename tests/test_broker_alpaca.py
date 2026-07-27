@@ -116,6 +116,45 @@ def test_account_maps_the_documented_fields():
     assert snap.day_trade_count == 2
 
 
+def test_account_maps_absent_pdt_fields_to_none_not_false_or_zero():
+    """FINDING (§13 probe, 2026-07-27 -- scripts/fixtures/account.json): a
+    real, brand-new Alpaca paper cash account OMITS `pattern_day_trader` and
+    `daytrade_count` entirely -- not `false`/`0`. Silently defaulting an
+    absent safety-relevant field to a concrete value is exactly what
+    Appendix E's fail-safe-to-NO-TRADE forbids: it invents data. Both must
+    come back as `None` (unknown), not `False`/`0`."""
+    t = ScriptedTransport()
+    body = account_json()
+    del body["pattern_day_trader"]
+    del body["daytrade_count"]
+    t.enqueue(200, body)
+    snap = adapter(t).account()
+    assert snap.pattern_day_trader is None
+    assert snap.day_trade_count is None
+
+
+def test_account_still_maps_real_pdt_fields_when_present():
+    """The unknown-vs-known distinction must not regress the ordinary case:
+    when Alpaca DOES report these fields, they still come through as the
+    real values, same as before this change."""
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(pattern_day_trader=True, daytrade_count=2))
+    snap = adapter(t).account()
+    assert snap.pattern_day_trader is True
+    assert snap.day_trade_count == 2
+
+
+def test_account_maps_a_reported_false_and_zero_as_known_not_unknown():
+    """The other edge: Alpaca explicitly reporting `false`/`0` (a genuinely
+    known, non-PDT, zero-day-trades account) must NOT be conflated with the
+    field being absent -- both are legitimate, distinct states."""
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(pattern_day_trader=False, daytrade_count=0))
+    snap = adapter(t).account()
+    assert snap.pattern_day_trader is False
+    assert snap.day_trade_count == 0
+
+
 def test_account_settled_cash_is_mapped_from_cash_and_is_approximate():
     """Alpaca's /v2/account has no settled/unsettled split (confirmed
     against alpaca-py's TradeAccount model -- no such field exists).
