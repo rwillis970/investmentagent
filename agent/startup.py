@@ -4,8 +4,9 @@ stale approvals -> resume.
 This wires four pieces that already existed for exactly this purpose --
 `mode.assert_legal_startup`, `market_calendar.assert_calendar_coverage_at_
 startup`, `AuditLog.verify`, and per-account `DayTradeGuard.reconcile` --
-and adds one that didn't (`ApprovalService.sweep_expired`, in agent/
-approval.py). Nothing here reimplements any of the four.
+and adds two that didn't (`ApprovalService.sweep_expired`, in agent/
+approval.py, and `mode_store.ModeStore`, the durable mode persistence this
+unit adds). Nothing here reimplements any of the four wired-in pieces.
 
 `DayTradeGuard.reconcile` only reconciles day-trade counts. §8.1 step 1 and
 Day 3's exit criterion also name positions, settled cash and open orders;
@@ -15,79 +16,77 @@ what each would need.
 DECISION 1 -- SEQUENCE ORDER. §8.1's literal order (reconcile, then verify
 the chain) is followed exactly, unchanged: the day-trade reconciliation
 loop runs before `audit_log.verify()` is checked below. I considered
-whether verification
-should come first, since reconciliation appends audit rows, and asked
-myself whether that appends onto a chain not yet known to be intact. It
-doesn't create a detection gap: `AuditLog.verify()` walks the ENTIRE chain
-from genesis on every call and returns False at the first broken link,
-wherever it is -- rows appended *after* a historical break can never make
-that break invisible, because verify() reaches the break before it reaches
-anything appended later. The only real cost of the doc's order is that a
-run whose chain later fails verification will have already written a few
-new (individually well-formed, but built on a foundation of unknown
-integrity) reconciliation rows before halting. That's mitigated by giving
-every row from one run the same `correlation_id`, so an operator
+whether verification should come first, since reconciliation appends audit
+rows, and asked myself whether that appends onto a chain not yet known to
+be intact. It doesn't create a detection gap: `AuditLog.verify()` walks the
+ENTIRE chain from genesis on every call and returns False at the first
+broken link, wherever it is -- rows appended *after* a historical break can
+never make that break invisible, because verify() reaches the break before
+it reaches anything appended later. The only real cost of the doc's order
+is that a run whose chain later fails verification will have already
+written a few new (individually well-formed, but built on a foundation of
+unknown integrity) reconciliation rows before halting. That's mitigated by
+giving every row from one run the same `correlation_id`, so an operator
 investigating a broken chain can identify and discount an entire failed
 run's rows together. Net: the doc's order is not less safe than verify-
 first, so it is kept exactly as written.
 
-Two checks that are NOT among §8.1's four named steps -- the mode-
-transition check and the calendar-coverage check -- run BEFORE reconcile,
-as pure preconditions with no side effects: there is no reason to reconcile
-accounts or touch the audit log for a startup attempt that is already
-illegal (wrong mode transition) or already known to be running past the
-calendar's coverage in PRODUCTION_ACTIVE. Placing them first costs nothing
-they are silent and side-effect-free until they need to raise or return a
-warning.
+Three checks that are NOT among §8.1's four named steps -- mode/audit
+reconciliation, the mode-transition check, the accounts-vs-mode check, and
+the calendar-coverage check -- run BEFORE reconcile, as pure preconditions:
+there is no reason to reconcile accounts or touch the audit log for a
+startup attempt that is already illegal (wrong mode transition, accounts
+handed to a mode that shouldn't have any) or already known to be running
+past the calendar's coverage in PRODUCTION_ACTIVE OR PAPER -- both exercise
+the calendar (see `market_calendar.exercises_calendar`); this used to say
+"in PRODUCTION_ACTIVE" only, which went stale the moment PAPER was added to
+`_CALENDAR_EXERCISING_MODES`. Placing these first costs nothing -- they are
+silent and side-effect-free until they need to raise or return a warning.
 
-DECISION 2 -- WHAT A FAILED STARTUP LEAVES BEHIND. The intent, once mode
-persistence exists (DECISION 3), is that every failure path except a
-broken audit chain transitions the persisted mode to PAUSED. PAUSED, not
-"leave mode untouched": §9.2 makes DISABLED and PAUSED reachable
-immediately and unconditionally from any state specifically so a kill-
-switch-shaped transition is never blocked by the same state machine it
-exists to override, and a failed startup is exactly a case where the
-system needs to land somewhere that provably cannot resume into live
-trading without a fresh PAPER/PAUSED -> PRODUCTION_ACTIVE confirmation
-(§9.2's CONFIRMATION_REQUIRED edges) rather than silently retrying whatever
-was persisted before. "Refuse and change nothing" was the other option; it
-was rejected because it leaves the persisted mode exactly where it was --
-which, if that was PRODUCTION_ACTIVE from before a crash, means the next
-thing to read persisted_mode has no record that the last startup attempt
-ever failed at all. This reasoning does not change and is kept here for
-when it applies.
+DECISION 2 -- WHAT A FAILED STARTUP LEAVES BEHIND. Every failure path
+except a broken audit chain now drives a REAL transition of the persisted
+mode to PAUSED, via `mode_store.write` followed by an audit row (see
+DECISION 5 for why that order). PAUSED, not "leave mode untouched": §9.2
+makes DISABLED and PAUSED reachable immediately and unconditionally from
+any state specifically so a kill-switch-shaped transition is never blocked
+by the same state machine it exists to override, and a failed startup is
+exactly a case where the system needs to land somewhere that provably
+cannot resume into live trading without a fresh PAPER/PAUSED ->
+PRODUCTION_ACTIVE confirmation (§9.2's CONFIRMATION_REQUIRED edges) rather
+than silently retrying whatever was persisted before. "Refuse and change
+nothing" was the other option; it was rejected because it leaves the
+persisted mode exactly where it was -- which, if that was PRODUCTION_ACTIVE
+from before a crash, means the next startup has no record that the last
+attempt ever failed at all.
 
-What actually happens today is narrower, and used to overclaim: this
-function used to append `action="mode_transition", after="PAUSED"`, but
-there is no state store anywhere in this codebase that persists mode (see
-DECISION 3) -- nothing sets a mode to PAUSED as a result of that row,
-and nothing reads it back and treats it as authoritative. It recorded a
-transition that never happened, because there is nothing yet for it to
-happen IN. `_halt` now records the halt and its reason instead
-(`action="startup_halted"`) -- an honest description of what this function
-can actually do without a mode store to act on. It should go back to
-driving a real transition to PAUSED once that store exists; the PAUSED
-reasoning above is the reasoning for that future change, not a description
-of current behavior.
+This used to be aspirational rather than actual: before durable mode
+persistence existed, `_halt` claimed `action="mode_transition", after=
+"PAUSED"` with nothing behind it -- no store to write to, so the row
+recorded a transition that never happened. That is fixed now: `_halt`
+writes to `mode_store` before it writes the audit row, so the claim is
+true by the time it's made. If `persisted_mode` is already "PAUSED",
+neither write happens -- there is no transition to make or claim, only the
+halt itself. Every halt, regardless, still appends a `startup_halted` row
+recording why.
 
 The one exception is `AuditChainBroken`: when `verify()` itself reports the
-chain broken, nothing further is written to that log, including the halt
-note. At that point the log's own trustworthiness is the thing that
-failed, and continuing to append to it -- even a note about halting --
-means building on a chain already known to contain at least one
-inconsistency, rather than preserving it exactly as found for a human to
+chain broken, nothing further is written anywhere -- not to `mode_store`,
+not to the audit log. At that point the log's own trustworthiness is the
+thing that failed, and taking any further action on the strength of a
+startup attempt whose own audit trail is already known-corrupted --
+including changing the real persisted mode -- means acting on unverified
+ground instead of preserving everything exactly as found for a human to
 inspect. Every other failure mode is caught before or independently of the
-chain-integrity question, so writing a halt note for those is safe.
+chain-integrity question, so acting on those is safe.
 
-DECISION 3 -- WHERE persisted_mode COMES FROM. It doesn't come from
-anywhere yet. `run_startup`, like `agent.config.load`, takes it as a plain
-caller-supplied argument. There is no persistence layer in this codebase
-that durably records "the mode the system was last in" -- that lands with
-the run loop/persistence layer, not here. This is a stated gap, not a
-silent one: a caller invoking `run_startup` today is responsible for
-sourcing `persisted_mode` itself (e.g. from whatever ran last, held in
-process memory, or hardcoded in a test), exactly as `config.load` already
-requires of its own `persisted_mode` parameter.
+DECISION 3 -- WHERE persisted_mode COMES FROM. RESOLVED by this unit: it
+comes from `mode_store.current()`. `run_startup` no longer takes
+`persisted_mode` as an argument; it takes a `mode_store: ModeStore` and
+resolves the persisted mode itself, exactly once, at the top of the
+function (after reconciling it against the audit log -- see DECISION 5).
+Tests supply a `ModeStore` (in-memory, no path) rather than a raw string --
+see tests/test_startup.py's `mode_store()` helper. See agent/mode_store.py
+for where and how this is actually persisted.
 
 DECISION 4 -- WHETHER "resume" BELONGS HERE. It does not. §8.1's fourth
 step implies handing control to the cadence loop, which does not exist yet
@@ -97,6 +96,80 @@ module). `run_startup` stops at "ready to resume": on success it returns a
 what reconciliation/sweep found. Nothing is started. A future run loop is
 what would call this and then actually begin operating in the mode the
 result names.
+
+DECISION 5 -- ATOMICITY BETWEEN THE MODE WRITE AND THE AUDIT ROW. This is
+the crux of durable mode persistence. `mode_store` and `audit_log` are two
+separate, independent stores (§7.2 requires mode state to live in its own
+schema with its own write path -- it cannot share a store, let alone a
+transaction, with the general-purpose audit log). There is no database
+transaction spanning both in this codebase's actual implementation (both
+are in-memory/JSONL reference stores, per `agent.store` and `agent.audit`'s
+own docstrings) -- so "one transaction" is not available honestly, and
+faking one (e.g. writing both into a single file) would violate the
+separate-write-path requirement.
+
+The two failure windows are NOT symmetric, and that asymmetry is the whole
+design:
+  - Write mode, then crash before the audit row: the audit log is
+    INCOMPLETE. It has no record of a transition that did, in fact, happen.
+    Recoverable: the next startup notices `mode_store.current()` disagrees
+    with the last `mode_transition` row's claimed mode, and appends a
+    `mode_persisted_reconciled` catch-up row, timestamped honestly at
+    recovery time, saying so.
+  - Write the audit row, then crash before the mode write: the audit log
+    is WRONG. It claims a transition that never happened -- exactly the
+    bug DECISION 2 used to have, and append-only means it can never be
+    un-claimed after the fact.
+
+Given that asymmetry, the ordering is not a coin flip: `mode_store.write`
+always happens BEFORE its paired audit row, everywhere in this module (in
+`_halt` and at the bottom of `run_startup`). This makes the dangerous
+failure (a false claim) structurally impossible -- an audit row claiming a
+transition is only ever written after the transition has already durably
+happened -- and reduces the remaining risk to the recoverable one (a
+lagging or missing audit row), which `_reconcile_mode_persistence` below
+closes on the very next startup, before any of the other four decisions'
+checks run.
+
+This does not achieve full ACID: a crash during the reconciliation catch-up
+write itself is a residual, unhandled double-fault, the same class of risk
+a real database's own transaction log has at the hardware level. Closing
+that would require both stores to share one real transactional connection
+(the production Postgres target already named in agent/store.py's and
+agent/audit.py's own docstrings), at which point this whole write-ahead/
+reconciliation scheme collapses into a single COMMIT and becomes
+unnecessary. Not built here -- this codebase has no real database
+connection yet to make that transaction on.
+
+DECISION 6 -- MIGRATION NUMBERING AND ENTITY PARITY. Mode state becomes a
+parity-tested entity: `ModeChange` (agent/entities.py) paired with
+`policy.mode_state` (migrations/003_mode_state.sql), registered in
+`tests/test_entities_match_sql.py`'s CASES in the same commit as both. It
+lives in the `policy` schema, not `agent`, alongside `policy.trade_
+capability`/`policy.holding`/`policy.risk` -- the other §7.2-protected
+fields migrations/001_init.sql already separates from the `agent` schema
+the optimiser's database role would otherwise share access to.
+
+DECISION 7 -- WHETHER config.load's persisted_mode STAYS. It does not.
+`agent.config.load` had its own independent `check_mode_transition`/
+`persisted_mode` opt-in parameters, calling the same `mode.
+assert_legal_startup` this module calls, but reading persisted_mode from
+wherever ITS caller happened to supply it -- a second, independent reader
+of "the mode the system was last in," with no connection to `mode_store`.
+Two readers of one durable value is exactly a divergence risk: nothing
+stopped `config.load` from being called with a stale or simply wrong
+`persisted_mode` that disagreed with what `mode_store` actually held.
+`run_startup`, backed by `mode_store`, is the only code path real orders
+ever flow through, so it becomes the sole source of mode-transition-
+legality enforcement; `config.load`'s `check_mode_transition`/
+`persisted_mode` parameters and the transition check inside `validate` are
+removed. `config.load` keeps validating that `cfg.mode` is a KNOWN mode
+(plain membership, unchanged) -- transition LEGALITY is `run_startup`'s
+job alone now. `config.py` was kept a pure, I/O-free function deliberately
+(no store of any kind), so the alternative -- giving it a `ModeStore`
+dependency so it could read the real value itself -- was rejected as a
+larger, unrequested architectural change for a check that already has a
+better home.
 
 KNOWN GAP -- CALENDAR COVERAGE IS ONLY RE-CHECKED AT STARTUP. `market_
 calendar.assert_calendar_coverage_at_startup` runs once, here, per process
@@ -109,6 +182,18 @@ inspection: `agent.mode`'s functions are called only from here and from
 `agent.config.load`); see the comment above `assert_legal_startup` in
 agent/mode.py for exactly where this needs to be wired in once one is
 built. Not built here.
+
+KNOWN GAP -- NO IMMUTABLE-BOUNDARY TEST SUITE EXISTS YET. §7.2 says "the
+Day-12 test suite attempts each of these writes and asserts failure" for
+every field in its protected list, mode state included. Checked by
+inspection: no such suite exists anywhere in this codebase yet -- there is
+no optimiser code, no database-role/grant mechanism, and no test file that
+attempts a forbidden write and asserts it fails, for mode or anything else
+on §7.2's list. `mode_store.ModeStore` living in its own module with its
+own file is the concrete, buildable half of §7.2 available today (a
+structurally separate write path); the enforcement half (an optimiser
+whose database role genuinely lacks a grant, and a test suite that proves
+it) is Day 11/12 work, not built here.
 """
 from __future__ import annotations
 
@@ -121,6 +206,7 @@ from .accounts import CrossAccountError
 from .approval import ApprovalService
 from .audit import AuditLog
 from .daytrade import DayTradeGuard, PostureMismatch
+from .mode_store import ModeStore
 
 
 class StartupHalted(Exception):
@@ -134,7 +220,8 @@ class StartupHalted(Exception):
 class AuditChainBroken(StartupHalted):
     """`AuditLog.verify()` returned False. Raised instead of letting a
     caller that ignores a bool return value silently proceed. Nothing is
-    written to the log after this is detected -- see DECISION 2."""
+    written to the log -- or to mode_store -- after this is detected. See
+    DECISION 2 and DECISION 5."""
 
 
 class AccountsNotExpectedForMode(StartupHalted):
@@ -193,40 +280,88 @@ class StartupResult:
     audit_chain_length: int
 
 
-def _halt(audit_log: AuditLog, *, persisted_mode: str | None, reason: str,
-         now: datetime, correlation_id: str | None) -> None:
-    """Append the one row a halting failure leaves behind (DECISION 2).
-    Records the halt and why -- NOT a transition to PAUSED: there is no
-    mode store yet for such a transition to be applied to, so claiming one
-    happened would be recording something that didn't occur. Never called
-    for a broken chain -- that path raises before this."""
+def _last_claimed_mode(audit_log: AuditLog) -> str | None:
+    """The mode the audit log most recently claimed was persisted, per its
+    latest `mode_transition` row -- or None if it has never claimed one.
+    Compared against `mode_store.current()` to detect the DECISION 5 gap:
+    a mode written but never audited."""
+    for ev in reversed(audit_log.events):
+        if ev.action == "mode_transition":
+            # .get, not [] -- a malformed row (e.g. tampering) must not
+            # crash this scanner; it should read as "no valid claim" and
+            # let verify() below report the corruption properly.
+            return ev.after.get("mode") if isinstance(ev.after, dict) else None
+    return None
+
+
+def _reconcile_mode_persistence(mode_store: ModeStore, audit_log: AuditLog, *,
+                                now: datetime, correlation_id: str | None) -> str | None:
+    """DECISION 5's recovery half. Runs first, before any other check, so
+    every check after this sees an audit log that agrees with mode_store.
+    If a prior run wrote a mode and crashed before auditing it, that gap is
+    closed here with an honestly-timestamped catch-up row -- never a
+    silent adoption, and never a claim that the transition happened at any
+    time other than now. Returns the resolved persisted mode."""
+    stored = mode_store.current()
+    claimed = _last_claimed_mode(audit_log)
+    if stored != claimed:
+        audit_log.append(
+            actor="system", action="mode_persisted_reconciled",
+            object_type="mode", object_id="system",
+            before={"mode": claimed}, after={"mode": stored},
+            correlation_id=correlation_id, timestamp=now,
+        )
+    return stored
+
+
+def _halt(mode_store: ModeStore, audit_log: AuditLog, *, persisted_mode: str | None,
+         reason: str, now: datetime, correlation_id: str | None) -> None:
+    """What a halting failure leaves behind (DECISION 2). If `persisted_
+    mode` is not already "PAUSED", drives a real transition to it --
+    mode_store first, then its audit row (DECISION 5's ordering) -- so the
+    row is never written before the fact it claims is true. Always appends
+    a `startup_halted` row recording why, whether or not a transition also
+    occurred. Never called for a broken chain -- that path raises before
+    this and writes nothing at all."""
+    if persisted_mode != "PAUSED":
+        mode_store.write("PAUSED", changed_at=now, reason=reason)
+        audit_log.append(actor="system", action="mode_transition",
+                         object_type="mode", object_id="system",
+                         before={"mode": persisted_mode}, after={"mode": "PAUSED"},
+                         correlation_id=correlation_id, timestamp=now)
     audit_log.append(actor="system", action="startup_halted",
                      object_type="startup", object_id="system",
-                     before=persisted_mode, after={"reason": reason},
+                     before={"mode": persisted_mode}, after={"reason": reason},
                      correlation_id=correlation_id, timestamp=now)
 
 
-def run_startup(*, target_mode: str, persisted_mode: str | None,
-                confirmed: bool = False, audit_log: AuditLog,
-                accounts: list[DayTradeReconciliation],
+def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLog,
+                mode_store: ModeStore, accounts: list[DayTradeReconciliation],
                 approval_service: ApprovalService, now: datetime,
                 correlation_id: str | None = None) -> StartupResult:
     """Run the §8.1 sequence once. Raises on any failure (see the module
-    docstring's four decisions for what each failure leaves behind);
-    returns a `StartupResult` only once every step has completed. Does not
-    validate that `target_mode`/`persisted_mode` are known mode values
-    itself -- `mode.assert_legal_startup` already does that, and re-checking
-    here would be exactly the reimplementation this module is told not to
-    do."""
+    docstring's decisions for what each failure leaves behind); returns a
+    `StartupResult` only once every step has completed. Reads the persisted
+    mode from `mode_store` itself (DECISION 3) rather than taking it as an
+    argument -- tests supply a `ModeStore` instance, seeded or empty, not a
+    raw string. Does not validate that `target_mode` is a known mode value
+    itself -- `mode.assert_legal_startup` already does that, and
+    re-checking here would be exactly the reimplementation this module is
+    told not to do."""
     today = market_calendar.session_for_instant(now)
+
+    # -- DECISION 5's recovery half, first, before anything else can
+    #    diverge further from a possibly-incomplete prior run.
+    persisted_mode = _reconcile_mode_persistence(
+        mode_store, audit_log, now=now, correlation_id=correlation_id)
 
     # -- preconditions: pure checks, no side effects, run before either the
     #    audit log or any account is touched (see DECISION 1's last part).
     try:
         mode_fsm.assert_legal_startup(persisted_mode, target_mode, confirmed=confirmed)
     except mode_fsm.ModeTransitionError as exc:
-        _halt(audit_log, persisted_mode=persisted_mode, reason=str(exc), now=now,
-             correlation_id=correlation_id)
+        _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=str(exc),
+             now=now, correlation_id=correlation_id)
         raise
 
     # A non-calendar-exercising mode (RESEARCH, DISABLED, PAUSED) has no
@@ -240,8 +375,8 @@ def run_startup(*, target_mode: str, persisted_mode: str | None,
             f"reconcile in this mode); refusing {len(accounts)} account(s) "
             "handed to a startup that should not be reconciling any."
         )
-        _halt(audit_log, persisted_mode=persisted_mode, reason=reason, now=now,
-             correlation_id=correlation_id)
+        _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=reason,
+             now=now, correlation_id=correlation_id)
         raise AccountsNotExpectedForMode(reason)
 
     calendar_warning: str | None = None
@@ -249,8 +384,8 @@ def run_startup(*, target_mode: str, persisted_mode: str | None,
         calendar_warning = market_calendar.assert_calendar_coverage_at_startup(
             target_mode, today=today)
     except market_calendar.CalendarExpiryError as exc:
-        _halt(audit_log, persisted_mode=persisted_mode, reason=str(exc), now=now,
-             correlation_id=correlation_id)
+        _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=str(exc),
+             now=now, correlation_id=correlation_id)
         raise
 
     # -- §8.1 step 1: reconcile day-trade counts, per account. This is ONLY
@@ -271,8 +406,8 @@ def run_startup(*, target_mode: str, persisted_mode: str | None,
             )
         except (CrossAccountError, PostureMismatch,
                market_calendar.CalendarCoverageError) as exc:
-            _halt(audit_log, persisted_mode=persisted_mode, reason=str(exc), now=now,
-                 correlation_id=correlation_id)
+            _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=str(exc),
+                 now=now, correlation_id=correlation_id)
             raise
         audit_log.append(
             actor="system", action="reconcile_day_trades", object_type="account",
@@ -286,12 +421,13 @@ def run_startup(*, target_mode: str, persisted_mode: str | None,
     # -- §8.1 step 2: verify the hash chain. A bool return value is exactly
     #    what a caller can accidentally ignore -- convert it into a raise
     #    here, once, so nothing downstream can do that. Nothing more is
-    #    written to the log past this point if it fails (DECISION 2).
+    #    written to the log -- or to mode_store -- past this point if it
+    #    fails (DECISION 2, DECISION 5).
     if not audit_log.verify():
         raise AuditChainBroken(
             "audit hash chain failed verification at startup (§8.1); "
             "refusing to resume, and refusing to write anything further to "
-            "this log. Preserve it as-is for investigation."
+            "this log or to mode_store. Preserve both as-is for investigation."
         )
 
     # -- §8.1 step 3: expire stale approvals. A state change, so it is
@@ -318,6 +454,18 @@ def run_startup(*, target_mode: str, persisted_mode: str | None,
             correlation_id=correlation_id, timestamp=now,
         )
         warnings = (calendar_warning,)
+
+    # -- the real transition, if this run actually changes the mode.
+    #    mode_store first, its audit row second -- DECISION 5's ordering,
+    #    same as _halt. A same-mode restart (persisted_mode == target_mode)
+    #    is a legal *step* but not a change, so nothing is written here for
+    #    it -- mode_store's history stays a record of real transitions.
+    if target_mode != persisted_mode:
+        mode_store.write(target_mode, changed_at=now)
+        audit_log.append(actor="system", action="mode_transition",
+                         object_type="mode", object_id="system",
+                         before={"mode": persisted_mode}, after={"mode": target_mode},
+                         correlation_id=correlation_id, timestamp=now)
 
     # -- ready to resume (DECISION 4: resume itself is not built here).
     audit_log.append(

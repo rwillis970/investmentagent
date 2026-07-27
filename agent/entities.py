@@ -1,6 +1,10 @@
-"""Runtime entities from §9.1 that Days 4–5 will populate.
+"""Runtime entities from §9.1 that Days 4–5 will populate, plus `ModeChange`
+(§7.2, §9.2, §11 Day 1) -- a Day-1 concept, not a Days-4-5 one, but placed
+here anyway because this is where every parity-tested entity lives, and
+`tests/test_entities_match_sql.py` needs one canonical place to import
+from.
 
-Defined here now so the SQL in migrations/001_init.sql and the Python side stay
+Defined here now so the SQL in migrations/*.sql and the Python side stay
 in step; `tests/test_entities_match_sql.py` asserts the field names agree, so a
 column added to one and not the other fails the build.
 """
@@ -8,6 +12,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+
+
+@dataclass(frozen=True)
+class ModeChange:
+    """One row of `policy.mode_state` (migrations/003_mode_state.sql) --
+    the durable record of a mode transition, append-only like everything
+    else this codebase persists. `seq` is assigned internally by
+    `agent.mode_store.ModeStore.write`, the same way `AuditEvent.seq` is
+    assigned internally by `AuditLog.append` -- never supplied by the
+    caller. See agent/mode_store.py for why this lives in its own,
+    separate store rather than agent.store.FactStore or agent.audit.
+    AuditLog."""
+    seq: int
+    mode: str
+    changed_at: datetime
+    reason: str | None = None
 
 
 @dataclass(frozen=True)

@@ -18,8 +18,9 @@ from .policy import CapabilityStatus, TradeCapabilityPolicy
 
 # The single source of truth for legal mode values is the transition chain in
 # agent.mode -- keeping a second, independent tuple here is exactly how the
-# two drift apart. §9.2 mode transition legality is a separate, opt-in check
-# (see check_mode_transition below); this tuple only proves membership.
+# two drift apart. §9.2 mode transition legality is agent.startup.
+# run_startup's job now, backed by the durable mode store; this tuple only
+# proves membership.
 MODES = mode_fsm.CHAIN
 PROFILES = ("CONSERVATIVE", "MODERATE", "AGGRESSIVE", "CUSTOM")
 POSTURES = ("CASH", "MARGIN_UNDER_25K", "MARGIN_OVER_25K", "UNKNOWN")
@@ -224,18 +225,21 @@ def _apply_profile_defaults(raw: dict) -> dict:
     return merged
 
 
-def load(raw: dict[str, Any], *, check_mode_transition: bool = False,
-         persisted_mode: str | None = None, confirmed: bool = False) -> Config:
+def load(raw: dict[str, Any]) -> Config:
     """Build a Config from a plain dict, rejecting anything unrecognised.
 
-    `check_mode_transition`, `persisted_mode` and `confirmed` are opt-in
-    (§9.2): a caller that doesn't pass them gets exactly the old membership
-    check, so every existing call site is unaffected. A real startup path
-    should pass `check_mode_transition=True` and the mode the system was
-    last persisted in -- see agent.mode.assert_legal_startup. There is no
-    persistence layer yet to source `persisted_mode` from automatically
-    (that lands with the run loop); until then this is the caller's
-    responsibility to supply.
+    Validates that `mode` is a KNOWN value (plain membership) and nothing
+    more. Transition LEGALITY -- whether reaching this mode is a legal §9.2
+    step from wherever the system last was -- is `agent.startup.
+    run_startup`'s job, backed by the durable `agent.mode_store.ModeStore`.
+    This function used to also offer an opt-in `check_mode_transition`/
+    `persisted_mode`/`confirmed` path that ran the same check itself,
+    reading persisted_mode from wherever ITS caller supplied it --
+    independently of, and with no connection to, the real mode store.
+    Removed: two independent readers of one durable value is exactly the
+    kind of divergence risk that leads to a stale-or-wrong persisted_mode
+    being trusted somewhere `run_startup` never touches. See agent/
+    startup.py's DECISION 7 for the full reasoning.
     """
     if not isinstance(raw, dict):
         raise ConfigError("config must be an object")
@@ -252,22 +256,15 @@ def load(raw: dict[str, Any], *, check_mode_transition: bool = False,
     # input first keeps the error about what the caller actually wrote.
     raw = _apply_profile_defaults(raw)
     cfg = Config(**raw)
-    validate(cfg, check_mode_transition=check_mode_transition,
-             persisted_mode=persisted_mode, confirmed=confirmed)
+    validate(cfg)
     return cfg
 
 
-def validate(cfg: Config, *, check_mode_transition: bool = False,
-            persisted_mode: str | None = None, confirmed: bool = False) -> None:
+def validate(cfg: Config) -> None:
     err: list[str] = []
 
     if cfg.mode not in MODES:
         err.append(f"mode must be one of {MODES}")
-    elif check_mode_transition:
-        try:
-            mode_fsm.assert_legal_startup(persisted_mode, cfg.mode, confirmed=confirmed)
-        except mode_fsm.ModeTransitionError as exc:
-            err.append(str(exc))
     if cfg.risk_profile not in PROFILES:
         err.append(f"risk_profile must be one of {PROFILES}")
     if cfg.assert_account_posture not in POSTURES:

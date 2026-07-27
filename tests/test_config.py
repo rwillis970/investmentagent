@@ -95,43 +95,37 @@ def test_shorting_and_margin_funding_must_stay_disabled():
                              "UNSETTLED_CASH": "DISABLED"}))
 
 
-def test_check_mode_transition_is_opt_in_and_off_by_default():
-    """Every existing call site in this file loads config.example.json's
-    mode: "PAPER" with no persisted history at all. That must keep working
-    exactly as before -- the §9.2 guard only engages when a caller asks for
-    it. (If it engaged by default, this would raise: PAPER is two steps from
-    the implicit DISABLED baseline via RESEARCH.)"""
-    cfg = C.load(base())
-    assert cfg.mode == "PAPER"
+# REMOVED: check_mode_transition / persisted_mode on C.load and C.validate.
+#
+# `load` used to accept an opt-in `check_mode_transition`/`persisted_mode`/
+# `confirmed` trio, calling `mode.assert_legal_startup` itself -- a second,
+# independent reader of "the mode the system was last in," with no
+# connection to the durable mode store `agent.startup.run_startup` now
+# reads (`agent.mode_store.ModeStore`). Two readers of one durable value is
+# a divergence risk: nothing stopped this one from being called with a
+# stale or simply wrong `persisted_mode`. `run_startup` is the only code
+# path real orders ever flow through, so it is now the sole enforcer of
+# §9.2 transition legality, backed by the real store. `load` still
+# validates that `cfg.mode` is a KNOWN mode (plain membership, see
+# `test_config.py`'s existing coverage of `ConfigError` for an unknown
+# value) -- transition legality moved out entirely; see
+# tests/test_startup.py for its replacement coverage
+# (test_illegal_mode_transition_halts_before_any_reconciliation,
+# test_confirmation_required_edge_also_halts, and the PAUSED/DISABLED
+# kill-switch tests there).
 
 
-def test_disabled_install_loading_production_active_fails_to_start():
-    """The literal scenario §9.2 and §12 criterion 3 name: a DISABLED-state
-    install loading mode: "PRODUCTION_ACTIVE" must fail to start, not warn
-    and not clamp."""
-    with pytest.raises(C.ConfigError, match="not reachable in one step"):
-        C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True,
-               persisted_mode="DISABLED")
-
-
-def test_no_persisted_mode_defaults_to_disabled_baseline_not_anything_goes():
-    with pytest.raises(C.ConfigError, match="not reachable in one step"):
-        C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True)
-
-
-def test_paper_to_production_active_needs_confirmation_through_load():
-    with pytest.raises(C.ConfigError, match="requires explicit confirmation"):
-        C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True,
-               persisted_mode="PAPER")
-    cfg = C.load(base(mode="PRODUCTION_ACTIVE"), check_mode_transition=True,
-                 persisted_mode="PAPER", confirmed=True)
+def test_mode_membership_is_still_checked_here_transition_legality_is_not():
+    """load only ever validated membership plus, opt-in, transition
+    legality; the latter is gone (see the REMOVED note above). This is the
+    one piece that stays here."""
+    with pytest.raises(C.ConfigError, match="mode must be one of"):
+        C.load(base(mode="NOT_A_REAL_MODE"))
+    # PRODUCTION_ACTIVE is a known mode, so load accepts it on its own --
+    # whether reaching it from wherever the system last was is LEGAL is
+    # agent.startup.run_startup's question now, not load's.
+    cfg = C.load(base(mode="PRODUCTION_ACTIVE"))
     assert cfg.mode == "PRODUCTION_ACTIVE"
-
-
-def test_kill_switch_targets_load_from_anywhere_even_with_the_guard_on():
-    for persisted in C.MODES:
-        C.load(base(mode="DISABLED"), check_mode_transition=True, persisted_mode=persisted)
-        C.load(base(mode="PAUSED"), check_mode_transition=True, persisted_mode=persisted)
 
 
 def test_example_config_carries_materiality_defaults():

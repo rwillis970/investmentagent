@@ -30,6 +30,7 @@ CASES = [
     (E.RunManifest, "agent.run_manifest"),
     (E.CapabilityChangeRequest, "policy.capability_change_request"),
     (E.PlaybookCandidate, "agent.playbook_candidate"),
+    (E.ModeChange, "policy.mode_state"),
 ]
 
 

@@ -87,14 +87,17 @@ def is_legal_step(persisted: str, target: str) -> bool:
 # KNOWN GAP -- RUNTIME MODE TRANSITIONS (checked while investigating a
 # calendar-coverage hole in agent/startup.py's delivery). `is_legal_step`
 # above is the general step-legality check; `assert_legal_startup` below is
-# the only thing in this codebase that calls it, and it only runs at
-# process startup (agent.startup.run_startup) or config load
-# (agent.config.load's check_mode_transition option). There is no runtime
-# transition path anywhere in this codebase today -- nothing lets an
-# already-running process move from, say, PAUSED to PRODUCTION_ACTIVE
-# without a full restart through run_startup. Confirmed by inspection: this
-# module and agent/config.py are the only two callers of any mode-fsm
-# function that exist.
+# the only thing in this codebase that calls it, and `agent.startup.
+# run_startup` is the only caller of THAT -- it only runs at process
+# startup. (`agent.config.load` used to also call it, via an opt-in
+# `check_mode_transition` option; that was removed once `run_startup`
+# gained a durable mode store to check against, since two independent
+# readers of the same durable value is a divergence risk -- see agent/
+# startup.py's DECISION 7.) There is no runtime transition path anywhere in
+# this codebase today -- nothing lets an already-running process move
+# from, say, PAUSED to PRODUCTION_ACTIVE without a full restart through
+# run_startup. Confirmed by inspection: `agent.startup` is the only caller
+# of any mode-fsm function that exists.
 #
 # This matters for calendar coverage: `market_calendar.
 # assert_calendar_coverage_at_startup` only runs as part of run_startup, so
