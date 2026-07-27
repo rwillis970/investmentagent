@@ -1,17 +1,26 @@
 """Startup sequence (§8.1): reconcile -> verify audit hash chain -> expire
 stale approvals -> resume.
 
-This wires four pieces that already existed for exactly this purpose --
+This wires pieces that already existed for exactly this purpose --
 `mode.assert_legal_startup`, `market_calendar.assert_calendar_coverage_at_
-startup`, `AuditLog.verify`, and per-account `DayTradeGuard.reconcile` --
-and adds two that didn't (`ApprovalService.sweep_expired`, in agent/
-approval.py, and `mode_store.ModeStore`, the durable mode persistence this
-unit adds). Nothing here reimplements any of the four wired-in pieces.
+startup`, `AuditLog.verify`, per-account `DayTradeGuard.reconcile`, and
+(as of this unit) `agent.reconciliation`'s `reconcile_positions`/
+`reconcile_settled_cash`/`reconcile_open_orders` -- and adds two that
+didn't exist before this module (`ApprovalService.sweep_expired`, in agent/
+approval.py, and `mode_store.ModeStore`, the durable mode persistence
+built in an earlier unit). Nothing here reimplements any of the wired-in
+pieces.
 
-`DayTradeGuard.reconcile` only reconciles day-trade counts. §8.1 step 1 and
-Day 3's exit criterion also name positions, settled cash and open orders;
-those are not covered here -- see `DayTradeReconciliation`'s docstring for
-what each would need.
+ALL FOUR OF DAY 3'S EXIT-CRITERION ITEMS NOW RECONCILE: positions, settled
+cash, open orders and day-trade count. This used to be three gaps and one
+covered item -- `DayTradeGuard.reconcile` covered day-trade count only,
+and `AccountReconciliation`'s own docstring (when it was still named
+`DayTradeReconciliation`, narrower in both name and scope) named the other
+three and what each would need. That gap is closed: see
+`agent/reconciliation.py` for the three new comparisons, each local-vs-
+broker, analogous to `DayTradeGuard.reconcile`. A mismatch on any of the
+four is a halt, not a warning -- consistent with the day-trade guard's
+pre-existing behaviour.
 
 DECISION 1 -- SEQUENCE ORDER. §8.1's literal order (reconcile, then verify
 the chain) is followed exactly, unchanged: the day-trade reconciliation
@@ -69,15 +78,23 @@ neither write happens -- there is no transition to make or claim, only the
 halt itself. Every halt, regardless, still appends a `startup_halted` row
 recording why.
 
-The one exception is `AuditChainBroken`: when `verify()` itself reports the
-chain broken, nothing further is written anywhere -- not to `mode_store`,
-not to the audit log. At that point the log's own trustworthiness is the
-thing that failed, and taking any further action on the strength of a
-startup attempt whose own audit trail is already known-corrupted --
-including changing the real persisted mode -- means acting on unverified
-ground instead of preserving everything exactly as found for a human to
-inspect. Every other failure mode is caught before or independently of the
-chain-integrity question, so acting on those is safe.
+`AuditChainBroken` is handled differently, but is not exempt from forcing
+PAUSED -- only from claiming it in the log. When `verify()` itself reports
+the chain broken, nothing further is EVER written to the log: it's the
+thing whose trustworthiness just failed, and appending to it -- even a
+halt note -- means building on a chain already known to contain an
+inconsistency instead of preserving it exactly as found for a human to
+inspect. `mode_store` is a different file, with no dependency on the log's
+integrity, so writing to it doesn't touch what's being preserved -- and
+leaving it alone would be actively unsafe: an untouched `persisted_mode`
+of PRODUCTION_ACTIVE means the very next startup attempt, if it targets
+the same mode, is a trivially legal one-step transition needing no
+confirmation, so a detected chain corruption would otherwise be
+completely silent to whatever reads mode next. `mode_store` is therefore
+forced to PAUSED here too (if not already), independently of the log.
+Every other failure mode is caught before or independently of the
+chain-integrity question, so writing the usual `startup_halted` note for
+those is safe.
 
 DECISION 3 -- WHERE persisted_mode COMES FROM. RESOLVED by this unit: it
 comes from `mode_store.current()`. `run_startup` no longer takes
@@ -130,6 +147,21 @@ happened -- and reduces the remaining risk to the recoverable one (a
 lagging or missing audit row), which `_reconcile_mode_persistence` below
 closes on the very next startup, before any of the other four decisions'
 checks run.
+
+A third scenario, not a crash but a detected corruption: `AuditChainBroken`
+also writes to `mode_store` (forcing PAUSED, unless already there) while
+writing NOTHING to the audit log -- see DECISION 2's ending. This is safe
+under the same asymmetry: mode_store's PAUSED write is never paired with a
+claim in the (untouched) log, so there is nothing to be wrong about. The
+NEXT startup will then see `mode_store.current()=="PAUSED"` disagree with
+the log's last (still-present, unaffected) claim from before the
+corruption, and `_reconcile_mode_persistence` will append a catch-up row
+-- onto a chain that is, at that point, still broken. That catch-up row
+does not hide the corruption: `AuditLog.verify()` walks the whole chain
+from genesis and will still hit the original break before it ever reaches
+anything appended afterward, so the next startup still correctly raises
+`AuditChainBroken` again. This is the same reasoning DECISION 1 already
+relies on for the day-trade reconcile rows written before `verify()` runs.
 
 This does not achieve full ACID: a crash during the reconciliation catch-up
 write itself is a residual, unhandled double-fault, the same class of risk
@@ -205,8 +237,11 @@ from . import mode as mode_fsm
 from .accounts import CrossAccountError
 from .approval import ApprovalService
 from .audit import AuditLog
+from .broker.base import AccountSnapshot, BrokerOrder, Position
 from .daytrade import DayTradeGuard, PostureMismatch
 from .mode_store import ModeStore
+from .reconciliation import (ReconciliationMismatch, reconcile_open_orders,
+                            reconcile_positions, reconcile_settled_cash)
 
 
 class StartupHalted(Exception):
@@ -220,8 +255,11 @@ class StartupHalted(Exception):
 class AuditChainBroken(StartupHalted):
     """`AuditLog.verify()` returned False. Raised instead of letting a
     caller that ignores a bool return value silently proceed. Nothing is
-    written to the log -- or to mode_store -- after this is detected. See
-    DECISION 2 and DECISION 5."""
+    ever written to the log after this is detected. `mode_store` IS forced
+    to PAUSED (if not already) -- it is a separate file, unaffected by
+    whatever corrupted the log, and leaving it alone would let a same-mode
+    restart resume trading with no acknowledgement the audit trail broke.
+    See DECISION 2 and DECISION 5."""
 
 
 class AccountsNotExpectedForMode(StartupHalted):
@@ -239,43 +277,69 @@ class AccountsNotExpectedForMode(StartupHalted):
 
 
 @dataclass(frozen=True)
-class DayTradeReconciliation:
-    """One account's worth of input to the day-trade reconciliation step.
-    `day_trade_guard` is the account's own local counter; `broker_reported_
-    day_trades` is whatever the broker adapter's account snapshot reports
-    for the same window -- see `BrokerAdapter`/`SimulatorBroker.
-    account_data().day_trade_count` for where that number comes from in
-    practice.
+class AccountReconciliation:
+    """One account's worth of input to §8.1 step 1 / Day 3's exit criterion:
+    "Positions, settled cash, open orders and day-trade count reconcile."
+    All four are covered by this type now.
 
-    Named for exactly what it covers, no more. §8.1 step 1 and Day 3's exit
-    criterion ("Positions, settled cash, open orders and day-trade count
-    reconcile") name FOUR things to reconcile per account; this type and
-    the step built around it are day-trade count ONLY. The other three are
-    not built here and not claimed:
+    Previously named `DayTradeReconciliation`, when an earlier unit
+    narrowed both the name and the scope to match: at that point this type
+    covered day-trade count only, and said so plainly in its own docstring
+    (positions, settled cash and open orders were named as gaps, not
+    built). That gap is closed this unit -- see `agent/reconciliation.py`
+    for the three new local-vs-broker comparisons. The name reverts to
+    `AccountReconciliation`, which is what it was called before that
+    earlier narrowing: the scope is no longer narrow, so neither is the
+    name.
 
-      - positions: `BrokerAdapter.positions()` exists (Day 3's read-only
-        adapter interface) but nothing compares it against a local ledger.
-      - settled cash: `PortfolioState.settled_cash` is consumed elsewhere
-        (risk_constrain, the reserve gate) as an input, not reconciled
-        against the broker's own reported cash anywhere.
-      - open orders: `BrokerAdapter.open_orders()` exists as a read
-        interface; nothing compares it against locally staged/submitted
-        orders.
+    day_trade_guard / broker_reported_day_trades: unchanged. `day_trade_
+    guard` is the account's own local counter; `broker_reported_day_trades`
+    is whatever the broker adapter's account snapshot reports for the same
+    window -- see `BrokerAdapter`/`SimulatorBroker.account().
+    day_trade_count`.
 
-    All three would need their own local-vs-broker comparison, analogous to
-    `DayTradeGuard.reconcile`, before `run_startup` could honestly reconcile
-    the account rather than just its day-trade count. Not built here."""
+    local_positions / broker_positions: `local_positions` is a plain
+    symbol -> qty mapping of what this account is locally believed to
+    hold -- there is no local position ledger built yet, so this is
+    supplied directly by the caller, the same way `broker_reported_
+    day_trades` always has been. `broker_positions` is the broker's own
+    answer, straight from `BrokerAdapter.positions()` -- kept as real
+    `Position` objects (not pre-flattened) so `agent.reconciliation.
+    reconcile_positions` can check each one's own `account_id`, not just
+    compare quantities.
+
+    local_settled_cash / broker_account: `broker_account` is the broker's
+    own `AccountSnapshot`, straight from `BrokerAdapter.account()` -- kept
+    whole for the same account_id-checking reason as positions. See
+    `agent/reconciliation.py` for why settled-cash reconciliation is exact
+    equality, not a tolerance.
+
+    local_open_order_ids / broker_open_orders: `local_open_order_ids` is
+    the set of client_order_ids this account locally believes are still
+    open; `broker_open_orders` is `BrokerAdapter.open_orders()`'s own
+    answer, kept whole for the same account_id-checking reason."""
     account_id: str
     day_trade_guard: DayTradeGuard
     broker_reported_day_trades: int
+    local_positions: dict[str, float]
+    broker_positions: tuple[Position, ...]
+    local_settled_cash: float
+    broker_account: AccountSnapshot
+    local_open_order_ids: frozenset[str]
+    broker_open_orders: tuple[BrokerOrder, ...]
 
 
 @dataclass(frozen=True)
 class StartupResult:
-    """"Ready to resume" -- see DECISION 4. Nothing consumes this yet."""
+    """"Ready to resume" -- see DECISION 4. Nothing consumes this yet.
+
+    `reconciled_accounts` -- renamed from `day_trade_reconciled_accounts`:
+    an account listed here had ALL FOUR of positions, settled cash, open
+    orders and day-trade count reconciled clean, not just day-trade count
+    (see `AccountReconciliation`)."""
     mode: str
     warnings: tuple[str, ...]
-    day_trade_reconciled_accounts: tuple[str, ...]
+    reconciled_accounts: tuple[str, ...]
     swept_approvals: tuple[str, ...]
     audit_chain_length: int
 
@@ -336,7 +400,7 @@ def _halt(mode_store: ModeStore, audit_log: AuditLog, *, persisted_mode: str | N
 
 
 def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLog,
-                mode_store: ModeStore, accounts: list[DayTradeReconciliation],
+                mode_store: ModeStore, accounts: list[AccountReconciliation],
                 approval_service: ApprovalService, now: datetime,
                 correlation_id: str | None = None) -> StartupResult:
     """Run the §8.1 sequence once. Raises on any failure (see the module
@@ -388,14 +452,14 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
              now=now, correlation_id=correlation_id)
         raise
 
-    # -- §8.1 step 1: reconcile day-trade counts, per account. This is ONLY
-    #    day-trade count -- see DayTradeReconciliation's docstring for the
-    #    three other things Day 3's exit criterion names (positions,
-    #    settled cash, open orders) that are not covered here. Per
-    #    accounts.py there is no path that combines accounts, so this is a
-    #    plain loop, and a mismatch is a halt, not a skip: the loop stops at
-    #    the first bad account rather than reconciling the rest and
-    #    reporting a partial result.
+    # -- §8.1 step 1: reconcile, per account, all four of Day 3's exit-
+    #    criterion items -- positions, settled cash, open orders and
+    #    day-trade count (see AccountReconciliation's docstring and
+    #    agent/reconciliation.py for the three non-day-trade comparisons).
+    #    Per accounts.py there is no path that combines accounts, so this is
+    #    a plain loop, and a mismatch on ANY of the four is a halt, not a
+    #    skip: the loop stops at the first bad account rather than
+    #    reconciling the rest and reporting a partial result.
     reconciled: list[str] = []
     for acct in accounts:
         try:
@@ -404,30 +468,65 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
                 broker_reported=acct.broker_reported_day_trades,
                 as_of=today,
             )
-        except (CrossAccountError, PostureMismatch,
+            reconcile_positions(
+                account_id=acct.account_id, local_positions=acct.local_positions,
+                broker_positions=list(acct.broker_positions),
+            )
+            reconcile_settled_cash(
+                account_id=acct.account_id, local_settled_cash=acct.local_settled_cash,
+                broker_account=acct.broker_account,
+            )
+            reconcile_open_orders(
+                account_id=acct.account_id, local_open_order_ids=acct.local_open_order_ids,
+                broker_open_orders=list(acct.broker_open_orders),
+            )
+        except (CrossAccountError, PostureMismatch, ReconciliationMismatch,
                market_calendar.CalendarCoverageError) as exc:
             _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=str(exc),
                  now=now, correlation_id=correlation_id)
             raise
         audit_log.append(
-            actor="system", action="reconcile_day_trades", object_type="account",
+            actor="system", action="reconcile_account", object_type="account",
             object_id=acct.account_id,
             after={"broker_reported_day_trades": acct.broker_reported_day_trades,
-                  "as_of": today.isoformat()},
+                  "as_of": today.isoformat(),
+                  "positions": acct.local_positions,
+                  "settled_cash": acct.local_settled_cash,
+                  "open_order_ids": sorted(acct.local_open_order_ids)},
             correlation_id=correlation_id, timestamp=now,
         )
         reconciled.append(acct.account_id)
 
     # -- §8.1 step 2: verify the hash chain. A bool return value is exactly
     #    what a caller can accidentally ignore -- convert it into a raise
-    #    here, once, so nothing downstream can do that. Nothing more is
-    #    written to the log -- or to mode_store -- past this point if it
-    #    fails (DECISION 2, DECISION 5).
+    #    here, once, so nothing downstream can do that.
+    #
+    #    The log gets NOTHING further -- it's the thing whose
+    #    trustworthiness just failed, and preserving it exactly as found
+    #    for investigation means never appending to it again, not even a
+    #    halt note (DECISION 2). mode_store is different: it is a
+    #    genuinely separate file, untouched by whatever corrupted the log,
+    #    so writing to it doesn't compromise anything being preserved. And
+    #    leaving it alone here would be actively unsafe -- if
+    #    persisted_mode was PRODUCTION_ACTIVE, a same-mode restart
+    #    immediately after a detected chain corruption is a trivially
+    #    "legal" one-step transition needing no confirmation, so nothing
+    #    would stop the very next attempt from resuming live trading with
+    #    no acknowledgement that the audit trail broke. Forcing PAUSED here
+    #    closes that gap the same way _halt already does for every other
+    #    failure mode (DECISION 2) -- this is that same principle applied
+    #    to the one store that's still safe to write to.
     if not audit_log.verify():
+        if persisted_mode != "PAUSED":
+            mode_store.write(
+                "PAUSED", changed_at=now,
+                reason="audit hash chain failed verification at startup (§8.1)",
+            )
         raise AuditChainBroken(
             "audit hash chain failed verification at startup (§8.1); "
-            "refusing to resume, and refusing to write anything further to "
-            "this log or to mode_store. Preserve both as-is for investigation."
+            "forced mode_store to PAUSED (a separate file, unaffected by "
+            "this corruption) but refusing to write anything to the audit "
+            "log itself. Preserve it exactly as-is for investigation."
         )
 
     # -- §8.1 step 3: expire stale approvals. A state change, so it is
@@ -476,7 +575,7 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
 
     return StartupResult(
         mode=target_mode, warnings=warnings,
-        day_trade_reconciled_accounts=tuple(reconciled),
+        reconciled_accounts=tuple(reconciled),
         swept_approvals=tuple(t.token_id for t in swept),
         audit_chain_length=len(audit_log),
     )

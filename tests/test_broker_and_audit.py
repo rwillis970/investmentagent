@@ -152,6 +152,20 @@ def test_sessions_skip_weekends():
     assert len(s) == 5 and all(d.weekday() < 5 for d in s)
 
 
+def test_sessions_are_holiday_aware_not_just_weekday_aware():
+    """Redirected to market_calendar.trailing_sessions (§4.4) -- the old
+    implementation was weekday-only and would have wrongly included
+    Thanksgiving (a Thursday) in the window. Same fixture as
+    test_market_calendar.py's test_trailing_sessions_skips_a_holiday_in_the_
+    window: the five sessions trailing the day after Thanksgiving 2026 must
+    skip Thanksgiving Thursday itself."""
+    from agent import market_calendar as mc
+    b, _ = broker()
+    s = b.sessions(date(2026, 11, 27), 5)
+    assert date(2026, 11, 26) not in s   # Thanksgiving itself
+    assert s == mc.trailing_sessions(date(2026, 11, 27), 5)
+
+
 # --------------------------------------------------- gate 4 (adapter guard)
 
 @pytest.mark.parametrize("asset_class,symbol", [

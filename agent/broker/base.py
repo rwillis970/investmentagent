@@ -271,7 +271,12 @@ class BrokerAdapter(ABC):
 
     @abstractmethod
     def sessions(self, through: date, count: int = 5) -> list[date]:
-        """Trailing trading sessions, for the day-trade window (§4.4)."""
+        """Trailing trading sessions, for the day-trade window (§4.4).
+        Implementations should delegate to `market_calendar.
+        trailing_sessions` rather than re-deriving this (weekday-only,
+        say) -- see `SimulatorBroker.sessions` for the reference
+        implementation. There is meant to be exactly one holiday-aware
+        trailing-sessions implementation in this codebase."""
 
     # -- write --------------------------------------------------------------
     def submit(self, staged: StagedOrder, *,

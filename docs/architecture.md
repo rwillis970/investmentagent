@@ -542,6 +542,17 @@ requirement. These fields live in a separate schema with a separate write path; 
 optimiser's database role has no grant on them. The Day-12 test suite attempts each of
 these writes and asserts failure.
 
+**Status: no enforcement exists yet, for any of these fields.** There is no optimiser to
+grant or deny a database role to, no database roles or grants have been created, and no test
+attempts a forbidden write. Mode state today lives in its separate file (§9.2's
+`ModeStore`, built ahead of schedule) purely by virtue of being a different Python object
+with no shared code path to the store an optimiser would use — not because anything has
+denied it access. The same is true of the other six fields: the separation described above
+is the target this boundary is being built toward, not a control operating today. Day 11
+builds the candidate-generation machinery this boundary exists to constrain; Day 12 is where
+the forbidden-write test suite referenced above is actually built and where this paragraph
+should be deleted once it stops being true.
+
 ### 7.3 Post-launch validation track
 
 v1.0's phase gates are not discarded; they run in parallel after launch, on a slower clock,
@@ -760,6 +771,16 @@ only the way back out of it into PRODUCTION_ACTIVE does. Loading a config that n
 one step ahead of the persisted current mode is a startup error, not a silent adoption —
 otherwise "DISABLED to PRODUCTION_ACTIVE in one step is impossible" (§12 criterion 3, and
 the Day-1 exit criterion in §11) is enforced by nothing.
+
+This check is enforced in exactly one place: `agent.startup.run_startup`, reading the
+persisted mode from `agent.mode_store.ModeStore` — the durable, append-only, separate-file
+store described in §7.2's immutable boundary. `agent.config.load` validates only that a
+mode name is a known mode; it does not read `ModeStore` and does not check transition
+legality, deliberately — a config loader independently re-deriving "the mode the system was
+last in" would be a second reader of one durable value, free to be called with a stale or
+simply wrong persisted mode. `run_startup` is the sole code path real orders ever flow
+through (§1's one-code-path invariant), so it is the sole enforcer of this rule, backed by
+the one store that actually persists it.
 
 ---
 

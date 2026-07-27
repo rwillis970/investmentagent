@@ -28,6 +28,7 @@ and `assert_legal_startup`'s contract for it is unchanged.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -56,10 +57,32 @@ class ModeStore:
             raise ModeStoreError("changed_at must be a timezone-aware datetime")
         change = ModeChange(seq=len(self._history) + 1, mode=mode,
                             changed_at=changed_at, reason=reason)
-        self._history.append(change)
+        # Persist BEFORE mutating self._history -- the same bug class as
+        # _halt once claiming a transition that never happened (agent/
+        # startup.py DECISION 2/5). If the disk write raises, this
+        # function must raise too, with self._history untouched -- never
+        # current()/history() claiming a change that isn't actually on
+        # disk. fsync, not just flush, for this file specifically: a
+        # buffered write that survives only in the OS page cache is
+        # exactly the durability gap that would defeat DECISION 5's
+        # write-ahead ordering on an unclean shutdown (a kill -9 or power
+        # loss, not just this process crashing) -- the whole safety
+        # argument there assumes `write()` returning means the mode is
+        # actually on disk, not merely handed to the OS. FactStore's own
+        # JSONL persistence (agent/store.py) does NOT fsync: it is
+        # evidence for research/backtesting, where losing the last few
+        # unflushed rows on an unclean shutdown is a completeness gap, not
+        # a safety one. ModeStore's job is specifically to make sure a
+        # crash can never be mistaken for permission to keep trading, so
+        # it gets the stronger, slower guarantee; FactStore does not need
+        # it and paying the fsync cost on every fact append would not be
+        # justified by anything FactStore is actually for.
         if self._path:
             with self._path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(_encode(change)) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        self._history.append(change)
         return change
 
     def current(self) -> str | None:

@@ -108,3 +108,34 @@ def test_in_memory_store_with_no_path_does_not_touch_disk(tmp_path):
     store = ModeStore()
     store.write("PAPER", changed_at=T0)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_disk_write_leaves_memory_unchanged(tmp_path):
+    """write() must persist before it mutates self._history -- the same
+    bug class as _halt once claiming a transition that never happened
+    (agent/startup.py DECISION 2/5). A disk write that fails must never
+    leave current()/history() claiming a change that isn't actually on
+    disk. The parent directory doesn't exist, so opening the file for
+    append raises OSError before any in-memory state could change."""
+    bad_path = tmp_path / "does-not-exist" / "mode_state.jsonl"
+    store = ModeStore(path=bad_path)
+    with pytest.raises(OSError):
+        store.write("PAPER", changed_at=T0)
+    assert store.current() is None
+    assert store.history() == ()
+
+
+def test_seq_is_not_advanced_by_a_failed_write(tmp_path):
+    """A failed write must not consume a seq number -- the next successful
+    write (once the underlying problem is fixed) should still be seq=1,
+    not seq=2, since nothing was actually persisted for seq=1."""
+    bad_path = tmp_path / "does-not-exist" / "mode_state.jsonl"
+    store = ModeStore(path=bad_path)
+    with pytest.raises(OSError):
+        store.write("PAPER", changed_at=T0)
+
+    # Point the same store at a real path and retry -- simulating an
+    # operator fixing the underlying disk problem without restarting.
+    store._path = tmp_path / "mode_state.jsonl"
+    c = store.write("PAPER", changed_at=T0)
+    assert c.seq == 1

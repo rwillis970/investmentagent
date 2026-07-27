@@ -38,10 +38,12 @@ from agent import mode as mode_fsm
 from agent.accounts import CrossAccountError
 from agent.approval import ApprovalService, order_fingerprint
 from agent.audit import AuditLog
+from agent.broker.base import AccountSnapshot, BrokerOrder, Position
 from agent.daytrade import DayTradeGuard, PostureMismatch
 from agent.mode_store import ModeStore
-from agent.startup import (AccountsNotExpectedForMode, AuditChainBroken,
-                           DayTradeReconciliation, StartupResult, run_startup)
+from agent.reconciliation import ReconciliationMismatch
+from agent.startup import (AccountReconciliation, AccountsNotExpectedForMode,
+                           AuditChainBroken, StartupResult, run_startup)
 
 NOW = datetime(2026, 7, 20, 13, 0, tzinfo=timezone.utc)   # ET date 2026-07-20, a real trading day
 ORDER = dict(symbol="SPY", side="BUY", qty=0.02, order_type="LIMIT",
@@ -55,12 +57,37 @@ def approval_service(**over):
     return ApprovalService(**kw)
 
 
-def account(account_id="acct-a", broker_reported=0, round_trips=()):
+def account(account_id="acct-a", broker_reported=0, round_trips=(),
+           local_positions=None, broker_positions=(),
+           settled_cash=0.0, broker_settled_cash=None,
+           local_open_order_ids=frozenset(), broker_open_orders=(),
+           broker_account_id=None):
+    """Defaults to a fully-agreeing AccountReconciliation (no positions, no
+    open orders, matching settled cash) so tests that only care about
+    day-trade reconciliation -- most of this file -- don't need to know
+    about the other three dimensions Unit 3 added. broker_settled_cash and
+    broker_account_id default to matching settled_cash/account_id exactly,
+    for the same reason; pass them explicitly to construct a deliberate
+    mismatch."""
     guard = DayTradeGuard(account_id=account_id, max_per_5_sessions=3)
     for session, symbol in round_trips:
         guard.record(session, symbol)
-    return DayTradeReconciliation(account_id=account_id, day_trade_guard=guard,
-                                  broker_reported_day_trades=broker_reported)
+    broker_cash = settled_cash if broker_settled_cash is None else broker_settled_cash
+    snap_account_id = account_id if broker_account_id is None else broker_account_id
+    return AccountReconciliation(
+        account_id=account_id, day_trade_guard=guard,
+        broker_reported_day_trades=broker_reported,
+        local_positions=local_positions or {}, broker_positions=tuple(broker_positions),
+        local_settled_cash=settled_cash,
+        broker_account=AccountSnapshot(
+            account_id=snap_account_id, equity=broker_cash, cash=broker_cash,
+            settled_cash=broker_cash, unsettled_cash=0.0, buying_power=broker_cash,
+            multiplier=1.0, pattern_day_trader=False, day_trade_count=broker_reported,
+            fetched_at=NOW,
+        ),
+        local_open_order_ids=frozenset(local_open_order_ids),
+        broker_open_orders=tuple(broker_open_orders),
+    )
 
 
 def mode_store(initial=None, *, at=None):
@@ -121,7 +148,7 @@ def test_happy_path_reconciles_verifies_sweeps_and_returns_ready_to_resume():
     assert isinstance(result, StartupResult)
     assert result.mode == "PAPER"
     assert result.warnings == ()
-    assert set(result.day_trade_reconciled_accounts) == {"acct-a", "acct-b"}
+    assert set(result.reconciled_accounts) == {"acct-a", "acct-b"}
     assert result.swept_approvals == ("stale",)
 
     assert stale_tok.swept_at == NOW
@@ -131,14 +158,14 @@ def test_happy_path_reconciles_verifies_sweeps_and_returns_ready_to_resume():
     assert len(ms.history()) == 1           # the seed write only; no redundant write
 
     actions = [ev.action for ev in log.events]
-    assert actions == ["mode_persisted_reconciled", "reconcile_day_trades",
-                       "reconcile_day_trades", "approval_expired", "startup_complete"]
+    assert actions == ["mode_persisted_reconciled", "reconcile_account",
+                       "reconcile_account", "approval_expired", "startup_complete"]
 
 
 def test_zero_accounts_is_allowed_and_produces_no_reconcile_events():
     log = AuditLog()
     result = run_startup(**base_kwargs(audit_log=log, accounts=[]))
-    assert result.day_trade_reconciled_accounts == ()
+    assert result.reconciled_accounts == ()
     assert [ev.action for ev in log.events] == ["mode_persisted_reconciled", "startup_complete"]
 
 
@@ -310,7 +337,7 @@ def test_production_active_and_paper_are_unaffected_by_the_accounts_check():
     result = run_startup(target_mode="PRODUCTION_ACTIVE", confirmed=False, audit_log=log,
                          mode_store=ms, accounts=[account("acct-a")],
                          approval_service=approval_service(), now=NOW)
-    assert result.day_trade_reconciled_accounts == ("acct-a",)
+    assert result.reconciled_accounts == ("acct-a",)
 
 
 # ------------------------------------------------------------ approval sweep
@@ -419,10 +446,8 @@ def test_calendar_warning_reaches_the_operator_without_halting():
 def test_cross_account_mismatch_halts_and_does_not_reconcile_remaining_accounts():
     ms, log = agreeing_store_and_log("PAPER")
     good = account("acct-a", broker_reported=0)
-    guard_b = DayTradeGuard(account_id="acct-b", max_per_5_sessions=3)
-    guard_b.record(date(2026, 7, 16), "SPY")
-    mismatched = DayTradeReconciliation(account_id="acct-b", day_trade_guard=guard_b,
-                                        broker_reported_day_trades=99)  # broker disagrees
+    mismatched = account("acct-b", broker_reported=99,   # broker disagrees
+                         round_trips=[(date(2026, 7, 16), "SPY")])
     never_reached = account("acct-c", broker_reported=0)
 
     with pytest.raises(PostureMismatch):
@@ -434,17 +459,92 @@ def test_cross_account_mismatch_halts_and_does_not_reconcile_remaining_accounts(
     # seed mode_transition, acct-a reconciled, acct-c never reached; PAPER
     # -> PAUSED is a real transition, so a mode_transition row precedes the
     # halt note.
-    assert actions == ["mode_transition", "reconcile_day_trades",
+    assert actions == ["mode_transition", "reconcile_account",
                        "mode_transition", "startup_halted"]
     ev = log.events[-1]
     assert "day trades" in ev.after["reason"]
 
 
+def test_position_mismatch_halts_startup():
+    """Unit 3: positions are now one of the four things §8.1 step 1
+    reconciles -- a halt, not a warning, same as day trades."""
+    ms, log = agreeing_store_and_log("PAPER")
+    mismatched = account("acct-a", broker_positions=[
+        Position(account_id="acct-a", symbol="SPY", qty=5.0, avg_price=500.0,
+                market_value=2500.0)])   # local_positions defaults to {} -- disagrees
+
+    with pytest.raises(ReconciliationMismatch):
+        run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
+                   accounts=[mismatched], approval_service=approval_service(), now=NOW)
+    ev = log.events[-1]
+    assert ev.action == "startup_halted"
+    assert "positions" in ev.after["reason"]
+
+
+def test_settled_cash_mismatch_halts_startup():
+    ms, log = agreeing_store_and_log("PAPER")
+    mismatched = account("acct-a", settled_cash=500.0, broker_settled_cash=475.0)
+
+    with pytest.raises(ReconciliationMismatch):
+        run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
+                   accounts=[mismatched], approval_service=approval_service(), now=NOW)
+    ev = log.events[-1]
+    assert ev.action == "startup_halted"
+    assert "settled cash" in ev.after["reason"]
+
+
+def test_open_orders_mismatch_halts_startup():
+    ms, log = agreeing_store_and_log("PAPER")
+    mismatched = account("acct-a", broker_open_orders=[
+        BrokerOrder(account_id="acct-a", client_order_id="c1", broker_order_id="b1",
+                   symbol="SPY", side="BUY", qty=1.0, order_type="LIMIT",
+                   time_in_force="DAY", limit_price=500.0, status="new",
+                   filled_qty=0.0, avg_fill_price=None)])   # local believes none open
+
+    with pytest.raises(ReconciliationMismatch):
+        run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
+                   accounts=[mismatched], approval_service=approval_service(), now=NOW)
+    ev = log.events[-1]
+    assert ev.action == "startup_halted"
+    assert "open order" in ev.after["reason"]
+
+
+def test_reconcile_account_audit_row_records_all_four_dimensions():
+    """The widened audit action (renamed from reconcile_day_trades) should
+    carry enough to show what was actually reconciled, not just day trades."""
+    ms, log = agreeing_store_and_log("PAPER")
+    acct = account("acct-a", broker_reported=0, settled_cash=500.0,
+                  local_positions={"SPY": 2.0},
+                  broker_positions=[Position(account_id="acct-a", symbol="SPY", qty=2.0,
+                                             avg_price=100.0, market_value=200.0)],
+                  local_open_order_ids={"c1"},
+                  broker_open_orders=[BrokerOrder(account_id="acct-a", client_order_id="c1",
+                                                  broker_order_id="b1", symbol="SPY", side="BUY",
+                                                  qty=1.0, order_type="LIMIT", time_in_force="DAY",
+                                                  limit_price=500.0, status="new", filled_qty=0.0,
+                                                  avg_fill_price=None)])
+
+    run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
+               accounts=[acct], approval_service=approval_service(), now=NOW)
+
+    ev = next(e for e in log.events if e.action == "reconcile_account")
+    assert ev.after["positions"] == {"SPY": 2.0}
+    assert ev.after["settled_cash"] == 500.0
+    assert ev.after["open_order_ids"] == ["c1"]
+
+
 def test_cross_account_error_from_a_misassigned_guard_halts():
     ms, log = agreeing_store_and_log("PAPER")
     guard = DayTradeGuard(account_id="acct-a", max_per_5_sessions=3)
-    wrong = DayTradeReconciliation(account_id="acct-wrong", day_trade_guard=guard,
-                                   broker_reported_day_trades=0)
+    wrong = AccountReconciliation(
+        account_id="acct-wrong", day_trade_guard=guard, broker_reported_day_trades=0,
+        local_positions={}, broker_positions=(), local_settled_cash=0.0,
+        broker_account=AccountSnapshot(
+            account_id="acct-wrong", equity=0.0, cash=0.0, settled_cash=0.0,
+            unsettled_cash=0.0, buying_power=0.0, multiplier=1.0,
+            pattern_day_trader=False, day_trade_count=0, fetched_at=NOW),
+        local_open_order_ids=frozenset(), broker_open_orders=(),
+    )
     with pytest.raises(CrossAccountError):
         run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
                    accounts=[wrong], approval_service=approval_service(), now=NOW)
@@ -453,25 +553,92 @@ def test_cross_account_error_from_a_misassigned_guard_halts():
     assert "refusing to net or reconcile across accounts" in ev.after["reason"]
 
 
-def test_broken_hash_chain_halts_and_nothing_further_is_written():
+def test_broken_hash_chain_forces_paused_in_the_store_but_writes_nothing_to_the_log():
+    """DECISION 2/5's broken-chain exception, refined: the audit log is
+    left completely untouched (it's the thing whose trustworthiness just
+    failed), but mode_store is a genuinely separate file -- writing PAUSED
+    there doesn't touch the log at all, and leaving mode_store at whatever
+    it was (possibly PRODUCTION_ACTIVE) would mean a same-mode restart
+    attempt right after a detected chain corruption is trivially "legal"
+    and needs no re-confirmation. So mode_store IS forced to PAUSED here,
+    independently, while the log gets nothing.
+
+    The corruption is planted on a THIRD row, not the seed mode_transition
+    row, so this test isolates "verify() fails" from "the mode claim reads
+    as missing" -- see test_reconciliation_reads_the_latest_mode_transition
+    _not_other_actions for that separate concern."""
     ms, log = agreeing_store_and_log("PAPER")
-    tampered = replace(log.events[0], after={"tampered": True})
-    list.__setitem__(log._events, 0, tampered)   # bypass the append-only guard, like a direct edit
+    log.append(actor="system", action="junk", object_type="x", object_id="1",
+              timestamp=NOW - timedelta(minutes=10))
+    tampered = replace(log.events[1], after={"tampered": True})
+    list.__setitem__(log._events, 1, tampered)   # bypass the append-only guard, like a direct edit
 
     before_len = len(log)
     with pytest.raises(AuditChainBroken):
         run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
                    accounts=[account("acct-a")], approval_service=approval_service(), now=NOW)
 
-    # The tampered row happens to be the one mode_transition event, so its
-    # claim reads as missing (not "PAPER") -- that mismatch against
-    # mode_store adds one reconciliation row, and the reconcile step adds
-    # one more, before verify() catches the real corruption. Nothing else
-    # gets written -- to the log or to mode_store -- once it does.
-    assert len(log) == before_len + 2
-    assert log.events[-1].action == "reconcile_day_trades"
+    # mode_store gains exactly one new entry: PAUSED. The log gains exactly
+    # one: the reconcile step's own row (no reconciliation row, since the
+    # untampered seed row still correctly claims "PAPER", matching
+    # mode_store's PRE-this-run value; nothing else gets written once
+    # verify() fails).
+    assert len(log) == before_len + 1
+    assert log.events[-1].action == "reconcile_account"
     assert log.verify() is False
-    assert len(ms.history()) == 1   # unchanged -- the seed write only
+    assert ms.current() == "PAUSED"
+    assert len(ms.history()) == 2
+    assert ms.history()[-1].reason is not None and "hash chain" in ms.history()[-1].reason
+
+
+def test_broken_hash_chain_when_already_paused_writes_no_redundant_mode_store_entry():
+    ms, log = agreeing_store_and_log("PAUSED")
+    log.append(actor="system", action="junk", object_type="x", object_id="1",
+              timestamp=NOW - timedelta(minutes=10))
+    tampered = replace(log.events[1], after={"tampered": True})
+    list.__setitem__(log._events, 1, tampered)
+
+    with pytest.raises(AuditChainBroken):
+        run_startup(target_mode="PAUSED", confirmed=False, audit_log=log, mode_store=ms,
+                   accounts=[], approval_service=approval_service(), now=NOW)
+    assert len(ms.history()) == 1   # unchanged -- already PAUSED, nothing to force
+
+
+def test_broken_hash_chain_forced_pause_is_seen_but_does_not_hide_corruption_at_next_boot():
+    """The exact check the delivery instructions asked for: forcing PAUSED
+    into mode_store means the NEXT startup's _reconcile_mode_persistence
+    will see a mismatch (mode_store says PAUSED; the log's last untouched
+    mode_transition claim still says PAPER) and write a catch-up row onto
+    a chain that is STILL broken. That catch-up row must not make the
+    corruption invisible -- verify() walks the whole chain from genesis
+    and will still hit the same original break regardless of what gets
+    appended after it (the same reasoning DECISION 1 already relies on for
+    the day-trade reconcile rows written before verify() runs)."""
+    ms, log = agreeing_store_and_log("PAPER")
+    log.append(actor="system", action="junk", object_type="x", object_id="1",
+              timestamp=NOW - timedelta(minutes=10))
+    tampered = replace(log.events[1], after={"tampered": True})
+    list.__setitem__(log._events, 1, tampered)
+
+    with pytest.raises(AuditChainBroken):
+        run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
+                   accounts=[], approval_service=approval_service(), now=NOW)
+    assert ms.current() == "PAUSED"
+    mode_history_len_after_first_run = len(ms.history())  # seed row + this run's forced PAUSED
+
+    # Second attempt, same (still corrupted) log and store -- simulating a
+    # retry without anyone having fixed the underlying problem.
+    before_len = len(log)
+    with pytest.raises(AuditChainBroken):
+        run_startup(target_mode="PAUSED", confirmed=False, audit_log=log, mode_store=ms,
+                   accounts=[], approval_service=approval_service(), now=NOW)
+
+    actions = [ev.action for ev in log.events[before_len:]]
+    assert actions == ["mode_persisted_reconciled"]   # the predicted catch-up row
+    assert log.verify() is False                       # still correctly detected
+    # already PAUSED going into this second run -- no redundant mode_store
+    # write from the AuditChainBroken branch itself.
+    assert len(ms.history()) == mode_history_len_after_first_run
 
 
 @pytest.mark.parametrize("break_it,expected", [
@@ -496,10 +663,16 @@ def test_every_required_failure_mode_leaves_no_result_to_trade_with(break_it, ex
 def test_cross_account_and_broken_chain_also_leave_no_result_to_trade_with():
     with pytest.raises(CrossAccountError):
         run_startup(**base_kwargs(
-            accounts=[DayTradeReconciliation(
+            accounts=[AccountReconciliation(
                 account_id="wrong",
                 day_trade_guard=DayTradeGuard(account_id="acct-a", max_per_5_sessions=3),
-                broker_reported_day_trades=0)]))
+                broker_reported_day_trades=0,
+                local_positions={}, broker_positions=(), local_settled_cash=0.0,
+                broker_account=AccountSnapshot(
+                    account_id="wrong", equity=0.0, cash=0.0, settled_cash=0.0,
+                    unsettled_cash=0.0, buying_power=0.0, multiplier=1.0,
+                    pattern_day_trader=False, day_trade_count=0, fetched_at=NOW),
+                local_open_order_ids=frozenset(), broker_open_orders=())]))
 
     ms, log = agreeing_store_and_log("PAPER")
     tampered = replace(log.events[0], after={"tampered": True})

@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
+from .. import market_calendar
 from ..accounts import BrokerCredentials
 from ..pipeline import StagedOrder
 from ..policy import TradeCapabilityPolicy, initial_policy
@@ -171,12 +172,19 @@ class SimulatorBroker(BrokerAdapter):
         return self._orders.get(client_order_id)
 
     def sessions(self, through: date, count: int = 5) -> list[date]:
-        out, d = [], through
-        while len(out) < count:
-            if d.weekday() < 5:
-                out.append(d)
-            d -= timedelta(days=1)
-        return sorted(out)
+        """Redirected to the real, holiday-aware calendar (§4.4) -- this
+        used to be a second, cruder (weekday-only, no-holiday-awareness)
+        implementation of the exact same trailing-sessions concept
+        `market_calendar.trailing_sessions` already provides and
+        `DayTradeGuard` already uses. One implementation now, not two.
+        `through`/`count` map directly onto `trailing_sessions`'s
+        `as_of`/`n` -- same oldest-first ordering, no behaviour change
+        there. The one real behaviour change: a `through` date outside the
+        calendar's verified coverage now raises `CalendarCoverageError`
+        (via `_check_range`) instead of silently walking back through
+        dates the old weekday-only loop had no way to know were
+        unverified."""
+        return market_calendar.trailing_sessions(through, count)
 
     def supported_matrix(self) -> dict[str, list[str]]:
         return {"order_type": ["MARKET", "LIMIT"], "time_in_force": ["DAY"],
