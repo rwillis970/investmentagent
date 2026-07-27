@@ -1,20 +1,17 @@
 # scripts/fixtures/
 
-Real capture, taken 2026-07-27T18:00:18Z (`capture_manifest.json`), run by
+Real capture, taken 2026-07-27T18:22:41Z (`capture_manifest.json`), run by
 the operator on his own machine with real Alpaca paper credentials via
 `scripts/alpaca_probe.py`. Files: `account.json`, `positions.json`,
-`orders.json`, `activities.json`, each `{"status": <http status>, "body":
-<verbatim response, credential-shaped fields redacted>}`. `configurations.json`
-and `assets.json` (one entry per symbol) were added to the probe script in
-a later commit and are not yet in this particular capture -- re-running the
-script will add them.
+`orders.json`, `activities.json`, `configurations.json`, `assets.json`
+(SPY, QQQ, AAPL) -- each entry `{"status": <http status>, "body": <verbatim
+response, credential-shaped fields redacted>}`.
 
 **The account captured is brand new and has never traded**: `positions.json`,
 `orders.json`, and `activities.json` are all `[]`. `account.json` shows a
-$500 paper cash account (`multiplier: "1"`) created 2026-07-27, no margin,
-shorting disabled. This limits what the capture can answer -- see
-`agent/broker/alpaca.py`'s module docstring and the delivery report for the
-full three-question analysis. Summary:
+$500 paper cash account (`multiplier: "1"`) created 2026-07-27, no margin.
+This limits what the capture can answer -- see `agent/broker/alpaca.py`'s
+module docstring and the delivery report for the full analysis. Summary:
 
 1. **Settled vs. unsettled cash** -- CONFIRMED NO: `/v2/account` has 36
    top-level fields, none of them a settled/unsettled split. `AccountSnapshot`
@@ -27,18 +24,33 @@ full three-question analysis. Summary:
    exercise order statuses without real fills existing first. `STATUS_MAP`
    stays as documented, judgment-call mappings until paper trading is
    actually running and has produced some order history to re-capture
-   against. Nothing to fix here; nothing to re-guess either.
-3. **`supported_matrix()`** -- was NEITHER CONFIRMED NOR CONTRADICTED by the
-   first capture: `/v2/account` doesn't carry fractional/time-in-force/
-   extended-hours metadata at all. The probe script now also hits
-   `/v2/account/configurations` and per-symbol `/v2/assets/{symbol}`
-   (default symbols: SPY, QQQ, AAPL) specifically to answer this -- rerun
-   the script and bring back `configurations.json`/`assets.json` for that
-   analysis.
+   against.
+3. **`supported_matrix()`** -- NOW PARTIALLY CONFIRMED/CONTRADICTED, from
+   `configurations.json` and `assets.json` (SPY/QQQ/AAPL):
+   - `session`: CONTRADICTED. The old `["REGULAR"]`-only guess was wrong --
+     `configurations.json` reports `disable_overnight_trading: false`, and
+     all three assets carry `overnight_tradable` + `fractional_eh_enabled`.
+     Updated to `["REGULAR", "EXTENDED", "OVERNIGHT"]` (matches
+     `agent.policy.initial_policy`'s own session vocabulary, which already
+     disables EXTENDED/OVERNIGHT by policy -- this is a separate,
+     broker-capability fact, not a proposal to enable them). Confirmed for
+     3 symbols only, not the full tradable universe.
+   - `fractional`: PARTIALLY CONFIRMED. `fractional_trading: true`
+     (account) and `fractionable: true` (all 3 assets) confirm fractional
+     trading is enabled and available. NOT confirmed: which order types
+     accept a fractional quantity -- neither endpoint says, so
+     `["MARKET", "LIMIT"]` is unchanged, still an unverified guess.
+   - `order_type` / `time_in_force`: STILL UNVERIFIED. Neither endpoint
+     exposes a supported-order-type or supported-TIF list; these are fixed
+     API features this probe has no read-only way to check. Unchanged.
+   - Incidental, unresolved tension (not modeled by any key): `account.json`
+     says `shorting_enabled: false` account-wide, but `configurations.json`
+     says `no_shorting: false` and all 3 assets say `shortable: true`. Not
+     investigated further -- moot in practice, since shorting is
+     independently disabled at the capability layer (Appendix E).
 
-One incidental, confirmed fact worth flagging even though it isn't one of
-the three questions: `account.json` omits `pattern_day_trader` and
-`daytrade_count` entirely (not `false`/`0` -- absent), while every other
+One more incidental, confirmed fact: `account.json` omits `pattern_day_trader`
+and `daytrade_count` entirely (not `false`/`0` -- absent), while every other
 boolean flag on the account (`trading_blocked`, `shorting_enabled`, etc.) is
 present even when false. `AccountSnapshot` now models both as `bool | None`/
 `int | None` (`None` = unknown) instead of silently defaulting to

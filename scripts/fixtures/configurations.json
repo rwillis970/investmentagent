@@ -1,0 +1,13 @@
+{
+  "body": {
+    "closing_transactions_only": false,
+    "disable_overnight_trading": false,
+    "fractional_trading": true,
+    "max_margin_multiplier": "4",
+    "no_shorting": false,
+    "ptp_no_exception_entry": false,
+    "suspend_trade": false,
+    "trade_confirm_email": "all"
+  },
+  "status": 200
+}

@@ -371,6 +371,30 @@ def test_supported_matrix_returns_a_populated_dict():
     assert "time_in_force" in matrix and "DAY" in matrix["time_in_force"]
 
 
+def test_supported_matrix_session_reflects_the_real_capture():
+    """FINDING (§13 probe, 2026-07-27 capture: configurations.json,
+    assets.json): `disable_overnight_trading: false` at the account level,
+    plus `overnight_tradable`/`fractional_eh_enabled` on every one of the
+    three probed assets (SPY, QQQ, AAPL), contradicts the old
+    ["REGULAR"]-only guess. Updated to match `agent.policy.initial_policy`'s
+    own REGULAR/EXTENDED/OVERNIGHT session vocabulary -- this is an
+    empirical BROKER-capability fact, independent of and not a proposal to
+    change the capability policy's own default of disabling EXTENDED/
+    OVERNIGHT (Appendix E)."""
+    matrix = adapter().supported_matrix()
+    assert set(matrix["session"]) == {"REGULAR", "EXTENDED", "OVERNIGHT"}
+
+
+def test_supported_matrix_fractional_order_types_remain_an_unverified_guess():
+    """`fractional_trading: true` (configurations.json) and
+    `fractionable: true` (assets.json, all three probed symbols) confirm
+    fractional trading is enabled and available -- but neither endpoint
+    says WHICH order types accept a fractional quantity, so this specific
+    list is unchanged: still a documented guess, not a confirmed one."""
+    matrix = adapter().supported_matrix()
+    assert matrix["fractional"] == ["MARKET", "LIMIT"]
+
+
 # ------------------------------------------------------------------ submit()
 
 def staged_order(gk, *, client_order_id="c1", side="BUY", qty=1.0, price=100.0,

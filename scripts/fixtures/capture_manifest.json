@@ -1,11 +1,15 @@
 {
   "base_url": "https://paper-api.alpaca.markets",
-  "captured_at": "2026-07-27T18:00:18.267583+00:00",
+  "captured_at": "2026-07-27T18:22:41.429865+00:00",
   "endpoints": [
     "/v2/account",
     "/v2/positions",
     "/v2/orders?{'status': 'all'}",
-    "/v2/account/activities"
+    "/v2/account/activities",
+    "/v2/account/configurations",
+    "/v2/assets/SPY",
+    "/v2/assets/QQQ",
+    "/v2/assets/AAPL"
   ],
   "note": "READ-ONLY capture. No order was placed, cancelled, or modified."
 }

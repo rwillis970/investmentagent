@@ -419,34 +419,58 @@ class AlpacaPaperAdapter(BrokerAdapter):
         return market_calendar.trailing_sessions(through, count)
 
     def supported_matrix(self) -> dict[str, list[str]]:
-        """Known from Alpaca's published API surface for US equities --
-        NOT empirically probed against a live account. §13 asks for this
-        to be probed; that requires a real (paper or live) account and has
-        not been done as part of this unit. Treat this as a documented
-        starting point for that probe, not its result.
+        """§13 empirical probe, capture dates 2026-07-27 (account.json) and
+        the follow-up capture that added configurations.json and assets.json
+        (SPY/QQQ/AAPL) -- see scripts/fixtures/. Per-key status below; this
+        replaces the earlier "neither confirmed nor contradicted" note now
+        that the two endpoints it named have actually been probed.
 
-        §13 PROBE ATTEMPTED, 2026-07-27 (scripts/fixtures/account.json):
-        `/v2/account` -- the only endpoint this unit's read-only script
-        hit that could plausibly carry this -- has NO fields for fractional
-        eligibility, supported time-in-force, or extended-hours. Checked
-        against alpaca-py's own `TradeAccount` model (github.com/alpacahq/
-        alpaca-py): that information lives on a DIFFERENT model,
-        `AccountConfiguration` (`/v2/account/configurations`:
-        `fractional_trading`, `no_shorting`, `max_margin_multiplier`,
-        `pdt_check`), and on per-symbol `/v2/assets/{symbol}`
-        (`fractionable`, `shortable`, `marginable`). Neither endpoint was
-        probed here. So this matrix is NEITHER confirmed NOR contradicted --
-        the premise that account-level metadata would settle this was wrong
-        for this endpoint; a real answer needs those two endpoints added to
-        `scripts/alpaca_probe.py`. One incidental, confirmed fact from the
-        real capture: `shorting_enabled` was `false` account-wide, consistent
-        with (not a new constraint beyond) the capability layer's own
-        independent no-short policy -- this matrix has no "side" axis to
-        update as a result."""
+        order_type / time_in_force -- STILL AN UNVERIFIED GUESS, from
+        Alpaca's published API surface, not this account. None of
+        `/v2/account`, `/v2/account/configurations` or `/v2/assets/{symbol}`
+        expose a supported-order-type or supported-time-in-force list --
+        these are fixed API features, not account- or asset-scoped data, so
+        there is no endpoint left to probe for them; a real answer would
+        require attempting real orders and observing acceptance/rejection,
+        which is a write action, out of scope for a read-only probe.
+
+        session -- CONTRADICTED, and now corrected. The old guess was
+        `["REGULAR"]` only. `configurations.json` reports
+        `disable_overnight_trading: false` (overnight trading is NOT
+        disabled for this account), and all three probed assets (SPY, QQQ,
+        AAPL) carry BOTH `overnight_tradable` and `fractional_eh_enabled` in
+        their `attributes` list -- i.e. this account, on these symbols, can
+        trade OVERNIGHT and can trade fractional quantities during EXTENDED
+        hours. Updated to `["REGULAR", "EXTENDED", "OVERNIGHT"]`, matching
+        the exact vocabulary `agent.policy.initial_policy`'s own `session`
+        capability dict already uses -- that policy had already anticipated
+        this three-way distinction and disables EXTENDED/OVERNIGHT by
+        default (Appendix E: "Regular market hours"). This matrix and that
+        policy answer DIFFERENT questions -- this is what the broker can do;
+        the policy is what this pilot currently allows -- and this update is
+        NOT a proposal to enable EXTENDED/OVERNIGHT trading. Confirmed for
+        three large, liquid, easy-to-borrow symbols only; not confirmed
+        universe-wide.
+
+        fractional -- PARTIALLY CONFIRMED. `configurations.json` reports
+        `fractional_trading: true` account-wide, and all three probed assets
+        report `fractionable: true` -- fractional trading being enabled and
+        available for these symbols is now confirmed, not guessed. NOT
+        confirmed: which specific order types accept a fractional quantity
+        -- neither endpoint breaks that down by order type, so this list
+        (`["MARKET", "LIMIT"]`) remains an unverified guess, unchanged.
+
+        Incidental finding, not modeled by any key here: `account.json`
+        reports `shorting_enabled: false` account-wide, while
+        `configurations.json` reports `no_shorting: false` (not explicitly
+        long-only) and all three assets report `shortable: true` --
+        genuinely in tension, not resolved here, and moot in practice since
+        shorting is independently DISABLED at the capability layer
+        regardless (Appendix E)."""
         return {
             "order_type": ["MARKET", "LIMIT", "STOP", "STOP_LIMIT", "TRAILING_STOP"],
             "time_in_force": ["DAY", "GTC", "OPG", "CLS", "IOC", "FOK"],
-            "session": ["REGULAR"],
+            "session": ["REGULAR", "EXTENDED", "OVERNIGHT"],
             "fractional": ["MARKET", "LIMIT"],
         }
 

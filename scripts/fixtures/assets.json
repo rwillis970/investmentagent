@@ -1,0 +1,79 @@
+{
+  "AAPL": {
+    "body": {
+      "attributes": [
+        "fractional_eh_enabled",
+        "has_options",
+        "overnight_tradable"
+      ],
+      "borrow_status": "easy_to_borrow",
+      "class": "us_equity",
+      "easy_to_borrow": true,
+      "exchange": "NASDAQ",
+      "fractionable": true,
+      "id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+      "maintenance_margin_requirement": 30,
+      "margin_requirement_long": "30",
+      "margin_requirement_short": "30",
+      "marginable": true,
+      "name": "Apple Inc. Common Stock",
+      "shortable": true,
+      "status": "active",
+      "symbol": "AAPL",
+      "tradable": true
+    },
+    "status": 200
+  },
+  "QQQ": {
+    "body": {
+      "attributes": [
+        "fractional_eh_enabled",
+        "has_options",
+        "options_late_close",
+        "overnight_tradable"
+      ],
+      "borrow_status": "easy_to_borrow",
+      "class": "us_equity",
+      "easy_to_borrow": true,
+      "exchange": "NASDAQ",
+      "fractionable": true,
+      "id": "2d9e926c-e17c-47c3-ad8c-26c7a594e48f",
+      "maintenance_margin_requirement": 30,
+      "margin_requirement_long": "30",
+      "margin_requirement_short": "30",
+      "marginable": true,
+      "name": "Invesco QQQ Trust, Series 1",
+      "shortable": true,
+      "status": "active",
+      "symbol": "QQQ",
+      "tradable": true
+    },
+    "status": 200
+  },
+  "SPY": {
+    "body": {
+      "attributes": [
+        "fractional_eh_enabled",
+        "has_options",
+        "options_late_close",
+        "overnight_tradable"
+      ],
+      "borrow_status": "easy_to_borrow",
+      "class": "us_equity",
+      "easy_to_borrow": true,
+      "exchange": "ARCA",
+      "fractionable": true,
+      "id": "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+      "maintenance_margin_requirement": 30,
+      "margin_requirement_long": "30",
+      "margin_requirement_short": "30",
+      "marginable": true,
+      "name": "State Street SPDR S&P 500 ETF Trust",
+      "shortable": true,
+      "status": "active",
+      "symbol": "SPY",
+      "tradable": true
+    },
+    "status": 200
+  }
+}
