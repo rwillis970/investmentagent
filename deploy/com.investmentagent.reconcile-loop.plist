@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for the scheduled reconciliation loop (scripts/run_agent.py).
+  See deploy/README.md for installation, the placeholder values below, and
+  what happens (and how an operator finds out) when the failure this job
+  restarts into is a PERMANENT one: a locked keychain, an expired
+  credential, or a genuine reconciliation halt, not a transient one.
+
+  Every /REPLACE/... value below is a placeholder. Fill them in for your
+  own machine before loading this job; do not put a raw secret anywhere in
+  this file. secret-ref is a keychain account name, resolved by
+  agent.secrets_provider.KeychainSecretsProvider at the point of use, never
+  a value that belongs here.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.investmentagent.reconcile-loop</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/investmentagent/scripts/run_agent.py</string>
+        <string>--config</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/config.json</string>
+        <string>--account-id</string>
+        <string>REPLACE_WITH_ACCOUNT_ID</string>
+        <string>--key-id</string>
+        <string>REPLACE_WITH_ALPACA_PAPER_KEY_ID</string>
+        <string>--secret-ref</string>
+        <string>REPLACE_WITH_KEYCHAIN_SECRET_REF</string>
+        <string>--ledger-store-path</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/ledger.jsonl</string>
+        <string>--mode-store-path</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/mode_state.jsonl</string>
+        <string>--audit-log-path</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/audit.jsonl</string>
+    </array>
+
+    <!-- Start when the job is loaded (e.g. at login, or immediately on
+         launchctl bootstrap; see deploy/README.md), not only when
+         something else demands it. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on a NON-ZERO exit only, never after a clean (zero) exit.
+         agent.run_loop.run_loop's own design is: any exception exits
+         non-zero, and never retries internally. This is the half of that
+         design that actually relaunches the process. A zero exit from this
+         script never happens in real, unattended operation (run_loop runs
+         forever unless something raises); SuccessfulExit=false is stated
+         explicitly anyway, rather than omitted, so this job's restart
+         behaviour doesn't depend on that being true forever. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Minimum seconds between relaunch attempts after a crash. Without
+         this, a PERMANENT failure (a locked keychain, an expired
+         credential, a genuine reconciliation halt that will recur
+         identically on every restart; see deploy/README.md) spins
+         launchd into relaunching as fast as the process can exit: burning
+         CPU, filling the log files with an unreadable wall of repeated
+         tracebacks, and hammering the broker's API with what is, in
+         effect, an unintended retry storm. 60s bounds that to once a
+         minute: frequent enough that a transient failure (a network
+         blip) recovers quickly, infrequent enough that a permanent one
+         doesn't spin. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Separate files, not one shared path: interleaving run_loop's own
+         per-cycle INFO logging with a traceback makes both harder to read
+         a week later. Directory must exist and be writable before this
+         job is loaded (see deploy/README.md). -->
+    <key>StandardOutPath</key>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/logs/reconcile-loop.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/logs/reconcile-loop.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
