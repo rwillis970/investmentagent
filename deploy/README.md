@@ -36,8 +36,8 @@ replace every `/REPLACE/...` value:
   Add it first with `agent.secrets_provider.KeychainSecretsProvider`'s own
   setup, or the macOS `Keychain Access` app / `security add-generic-password`
   directly.
-- `--ledger-store-path`, `--mode-store-path`, `--audit-log-path`: paths
-  under the `state/` directory created in step 1
+- `--ledger-store-path`, `--quarantine-store-path`, `--mode-store-path`,
+  `--audit-log-path`: paths under the `state/` directory created in step 1
 - `StandardOutPath`/`StandardErrorPath`: paths under the `logs/` directory
   created in step 1
 

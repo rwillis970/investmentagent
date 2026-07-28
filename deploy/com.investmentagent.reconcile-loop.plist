@@ -32,6 +32,8 @@
         <string>REPLACE_WITH_KEYCHAIN_SECRET_REF</string>
         <string>--ledger-store-path</string>
         <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/ledger.jsonl</string>
+        <string>--quarantine-store-path</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/quarantine.jsonl</string>
         <string>--mode-store-path</string>
         <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/mode_state.jsonl</string>
         <string>--audit-log-path</string>

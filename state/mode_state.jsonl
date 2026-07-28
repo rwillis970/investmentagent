@@ -1,2 +1,3 @@
 {"seq": 1, "mode": "RESEARCH", "changed_at": "2026-07-28T14:15:10.604816+00:00", "reason": "--advance-mode-to operator command"}
 {"seq": 2, "mode": "PAPER", "changed_at": "2026-07-28T14:15:10.664131+00:00", "reason": "--advance-mode-to operator command"}
+{"seq": 3, "mode": "PAUSED", "changed_at": "2026-07-28T15:15:18.129280+00:00", "reason": "account 98b34e82-04fc-4e19-ab3b-99ee312c8478: local positions {} do not match broker-reported positions {'SPY': 0.027087234}", "paused_from": "PAPER"}

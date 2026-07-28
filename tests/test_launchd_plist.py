@@ -40,7 +40,8 @@ def test_program_arguments_invoke_run_agent_with_every_required_flag():
     args = plist["ProgramArguments"]
     assert any("run_agent.py" in a for a in args)
     for flag in ("--config", "--account-id", "--key-id", "--secret-ref",
-                "--ledger-store-path", "--mode-store-path", "--audit-log-path"):
+                "--ledger-store-path", "--quarantine-store-path",
+                "--mode-store-path", "--audit-log-path"):
         assert flag in args, f"{flag} missing from ProgramArguments"
 
 
