@@ -16,12 +16,15 @@ from .durations import parse_duration
 from .materiality import MaterialityPolicy
 from .policy import CapabilityStatus, TradeCapabilityPolicy
 
-# The single source of truth for legal mode values is the transition chain in
-# agent.mode -- keeping a second, independent tuple here is exactly how the
-# two drift apart. §9.2 mode transition legality is agent.startup.
-# run_startup's job now, backed by the durable mode store; this tuple only
-# proves membership.
-MODES = mode_fsm.CHAIN
+# The single source of truth for legal mode values is agent.mode -- keeping
+# a second, independent tuple here is exactly how the two drift apart. §9.2
+# mode transition legality is agent.startup.run_startup's job now, backed by
+# the durable mode store; this tuple only proves membership. mode_fsm.MODES,
+# not mode_fsm.CHAIN: CHAIN is only the four-mode ESCALATION ordering
+# (PAUSED deliberately excluded -- see agent/mode.py's own module docstring,
+# TOPOLOGY section); PAUSED is still a real, valid mode value a config can
+# legitimately name, just not part of that ordering.
+MODES = mode_fsm.MODES
 PROFILES = ("CONSERVATIVE", "MODERATE", "AGGRESSIVE", "CUSTOM")
 POSTURES = ("CASH", "MARGIN_UNDER_25K", "MARGIN_OVER_25K", "UNKNOWN")
 

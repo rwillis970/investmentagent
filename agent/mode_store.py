@@ -52,11 +52,16 @@ class ModeStore:
             self._load()
 
     def write(self, mode: str, *, changed_at: datetime,
-             reason: str | None = None) -> ModeChange:
+             reason: str | None = None, paused_from: str | None = None) -> ModeChange:
+        """`paused_from`: only meaningful when `mode == "PAUSED"` -- the
+        mode the system was persisted in immediately before this pause. See
+        agent/mode.py's own module docstring (TOPOLOGY section) for why
+        this exists and `paused_from()` below for how it's read back."""
         if changed_at.tzinfo is None:
             raise ModeStoreError("changed_at must be a timezone-aware datetime")
         change = ModeChange(seq=len(self._history) + 1, mode=mode,
-                            changed_at=changed_at, reason=reason)
+                            changed_at=changed_at, reason=reason,
+                            paused_from=paused_from)
         # Persist BEFORE mutating self._history -- the same bug class as
         # _halt once claiming a transition that never happened (agent/
         # startup.py DECISION 2/5). If the disk write raises, this
@@ -95,6 +100,17 @@ class ModeStore:
     def history(self) -> tuple[ModeChange, ...]:
         return tuple(self._history)
 
+    def paused_from(self) -> str | None:
+        """The mode the CURRENT state was paused from, if `current() ==
+        "PAUSED"` -- `None` otherwise (including: never paused, currently
+        paused but predating this field, or already resumed). Reads only
+        the latest history entry's own `paused_from`, which is `None` on
+        every non-PAUSED row by construction (`write` only receives a real
+        value when writing a PAUSED row) -- so this naturally answers
+        "what is the CURRENT pause paused from", not "the last time this
+        store was ever paused"."""
+        return self._history[-1].paused_from if self._history else None
+
     def update(self, *a, **k):
         raise ModeStoreError("mode history is append-only; write a new change")
 
@@ -118,6 +134,8 @@ def _encode(c: ModeChange) -> dict:
 
 
 def _decode(d: dict) -> ModeChange:
+    # .get, not [] -- a row written before this field existed has no
+    # "paused_from" key at all; it must decode as None, not raise.
     return ModeChange(seq=d["seq"], mode=d["mode"],
                       changed_at=datetime.fromisoformat(d["changed_at"]),
-                      reason=d.get("reason"))
+                      reason=d.get("reason"), paused_from=d.get("paused_from"))

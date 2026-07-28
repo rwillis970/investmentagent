@@ -442,6 +442,7 @@ def test_illegal_mode_transition_halts_before_any_reconciliation():
     assert "not reachable in one step" in ev.after["reason"]
     assert log.verify() is True
     assert ms.current() == "PAUSED"
+    assert ms.paused_from() == "DISABLED"
 
 
 def test_confirmation_required_edge_also_halts():
@@ -453,6 +454,10 @@ def test_confirmation_required_edge_also_halts():
     assert ev.action == "startup_halted"
     assert "requires explicit confirmation" in ev.after["reason"]
     assert ms.current() == "PAUSED"
+    # paused FROM the mode we were actually running in (PAPER), never from
+    # the target we failed to reach (PRODUCTION_ACTIVE) -- see agent/mode.py's
+    # own module docstring for why that distinction is the whole fix.
+    assert ms.paused_from() == "PAPER"
 
 
 def test_calendar_expiry_in_production_active_halts_before_reconcile():
@@ -638,6 +643,7 @@ def test_broken_hash_chain_forces_paused_in_the_store_but_writes_nothing_to_the_
     assert ms.current() == "PAUSED"
     assert len(ms.history()) == 2
     assert ms.history()[-1].reason is not None and "hash chain" in ms.history()[-1].reason
+    assert ms.paused_from() == "PAPER"
 
 
 def test_broken_hash_chain_when_already_paused_writes_no_redundant_mode_store_entry():
@@ -729,3 +735,78 @@ def test_cross_account_and_broken_chain_also_leave_no_result_to_trade_with():
     with pytest.raises(AuditChainBroken):
         run_startup(target_mode="PAPER", confirmed=False, audit_log=log, mode_store=ms,
                    accounts=[], approval_service=approval_service(), now=NOW)
+
+
+# ------------------------------------------- resuming from PAUSED (§9.2 fix)
+#
+# Real gap found running the loop for the first time: PAUSED was a dead
+# end -- see agent/mode.py's own module docstring for the full topology
+# fix. These exercise it through run_startup itself, not just the pure
+# mode.py functions tests/test_mode.py already covers.
+
+def test_resuming_from_a_halt_returns_to_the_mode_it_was_paused_from():
+    ms, log = agreeing_store_and_log("PAPER")
+    with pytest.raises(mode_fsm.ConfirmationRequired):
+        run_startup(target_mode="PRODUCTION_ACTIVE", confirmed=False, audit_log=log,
+                   mode_store=ms, accounts=[], approval_service=approval_service(), now=NOW)
+    assert ms.current() == "PAUSED"
+    assert ms.paused_from() == "PAPER"
+
+    # Before the fix, this had no legal one-step path at all short of a
+    # hand edit -- PAUSED's only chain-adjacent neighbour was
+    # PRODUCTION_ACTIVE. Now it resumes cleanly, one step, no confirmation.
+    result = run_startup(target_mode="PAPER", confirmed=False, audit_log=log,
+                         mode_store=ms, accounts=[account("acct-a")],
+                         approval_service=approval_service(), now=NOW + timedelta(minutes=1))
+    assert result.mode == "PAPER"
+    assert ms.current() == "PAPER"
+
+
+def test_resuming_from_paused_to_the_wrong_mode_is_still_refused():
+    ms, log = agreeing_store_and_log("PAPER")
+    with pytest.raises(mode_fsm.ConfirmationRequired):
+        run_startup(target_mode="PRODUCTION_ACTIVE", confirmed=False, audit_log=log,
+                   mode_store=ms, accounts=[], approval_service=approval_service(), now=NOW)
+    assert ms.paused_from() == "PAPER"
+
+    # RESEARCH is not where this was paused from -- still illegal, even
+    # though RESEARCH is otherwise a perfectly ordinary mode.
+    with pytest.raises(mode_fsm.IllegalModeTransition):
+        run_startup(target_mode="RESEARCH", confirmed=False, audit_log=log, mode_store=ms,
+                   accounts=[], approval_service=approval_service(), now=NOW + timedelta(minutes=1))
+
+
+def test_a_deliberate_config_driven_transition_into_paused_also_records_paused_from():
+    """PAUSED can also be entered deliberately (an operator sets
+    mode: PAUSED and runs the loop), not only via a failure through _halt --
+    run_startup's own "real transition" bottom block writes this row, and it
+    must record paused_from too."""
+    ms, log = agreeing_store_and_log("PAPER")
+    result = run_startup(target_mode="PAUSED", confirmed=False, audit_log=log, mode_store=ms,
+                         accounts=[], approval_service=approval_service(), now=NOW)
+    assert result.mode == "PAUSED"
+    assert ms.current() == "PAUSED"
+    assert ms.paused_from() == "PAPER"
+    ev = next(e for e in log.events if e.action == "mode_transition"
+             and e.after.get("mode") == "PAUSED")
+    assert ev.after["paused_from"] == "PAPER"
+
+
+def test_the_disabled_paused_production_active_bypass_is_closed_end_to_end():
+    """The independently-discovered, more serious half of this fix,
+    exercised through the real orchestrator: under the OLD chain-adjacency
+    model, a fresh DISABLED install could reach PRODUCTION_ACTIVE in two
+    hops (DISABLED -> PAUSED, unconditional; PAUSED -> PRODUCTION_ACTIVE,
+    merely confirmed) without ever having actually run in RESEARCH or
+    PAPER. Closed now: paused_from="DISABLED" makes the second hop illegal,
+    confirmed or not."""
+    ms, log = agreeing_store_and_log("DISABLED")
+    result = run_startup(target_mode="PAUSED", confirmed=False, audit_log=log, mode_store=ms,
+                         accounts=[], approval_service=approval_service(), now=NOW)
+    assert result.mode == "PAUSED"
+    assert ms.paused_from() == "DISABLED"
+
+    with pytest.raises(mode_fsm.IllegalModeTransition):
+        run_startup(target_mode="PRODUCTION_ACTIVE", confirmed=True, audit_log=log,
+                   mode_store=ms, accounts=[account("acct-a")],
+                   approval_service=approval_service(), now=NOW + timedelta(minutes=1))

@@ -16,18 +16,26 @@ from datetime import datetime
 
 @dataclass(frozen=True)
 class ModeChange:
-    """One row of `policy.mode_state` (migrations/003_mode_state.sql) --
-    the durable record of a mode transition, append-only like everything
-    else this codebase persists. `seq` is assigned internally by
-    `agent.mode_store.ModeStore.write`, the same way `AuditEvent.seq` is
-    assigned internally by `AuditLog.append` -- never supplied by the
-    caller. See agent/mode_store.py for why this lives in its own,
-    separate store rather than agent.store.FactStore or agent.audit.
-    AuditLog."""
+    """One row of `policy.mode_state` (migrations/003_mode_state.sql,
+    migrations/004_mode_state_paused_from.sql) -- the durable record of a
+    mode transition, append-only like everything else this codebase
+    persists. `seq` is assigned internally by `agent.mode_store.ModeStore.
+    write`, the same way `AuditEvent.seq` is assigned internally by
+    `AuditLog.append` -- never supplied by the caller. See agent/
+    mode_store.py for why this lives in its own, separate store rather than
+    agent.store.FactStore or agent.audit.AuditLog.
+
+    `paused_from`: set only on a row where `mode == "PAUSED"` -- the mode
+    the system was actually persisted in immediately before this pause
+    (never the mode a failed startup attempt was TARGETING). `None` for
+    every other row. See agent/mode.py's own module docstring (TOPOLOGY
+    section) for why this exists: PAUSED's only legal exits are DISABLED
+    and this specific value, not "whatever is next in a chain"."""
     seq: int
     mode: str
     changed_at: datetime
     reason: str | None = None
+    paused_from: str | None = None
 
 
 @dataclass(frozen=True)

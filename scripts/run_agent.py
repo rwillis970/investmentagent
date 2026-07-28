@@ -224,18 +224,24 @@ def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
     into the mode already persisted writes nothing to either store.
 
     NOT DONE HERE, ON PURPOSE: `market_calendar.assert_calendar_coverage_
-    at_startup`. See agent/mode.py's own pre-existing "KNOWN GAP -- RUNTIME
-    MODE TRANSITIONS" comment above `assert_legal_startup`: it says a
-    runtime transition function, when built, must also run that check for
-    a target that exercises the calendar. This function is exactly that
-    runtime transition function, and deliberately does not -- the scope
-    given for this flag was `assert_legal_startup` + `ModeStore` only. This
-    is still safe: the calendar check runs, fresh, inside `run_startup` on
-    the very next REAL cycle (`agent.run_loop.run_cycle` always calls it),
-    which is the only place any account is ever actually reconciled or any
-    order could ever be routed. This flag can legally write a
-    calendar-doomed mode into the store; it cannot make anything trade on
-    it.
+    at_startup`. This function is a runtime mode-transition path (agent/
+    mode.py's own module docstring discusses exactly this kind of function
+    under its TOPOLOGY section), and deliberately does not run the calendar
+    check -- the scope given for this flag was `assert_legal_startup` +
+    `ModeStore` only. This is still safe: the calendar check runs, fresh,
+    inside `run_startup` on the very next REAL cycle (`agent.run_loop.
+    run_cycle` always calls it), which is the only place any account is
+    ever actually reconciled or any order could ever be routed. This flag
+    can legally write a calendar-doomed mode into the store; it cannot make
+    anything trade on it.
+
+    RESUMING FROM PAUSED (§9.2 topology fix): when `persisted == "PAUSED"`,
+    the legal target is {DISABLED, `mode_store.paused_from()`} -- never
+    "whatever `mode.CHAIN` happens to put next" (see agent/mode.py's own
+    module docstring for the dead end, and the independently-discovered
+    escalation bypass, that shape used to permit). Resolved the same way
+    `agent.startup.run_startup` resolves it, from the same store method --
+    one implementation of "what mode was this paused from," not two.
 
     Any unexpected exception (e.g. `mode_store_path`'s parent directory
     does not exist) is caught and logged, matching this script's own
@@ -252,9 +258,11 @@ def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
 
         persisted = _reconcile_mode_persistence(
             mode_store, audit_log, now=now, correlation_id=None)
+        paused_from = mode_store.paused_from() if persisted == "PAUSED" else None
 
         try:
-            mode_fsm.assert_legal_startup(persisted, target_mode, confirmed=confirmed)
+            mode_fsm.assert_legal_startup(persisted, target_mode, confirmed=confirmed,
+                                          paused_from=paused_from)
         except mode_fsm.ModeTransitionError as exc:
             log.error("refusing --advance-mode-to %s: %s", target_mode, exc)
             return 1
@@ -263,11 +271,20 @@ def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
             log.info("already in mode %s; nothing to advance", target_mode)
             return 0
 
+        # Entering PAUSED (deliberately, via this command) must record what
+        # it's paused FROM, the same as run_startup's own two write sites --
+        # see agent/mode.py's own module docstring for why.
+        entering_paused = target_mode == "PAUSED"
+        write_paused_from = mode_fsm.normalize_persisted(persisted) if entering_paused else None
         mode_store.write(target_mode, changed_at=now,
-                         reason="--advance-mode-to operator command")
+                         reason="--advance-mode-to operator command",
+                         paused_from=write_paused_from)
+        after = {"mode": target_mode}
+        if entering_paused:
+            after["paused_from"] = write_paused_from
         audit_log.append(actor="operator", action="mode_transition",
                          object_type="mode", object_id="system",
-                         before={"mode": persisted}, after={"mode": target_mode},
+                         before={"mode": persisted}, after=after,
                          timestamp=now)
         log.info("advanced mode %s -> %s", persisted, target_mode)
         return 0
@@ -298,7 +315,7 @@ def _parse_args(argv: list[str] | None):
     parser.add_argument("--audit-log-path", required=True,
                         help="durable AuditLog file -- survives a restart, fsynced on every "
                              "append (see agent/audit.py's own docstring for why)")
-    parser.add_argument("--advance-mode-to", choices=list(mode_fsm.CHAIN), default=None,
+    parser.add_argument("--advance-mode-to", choices=list(mode_fsm.MODES), default=None,
                         help="advance the PERSISTED mode one legal §9.2 step, with no "
                              "broker adapter and no account reconciliation, then exit -- "
                              "the operator path around the PAPER-unreachable-in-one-step "

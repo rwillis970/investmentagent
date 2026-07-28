@@ -1,5 +1,5 @@
 {
-  "mode": "RESEARCH",
+  "mode": "PAPER",
   "require_human_trade_approval": true,
   "risk_profile": "MODERATE",
   "assert_account_posture": "CASH",

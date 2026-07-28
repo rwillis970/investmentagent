@@ -434,3 +434,77 @@ def test_advance_mode_uses_the_injected_now_fn(tmp_path):
     assert code == 0
     change = ModeStore(mode_path).history()[-1]
     assert change.changed_at == fixed
+
+
+# --------------------------------- resuming from PAUSED via --advance-mode-to
+#
+# Real gap found running the loop for the first time: PAUSED was a dead
+# end. See agent/mode.py's own module docstring for the full topology fix.
+
+def test_advance_mode_to_paused_is_still_a_valid_choice(tmp_path):
+    """PAUSED left agent.mode.CHAIN (the escalation ordering) but must
+    remain reachable via this flag -- it is a real, valid mode, just not
+    part of that ordering. Regression guard for the argparse choices list."""
+    code = main(_mode_argv(tmp_path / "mode.jsonl", tmp_path / "audit.jsonl", "PAUSED"))
+    assert code == 0
+
+
+def test_advance_mode_can_resume_from_paused_to_the_mode_it_was_paused_from(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    main(_mode_argv(mode_path, audit_path, "PAPER"))
+    assert main(_mode_argv(mode_path, audit_path, "PAUSED")) == 0   # deliberate pause
+    assert ModeStore(mode_path).paused_from() == "PAPER"
+
+    # Before the fix, PAUSED's only chain-adjacent exit was PRODUCTION_
+    # ACTIVE -- this had no legal path back to PAPER at all.
+    code = main(_mode_argv(mode_path, audit_path, "PAPER"))
+    assert code == 0
+    assert ModeStore(mode_path).current() == "PAPER"
+
+
+def test_advance_mode_resuming_to_the_wrong_mode_from_paused_is_refused(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    main(_mode_argv(mode_path, audit_path, "PAPER"))
+    main(_mode_argv(mode_path, audit_path, "PAUSED"))
+
+    code = main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    assert code == 1
+    assert ModeStore(mode_path).current() == "PAUSED"   # unchanged
+
+
+def test_advance_mode_bypass_via_paused_to_production_active_is_closed(tmp_path):
+    """The independently-discovered, more serious half of this fix: a
+    fresh DISABLED install could previously reach PRODUCTION_ACTIVE in two
+    confirmed-but-unconditional hops via PAUSED, without ever running in
+    RESEARCH or PAPER. Closed: paused_from="DISABLED" refuses the second
+    hop, confirmed or not."""
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    assert main(_mode_argv(mode_path, audit_path, "PAUSED")) == 0   # from DISABLED
+    assert ModeStore(mode_path).paused_from() == "DISABLED"
+
+    code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
+    assert code == 1
+    assert ModeStore(mode_path).current() == "PAUSED"
+
+
+def test_advance_mode_resume_to_production_active_still_requires_confirmed(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    main(_mode_argv(mode_path, audit_path, "PAPER"))
+    main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
+    main(_mode_argv(mode_path, audit_path, "PAUSED"))
+    assert ModeStore(mode_path).paused_from() == "PRODUCTION_ACTIVE"
+
+    code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=False))
+    assert code == 1
+    assert ModeStore(mode_path).current() == "PAUSED"
+
+    code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
+    assert code == 0
+    assert ModeStore(mode_path).current() == "PRODUCTION_ACTIVE"

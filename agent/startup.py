@@ -406,12 +406,21 @@ def _halt(mode_store: ModeStore, audit_log: AuditLog, *, persisted_mode: str | N
     row is never written before the fact it claims is true. Always appends
     a `startup_halted` row recording why, whether or not a transition also
     occurred. Never called for a broken chain -- that path raises before
-    this and writes nothing at all."""
+    this and writes nothing at all.
+
+    Records `paused_from=persisted_mode` (normalized: `None` -> "DISABLED",
+    §9.2 topology fix) -- the mode the system was ACTUALLY running in
+    before this halt, never the mode a failed startup attempt was
+    targeting. See agent/mode.py's own module docstring for why this is
+    the fix for PAUSED being a dead end, and for the independently-
+    discovered escalation-bypass it also closes."""
     if persisted_mode != "PAUSED":
-        mode_store.write("PAUSED", changed_at=now, reason=reason)
+        paused_from = mode_fsm.normalize_persisted(persisted_mode)
+        mode_store.write("PAUSED", changed_at=now, reason=reason, paused_from=paused_from)
         audit_log.append(actor="system", action="mode_transition",
                          object_type="mode", object_id="system",
-                         before={"mode": persisted_mode}, after={"mode": "PAUSED"},
+                         before={"mode": persisted_mode},
+                         after={"mode": "PAUSED", "paused_from": paused_from},
                          correlation_id=correlation_id, timestamp=now)
     audit_log.append(actor="system", action="startup_halted",
                      object_type="startup", object_id="system",
@@ -441,8 +450,13 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
 
     # -- preconditions: pure checks, no side effects, run before either the
     #    audit log or any account is touched (see DECISION 1's last part).
+    # `paused_from` only matters (and is only read) when persisted_mode is
+    # actually "PAUSED" -- see agent/mode.py's own module docstring for why
+    # PAUSED's legal exits are {DISABLED, paused_from}, not chain adjacency.
+    paused_from = mode_store.paused_from() if persisted_mode == "PAUSED" else None
     try:
-        mode_fsm.assert_legal_startup(persisted_mode, target_mode, confirmed=confirmed)
+        mode_fsm.assert_legal_startup(persisted_mode, target_mode, confirmed=confirmed,
+                                      paused_from=paused_from)
     except mode_fsm.ModeTransitionError as exc:
         _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=str(exc),
              now=now, correlation_id=correlation_id)
@@ -541,6 +555,7 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
             mode_store.write(
                 "PAUSED", changed_at=now,
                 reason="audit hash chain failed verification at startup (§8.1)",
+                paused_from=mode_fsm.normalize_persisted(persisted_mode),
             )
         raise AuditChainBroken(
             "audit hash chain failed verification at startup (§8.1); "
@@ -580,10 +595,19 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
     #    is a legal *step* but not a change, so nothing is written here for
     #    it -- mode_store's history stays a record of real transitions.
     if target_mode != persisted_mode:
-        mode_store.write(target_mode, changed_at=now)
+        # PAUSED can also be entered deliberately here (an operator sets
+        # mode: PAUSED in config and runs the loop), not only via _halt's
+        # failure path -- it must record paused_from too, for the same
+        # reason (agent/mode.py's own module docstring).
+        entering_paused = target_mode == "PAUSED"
+        write_paused_from = mode_fsm.normalize_persisted(persisted_mode) if entering_paused else None
+        mode_store.write(target_mode, changed_at=now, paused_from=write_paused_from)
+        after = {"mode": target_mode}
+        if entering_paused:
+            after["paused_from"] = write_paused_from
         audit_log.append(actor="system", action="mode_transition",
                          object_type="mode", object_id="system",
-                         before={"mode": persisted_mode}, after={"mode": target_mode},
+                         before={"mode": persisted_mode}, after=after,
                          correlation_id=correlation_id, timestamp=now)
 
     # -- ready to resume (DECISION 4: resume itself is not built here).

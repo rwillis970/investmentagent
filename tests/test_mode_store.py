@@ -95,6 +95,57 @@ def test_survives_being_reloaded_from_disk(tmp_path):
     assert modes_and_reasons == [("RESEARCH", None), ("PAPER", "promoted")]
 
 
+def test_paused_from_defaults_to_none():
+    store = ModeStore()
+    c = store.write("PAPER", changed_at=T0)
+    assert c.paused_from is None
+    assert store.paused_from() is None
+
+
+def test_write_records_paused_from_on_a_paused_row():
+    store = ModeStore()
+    store.write("PAPER", changed_at=T0)
+    c = store.write("PAUSED", changed_at=T0 + timedelta(minutes=1), paused_from="PAPER")
+    assert c.paused_from == "PAPER"
+    assert store.paused_from() == "PAPER"
+
+
+def test_paused_from_reflects_only_the_latest_history_entry():
+    """Once resumed, paused_from() must go back to None -- it answers "what
+    was the CURRENT pause paused from", not "the last time this store was
+    ever paused"."""
+    store = ModeStore()
+    store.write("PAPER", changed_at=T0)
+    store.write("PAUSED", changed_at=T0 + timedelta(minutes=1), paused_from="PAPER")
+    store.write("PAPER", changed_at=T0 + timedelta(minutes=2))   # resumed
+    assert store.current() == "PAPER"
+    assert store.paused_from() is None
+
+
+def test_paused_from_survives_being_reloaded_from_disk(tmp_path):
+    path = tmp_path / "mode_state.jsonl"
+    first = ModeStore(path=path)
+    first.write("RESEARCH", changed_at=T0)
+    first.write("PAUSED", changed_at=T0 + timedelta(minutes=1), paused_from="RESEARCH")
+
+    second = ModeStore(path=path)
+    assert second.current() == "PAUSED"
+    assert second.paused_from() == "RESEARCH"
+
+
+def test_a_pre_existing_row_with_no_paused_from_column_decodes_as_none(tmp_path):
+    """Backward compatibility: a mode_state.jsonl written before this fix
+    shipped has no paused_from key on any line at all."""
+    path = tmp_path / "mode_state.jsonl"
+    path.write_text(
+        '{"seq": 1, "mode": "PAUSED", "changed_at": "2026-07-20T15:00:00+00:00", '
+        '"reason": "old halt"}\n'
+    )
+    store = ModeStore(path=path)
+    assert store.current() == "PAUSED"
+    assert store.paused_from() is None
+
+
 def test_a_reloaded_store_continues_the_same_seq_sequence(tmp_path):
     path = tmp_path / "mode_state.jsonl"
     first = ModeStore(path=path)

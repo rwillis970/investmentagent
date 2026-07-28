@@ -1,1 +1,0 @@
-{"exc_type": "AlpacaError", "message": "alpaca_paper is bound to mode='PAPER', but was given a secrets_provider bound to mode='RESEARCH'. This is exactly the mismatch structural isolation exists to catch at construction, before a single request is made.", "first_at": "2026-07-28T13:55:12.513830+00:00", "last_at": "2026-07-28T13:55:12.513830+00:00", "consecutive_count": 1}

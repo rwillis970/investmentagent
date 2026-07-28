@@ -841,32 +841,90 @@ reads it.
 
 ### 9.2 Mode transitions
 
-Mode is not a free-text field and membership validation is not sufficient. The legal
-transitions are:
+Mode is not a free-text field and membership validation is not sufficient. This is NOT a
+single linear chain — that shape was tried, found to be wrong, and replaced (see the
+TOPOLOGY CORRECTION below for why). There are two distinct pieces: an escalation ORDERING
+of four modes, and PAUSED, which sits outside that ordering entirely.
+
+**The escalation ordering.** Four modes, one step at a time:
 
 ```
-DISABLED  ⇄  RESEARCH  ⇄  PAPER  ⇄  PRODUCTION_ACTIVE  ⇄  PAUSED
+DISABLED  ⇄  RESEARCH  ⇄  PAPER  ⇄  PRODUCTION_ACTIVE
 ```
 
-Forward movement is one step at a time and requires re-authentication and explicit
-confirmation at both edges landing on PRODUCTION_ACTIVE — from PAPER, and from PAUSED.
-Resuming into live trading after a pause is not exempt from the same re-authentication the
-initial promotion requires. Any transition to DISABLED or PAUSED is immediate and
-unconditional, from any state — entering PAUSED itself carries no confirmation requirement;
-only the way back out of it into PRODUCTION_ACTIVE does. Loading a config that names a mode more than
+Forward movement is one step at a time. DISABLED is reachable immediately and
+unconditionally from any state. PAPER → PRODUCTION_ACTIVE additionally requires
+re-authentication and explicit confirmation. Loading a config that names a mode more than
 one step ahead of the persisted current mode is a startup error, not a silent adoption —
 otherwise "DISABLED to PRODUCTION_ACTIVE in one step is impossible" (§12 criterion 3, and
 the Day-1 exit criterion in §11) is enforced by nothing.
 
-This check is enforced in exactly one place: `agent.startup.run_startup`, reading the
-persisted mode from `agent.mode_store.ModeStore` — the durable, append-only, separate-file
-store described in §7.2's immutable boundary. `agent.config.load` validates only that a
-mode name is a known mode; it does not read `ModeStore` and does not check transition
-legality, deliberately — a config loader independently re-deriving "the mode the system was
-last in" would be a second reader of one durable value, free to be called with a stale or
-simply wrong persisted mode. `run_startup` is the sole code path real orders ever flow
-through (§1's one-code-path invariant), so it is the sole enforcer of this rule, backed by
-the one store that actually persists it.
+**PAUSED is not a fifth rung on that ladder.** It is an emergency-stop OVERLAY, reachable
+immediately and unconditionally from every one of the four modes above (and from itself),
+because a kill switch must never be blocked by the same state machine it exists to
+override. Entering it carries no confirmation requirement. Leaving it is defined as
+returning to the SPECIFIC mode the system was persisted in immediately before the pause —
+recorded at the moment PAUSED is entered, never derived from "the next mode in some
+ordering" — or to DISABLED, the universal full reset. Resuming into PRODUCTION_ACTIVE
+specifically still requires the same re-authentication and explicit confirmation the
+initial promotion does; resuming into anything else requires neither.
+
+**TOPOLOGY CORRECTION (real gap found running the loop for the first time).** An earlier
+version of this section modeled PAUSED as the last element of a single five-mode tuple
+`DISABLED ⇄ RESEARCH ⇄ PAPER ⇄ PRODUCTION_ACTIVE ⇄ PAUSED`, with legality derived from
+plain index adjacency. That shape is wrong for a mode reachable from everywhere, for two
+independent reasons:
+
+1. **Dead end.** PAUSED's only index-adjacent neighbour was PRODUCTION_ACTIVE. A system
+   paused from DISABLED, RESEARCH, or PAPER had no legal one-step path back to where it
+   actually was — only DISABLED (discarding all memory of the prior mode and forcing a
+   full re-climb) or PRODUCTION_ACTIVE (gated by confirmation and, separately, a live
+   adapter that does not exist yet). A single failed first startup left no way back to
+   operating short of hand-editing the durable mode store — defeating the entire point
+   of persisting it.
+2. **Escalation bypass (found while designing the fix for #1, independently more
+   serious).** Because entering PAUSED is unconditional from anywhere, and PAUSED →
+   PRODUCTION_ACTIVE was "legal" (index-adjacent) regardless of what mode PAUSED was
+   actually entered from, the old shape permitted DISABLED → PAUSED (one unconditional
+   hop) → PRODUCTION_ACTIVE (one hop, merely confirmed) as a two-hop path to live trading
+   from an install that had never actually operated in RESEARCH or PAPER — silently
+   defeating the one-step escalation rule this whole section exists to enforce. This was
+   not exploitable end-to-end only because no live adapter exists yet (§11 Day 10) — an
+   accidental mitigation elsewhere, not a property of the mode state machine itself.
+
+The fix: PAUSED is removed from the escalation ordering entirely and modeled as its own
+case, per the two paragraphs above. `agent.mode_store.ModeChange` records `paused_from` on
+any row transitioning into PAUSED — whether via a failed startup (`agent.startup._halt`) or
+a deliberate one (an operator setting `mode: PAUSED`, or the `--advance-mode-to PAUSED`
+operator command below) — and `agent.mode.is_legal_step`/`assert_legal_startup` accept it
+as an explicit parameter, since these are pure functions with no store access of their own.
+An unsupplied or unknown `paused_from` allows nothing but DISABLED — default deny, matching
+this plan's other fail-safe-on-uncertainty gates (Appendix E: "an unlisted value is
+DISABLED").
+
+**Enforcement.** This check is enforced in exactly one place: `agent.startup.run_startup`,
+reading the persisted mode (and, when it is PAUSED, the recorded `paused_from`) from
+`agent.mode_store.ModeStore` — the durable, append-only, separate-file store described in
+§7.2's immutable boundary. `agent.config.load` validates only that a mode name is a known
+value (`agent.mode.MODES`, all five — PAUSED included, even though it is not a member of
+the four-mode escalation ordering `agent.mode.CHAIN`); it does not read `ModeStore` and does
+not check transition legality, deliberately — a config loader independently re-deriving "the
+mode the system was last in" would be a second reader of one durable value, free to be
+called with a stale or simply wrong persisted mode. `run_startup` is the sole code path real
+orders ever flow through (§1's one-code-path invariant), so it is the sole enforcer of this
+rule, backed by the one store that actually persists it.
+
+**Operator path around a fresh-install dead end.** `scripts/run_agent.py --advance-mode-to
+MODE` advances the persisted mode one legal step — including resuming out of PAUSED — with
+no broker adapter, no account, and no reconciliation constructed at all, exactly the same
+`assert_legal_startup`/`ModeStore` path `run_startup` itself uses. This exists because the
+real scheduled loop constructs a broker adapter for every configured account unconditionally,
+before `run_startup` ever runs — so setting `mode: RESEARCH` in config to legally take the
+first escalation step does not work: the adapter is hardcoded to PAPER and refuses a
+RESEARCH-bound secrets provider before `run_startup` gets a chance to run at all. The same
+structural gap affects PAPER → PRODUCTION_ACTIVE for a more fundamental reason: no live
+adapter exists in this codebase yet (§11 Day 10), so nothing can operate in that mode
+regardless of how the persisted value is reached.
 
 ---
 
@@ -1380,3 +1438,4 @@ plus a versioned `CapabilityChangeRequest` per §5.
 | v1.1 add | §6 states that the profile table is a preset table — `risk_profile` must drive the defaults and reject contradictory overrides, not sit unread beside independent fields. |
 | v1.1 confirm | §4.1 records a real-account finding (§13 probe, 2026-07-27): Alpaca's cash-account API has no settled/unsettled cash field anywhere. `lot.settled` and cash-account free-riding protection can only be enforced from a local ledger's own T+1 expectation, never from broker-reported state. Settled-cash reconciliation (exact equality, Option A) is unaffected — it checks that two cash *totals* agree, not which lots are settled. The local ledger itself remains unbuilt. |
 | v1.1 confirm | §4.1 records a second confirmed finding (2026-07-27, `agent/lot_selection.py`): an internal `lot_id` does not control which lot Alpaca actually disposes of. Alpaca's own documentation (not the Customer Agreement, which names no method) confirms Compressed FIFO for end-of-day positions, Weighted Average intraday, and no API-level lot designation. `sellable_qty` was evaluating hold-eligibility per lot in isolation, which could believe a seasoned lot was sold while the broker's FIFO order actually disposed of a fresh one — fixed to walk lots in broker-actual disposal order and block on the first ineligible FIFO predecessor, no override path. `Ledger.disposal_records()` now records intended-vs-broker-actual lot per SELL fill. |
+| v1.1 fix | §9.2 topology corrected (real gap found running the loop for the first time): PAUSED was modeled as the last element of a single five-mode chain, making it a dead end (no legal one-step path back to a mode paused from DISABLED, RESEARCH, or PAPER) and — independently, more seriously — permitting DISABLED → PAUSED → PRODUCTION_ACTIVE as an unintended two-hop bypass of the one-step escalation rule. PAUSED is now modeled as an overlay outside the four-mode escalation ordering, recording the specific mode it was paused from (`paused_from`) and requiring confirmation on resume only when that mode is PRODUCTION_ACTIVE. See §9.2 for the full correction. |

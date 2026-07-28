@@ -128,6 +128,15 @@ def test_mode_membership_is_still_checked_here_transition_legality_is_not():
     assert cfg.mode == "PRODUCTION_ACTIVE"
 
 
+def test_paused_is_still_a_valid_config_mode_value():
+    """Regression guard for the §9.2 topology fix: PAUSED left agent.mode.
+    CHAIN (the four-mode escalation ordering) but remains a real, valid
+    mode value -- MODES must bind to agent.mode.MODES (all five), not
+    agent.mode.CHAIN, or this silently stops accepting it."""
+    cfg = C.load(base(mode="PAUSED"))
+    assert cfg.mode == "PAUSED"
+
+
 def test_example_config_carries_materiality_defaults():
     """§3.2, §9.1: the keys are added in the same commit that reads them,
     and the example still loads verbatim."""
