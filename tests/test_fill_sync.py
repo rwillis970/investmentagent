@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from agent.money import to_decimal
+
 from agent.accounts import CrossAccountError
 from agent.audit import AuditLog
 from agent.broker.base import (AccountSnapshot, BrokerAdapter, BrokerOrder,
@@ -78,7 +80,8 @@ def execution(execution_id="e1", account_id=ACCT, client_order_id="c1",
              filled_at=T0):
     return Execution(execution_id=execution_id, account_id=account_id,
                      client_order_id=client_order_id, symbol=symbol, side=side,
-                     qty=qty, price=price, cum_qty=cum_qty, filled_at=filled_at)
+                     qty=to_decimal(qty), price=to_decimal(price),
+                     cum_qty=to_decimal(cum_qty), filled_at=filled_at)
 
 
 def registry():
@@ -304,7 +307,7 @@ def test_multiple_partial_buy_increments_each_become_their_own_lot(tmp_path):
     second = sync_fills(b, s, now=T0 + timedelta(minutes=5), quarantine=q, audit_log=AuditLog())
     assert len(second) == 1
     assert second[0].lot_id == "e2"
-    assert second[0].qty == 0.6   # the increment's own qty, not cumulative
+    assert second[0].qty == to_decimal(0.6)   # the increment's own qty, not cumulative
 
     _, fills, _ = s.load()
     assert {f.fill_id for f in fills} == {"e1", "e2"}

@@ -582,8 +582,12 @@ def test_reconcile_account_audit_row_records_all_four_dimensions():
                accounts=[acct], approval_service=approval_service(), now=NOW)
 
     ev = next(e for e in log.events if e.action == "reconcile_account")
-    assert ev.after["positions"] == {"SPY": 2.0}
-    assert ev.after["settled_cash"] == 500.0
+    # str, not a raw Decimal: agent.audit.AuditLog._assert_json_native
+    # rejects Decimal by design (2026-07-28 Decimal migration --
+    # agent/startup.py's reconcile_account audit row stringifies
+    # positions/settled_cash before they reach the audit log).
+    assert ev.after["positions"] == {"SPY": "2.0"}
+    assert ev.after["settled_cash"] == "500.0"
     assert ev.after["open_order_ids"] == ["c1"]
 
 

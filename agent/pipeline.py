@@ -294,7 +294,17 @@ class Gatekeeper:
             check_qty = qty if side_u == "SELL" else broker_position_qty
             if check_qty is None:
                 raise Rejected("holding", "no quantity to check against the holding policy")
-            available = sellable_qty(lots, self.account_id, symbol, now)
+            # `sellable_qty` (agent/holding.py) now returns Decimal (2026-07-28
+            # Decimal migration); `check_qty`/`qty` here are StagedOrder's own
+            # float fields, deliberately left float (out of that migration's
+            # named scope -- StagedOrder is signed/hashed, not money-exact
+            # reconciliation). float() at this one boundary is the same
+            # pattern already used at agent/broker/simulator.py's StagedOrder
+            # boundary, just in the other direction; the epsilon tolerance
+            # below is pipeline.py's own pre-existing float-rounding
+            # allowance for a caller-supplied qty and is unrelated to (and
+            # unaffected by) the exact-equality reconciliation invariant.
+            available = float(sellable_qty(lots, self.account_id, symbol, now))
             if check_qty > available + 1e-9:
                 raise Rejected(
                     "holding",

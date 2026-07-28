@@ -155,17 +155,29 @@ before proceeding, so the sequencing is already correct; only the wiring
 from a real `Ledger` into that loop does not exist yet (see the ledger
 unit's own delivery report for why that wiring -- "the orchestrator" --
 remains out of scope here too).
+
+DECIMAL ON DISK, NOT FLOAT (real-account finding, 2026-07-28: see
+agent/ledger.py's own module docstring for the full reasoning). `Fill.qty`/
+`.price` and `opening_settled_cash` are `decimal.Decimal`, which is not
+JSON-native -- `json.dumps` raises on one directly. `_encode_fill`/
+`write_opening_balance` therefore write them as `str(...)` (exact --
+`Decimal(str(d)) == d` for any `Decimal`), and `_decode_fill`/`_load_into`
+parse them back via `agent.money.to_decimal`, never a bare `float(...)`.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import asdict
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from .holding import HoldingPolicyRegistry
 from .ledger import Fill, Ledger, OrderRecord
 from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy
+from .money import to_decimal
+
+_ZERO = Decimal("0")
 
 
 class LedgerStoreError(Exception):
@@ -191,19 +203,19 @@ class LedgerStore:
         self._policy_registry = policy_registry
         self._t_plus = t_plus
         self._lot_selection_policy = lot_selection_policy
-        self._opening: float | None = None
+        self._opening: Decimal | None = None
         # The validating Ledger's own opening_settled_cash is a PLACEHOLDER
         # -- never read, never exposed. It exists purely so record_fill/
         # record_order_status's existing validation logic can be reused
         # as-is rather than re-implemented here. The REAL opening balance
         # (self._opening) is tracked separately, alongside it.
-        self._ledger = Ledger(account_id=account_id, opening_settled_cash=0.0,
+        self._ledger = Ledger(account_id=account_id, opening_settled_cash=_ZERO,
                               policy_registry=policy_registry, t_plus=t_plus,
                               lot_selection_policy=lot_selection_policy)
         if self._path.exists():
             self._load_into(self._ledger)
 
-    def write_opening_balance(self, amount: float, *, at: datetime) -> None:
+    def write_opening_balance(self, amount: Decimal, *, at: datetime) -> None:
         """Written exactly once, and only BEFORE any fill exists on this
         ledger -- see module docstring's REVIEW FIX (orchestrator unit,
         Commit 1) for why. A broker read taken to seed this value already
@@ -213,6 +225,10 @@ class LedgerStore:
         it."""
         if at.tzinfo is None:
             raise LedgerStoreError("at must be a timezone-aware datetime")
+        # Lenient at this one boundary (a caller may still hand in a plain
+        # int/str/float) -- see agent/money.py for why a float is routed
+        # through str() first, never Decimal(a_float) directly.
+        amount = to_decimal(amount)
         if self._opening is None and self._ledger.fills:
             raise LedgerStoreError(
                 f"refusing to seed opening_settled_cash: {len(self._ledger.fills)} "
@@ -231,7 +247,8 @@ class LedgerStore:
                 f"refusing to overwrite with {amount!r} -- it is written exactly once, "
                 "never re-derived from a later broker read (see module docstring)"
             )
-        self._append_row({"kind": "opening_balance", "amount": amount, "at": at.isoformat()})
+        self._append_row({"kind": "opening_balance", "amount": str(amount),
+                         "at": at.isoformat()})
         self._opening = amount
 
     def write_fill(self, fill: Fill) -> None:
@@ -251,7 +268,7 @@ class LedgerStore:
         self._ledger.record_order_status(record)   # raises before anything is persisted
         self._append_row(dict(kind="order_record", **_encode_order_record(record)))
 
-    def load(self) -> tuple[float | None, tuple[Fill, ...], tuple[OrderRecord, ...]]:
+    def load(self) -> tuple[Decimal | None, tuple[Fill, ...], tuple[OrderRecord, ...]]:
         return self._opening, self._ledger.fills, self._ledger.order_records
 
     def to_ledger(self) -> Ledger:
@@ -307,7 +324,7 @@ class LedgerStore:
             row = json.loads(line)
             kind = row.get("kind")
             if kind == "opening_balance":
-                self._opening = row["amount"]
+                self._opening = to_decimal(row["amount"])
             elif kind == "fill":
                 ledger.record_fill(_decode_fill(row))
             elif kind == "order_record":
@@ -321,6 +338,10 @@ class LedgerStore:
 
 def _encode_fill(f: Fill) -> dict:
     d = asdict(f)
+    # Decimal is not JSON-native -- str() round-trips exactly
+    # (Decimal(str(d)) == d for any Decimal). See agent/money.py.
+    d["qty"] = str(f.qty)
+    d["price"] = str(f.price)
     d["filled_at"] = f.filled_at.isoformat()
     return d
 
@@ -328,7 +349,7 @@ def _encode_fill(f: Fill) -> dict:
 def _decode_fill(d: dict) -> Fill:
     return Fill(
         fill_id=d["fill_id"], account_id=d["account_id"], symbol=d["symbol"],
-        side=d["side"], qty=d["qty"], price=d["price"],
+        side=d["side"], qty=to_decimal(d["qty"]), price=to_decimal(d["price"]),
         filled_at=datetime.fromisoformat(d["filled_at"]), lot_id=d["lot_id"],
         holding_policy_version=d.get("holding_policy_version"),
     )

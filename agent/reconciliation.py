@@ -30,29 +30,32 @@ verify that the CALLER wired the right local guard object to the right
 label (a bare `int` has no account_id of its own to check against); here,
 the broker's own data is checked directly.
 
-SETTLED CASH: EXACT EQUALITY, NOT A TOLERANCE. This codebase represents
-dollar values as plain floats throughout (`PortfolioState.settled_cash`,
-`AccountSnapshot.settled_cash`) with no fixed-point/Decimal type to
-introduce representational drift between two otherwise-agreeing reads.
-There is also, today, no local ledger computing a settled-cash figure
-through its own independent arithmetic (summing fills, say) that could
-accumulate float error against the broker's number -- the only thing
-"local settled cash" can mean right now is a previously observed or
-expected figure, compared against a fresh broker read of literally the
-same kind of value. Any difference between the two is real information (a
-fill, a dividend, a fee the local side doesn't know about yet), not
-representational noise, and belongs on the same footing as
-`DayTradeGuard.reconcile`'s own exact `!=` comparison for day-trade counts
--- never averaged over with an invented cents-or-percentage tolerance. If a
-real local cash ledger with its own arithmetic is ever built, this
-decision should be revisited against a measured error budget then, not
-guessed at now.
+SETTLED CASH: EXACT EQUALITY, NOT A TOLERANCE -- REVISITED FOR REAL, PER
+THIS SECTION'S OWN "IF A REAL LOCAL CASH LEDGER IS EVER BUILT" CLAUSE
+(real-account finding, 2026-07-28). That local ledger now exists
+(`agent.ledger.Ledger`), and it did exactly what this section predicted: a
+fractional-share fill (0.027087234 shares) produced a local settled-cash
+figure that disagreed with the broker's own at the fifteenth decimal place
+-- pure binary-`float` representational noise, not a real discrepancy,
+tripping this exact-equality check on a false positive. The chosen fix,
+per that finding's own report, is NOT a tolerance (which would reopen "what
+magnitude counts as real," precisely the ambiguity this exact-equality
+design was chosen to avoid) -- it is removing `float` from this comparison
+entirely. `local_settled_cash` and `AccountSnapshot.settled_cash` are now
+both `decimal.Decimal` (see agent/money.py for why `Decimal`, not integer
+minor units, and agent/broker/alpaca.py for why parsing Alpaca's own
+decimal-string response into `Decimal` is a lossless re-parse, not an
+approximation). Two exact `Decimal` values either agree exactly or they
+don't -- there is no representational drift left for an equality check to
+misfire on, so EXACT EQUALITY, THE ORIGINAL DESIGN, IS UNCHANGED: this
+function's own logic below has not changed at all, only the type flowing
+through it. Any remaining disagreement is real information (a fill, a
+dividend, a fee the local side doesn't know about yet) exactly as this
+section always intended.
 
-POSITIONS: same reasoning, exact equality per symbol. A position's quantity
-is either a whole share count or an explicitly-entered fractional quantity
-(§1.2: Alpaca's fractional-share support) -- not the output of repeated
-float arithmetic anywhere in this codebase today, so there is nothing for a
-tolerance to forgive that would not also be forgiving a real missed fill.
+POSITIONS: same reasoning, exact equality per symbol, same fix -- a
+position's quantity (`local_positions`/`Position.qty`) is now `Decimal`
+too, for the same reason.
 
 OPEN ORDERS: not a numeric comparison at all -- a set-membership check on
 `client_order_id`. `broker_open_orders` is expected to already be filtered
@@ -62,6 +65,8 @@ in a filled or cancelled order as if it were "open" gets exactly the
 mismatch that contract violation deserves.
 """
 from __future__ import annotations
+
+from decimal import Decimal
 
 from .accounts import CrossAccountError
 from .broker.base import AccountSnapshot, BrokerOrder, Position
@@ -74,7 +79,7 @@ class ReconciliationMismatch(Exception):
     `PostureMismatch` for day-trade counts."""
 
 
-def reconcile_settled_cash(*, account_id: str, local_settled_cash: float,
+def reconcile_settled_cash(*, account_id: str, local_settled_cash: Decimal,
                           broker_account: AccountSnapshot) -> None:
     """Exact equality -- see module docstring for why no tolerance is
     used."""
@@ -90,7 +95,7 @@ def reconcile_settled_cash(*, account_id: str, local_settled_cash: float,
         )
 
 
-def reconcile_positions(*, account_id: str, local_positions: dict[str, float],
+def reconcile_positions(*, account_id: str, local_positions: dict[str, Decimal],
                         broker_positions: list[Position]) -> None:
     """`local_positions` is a plain symbol -> qty mapping. `broker_positions`
     is `BrokerAdapter.positions()`'s own return value, kept as real

@@ -84,10 +84,12 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from .accounts import CrossAccountError
 from .broker.base import Execution
+from .money import to_decimal
 
 PENDING, ADMITTED, REJECTED = "PENDING", "ADMITTED", "REJECTED"
 _DECISIONS = (ADMITTED, REJECTED)
@@ -106,8 +108,8 @@ class QuarantinedExecution:
     client_order_id: str
     symbol: str
     side: str
-    qty: float
-    price: float
+    qty: Decimal
+    price: Decimal
     filled_at: datetime
     reason: str
     quarantined_at: datetime
@@ -311,6 +313,12 @@ class ExecutionQuarantineStore:
 
 def _encode_quarantined(record: QuarantinedExecution) -> dict:
     d = asdict(record)
+    # Decimal is not JSON-native (json.dumps raises TypeError on one
+    # directly) -- str() round-trips exactly (Decimal(str(d)) == d for any
+    # Decimal), the same discipline agent/ledger_store.py's _encode_fill
+    # follows for Fill.qty/price.
+    d["qty"] = str(record.qty)
+    d["price"] = str(record.price)
     d["filled_at"] = record.filled_at.isoformat()
     d["quarantined_at"] = record.quarantined_at.isoformat()
     return d
@@ -320,8 +328,8 @@ def _decode_execution(row: dict) -> Execution:
     return Execution(
         execution_id=row["execution_id"], account_id=row["account_id"],
         client_order_id=row["client_order_id"], symbol=row["symbol"],
-        side=row["side"], qty=row["qty"], price=row["price"],
-        cum_qty=row["qty"], filled_at=datetime.fromisoformat(row["filled_at"]),
+        side=row["side"], qty=to_decimal(row["qty"]), price=to_decimal(row["price"]),
+        cum_qty=to_decimal(row["qty"]), filled_at=datetime.fromisoformat(row["filled_at"]),
     )
 
 

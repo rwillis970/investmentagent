@@ -16,6 +16,7 @@ import pytest
 from agent.accounts import AccountType
 from agent.daytrade import DayTradeGuard
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+from agent.money import to_decimal
 from agent.pipeline import Gatekeeper, Rejected, StagedOrder
 from agent.policy import initial_policy
 from agent.risk import PortfolioState, RiskPolicy
@@ -55,8 +56,8 @@ def stage(gk=None, **over):
 
 
 def lots(reg, version, opened=T0, settles=None, qty=1.0):
-    return [reg.make_lot(lot_id="l1", account_id=ACCT, symbol="SPY", qty=qty,
-                         cost_basis=100.0, opened_at=opened, policy_version=version,
+    return [reg.make_lot(lot_id="l1", account_id=ACCT, symbol="SPY", qty=to_decimal(qty),
+                         cost_basis=to_decimal(100.0), opened_at=opened, policy_version=version,
                          settles_at=settles)]
 
 

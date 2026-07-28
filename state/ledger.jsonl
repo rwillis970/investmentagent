@@ -1,1 +1,2 @@
 {"kind": "opening_balance", "amount": 500.0, "at": "2026-07-28T13:51:00.270285+00:00"}
+{"kind": "fill", "fill_id": "20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346", "account_id": "98b34e82-04fc-4e19-ab3b-99ee312c8478", "symbol": "SPY", "side": "BUY", "qty": 0.027087234, "price": 737.986, "filled_at": "2026-07-28T14:42:51.412408+00:00", "lot_id": "20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346", "holding_policy_version": "config"}

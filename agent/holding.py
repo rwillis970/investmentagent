@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 
 from .durations import parse_duration
@@ -68,8 +69,8 @@ class HoldingPolicyRegistry:
                 "a duration for an existing lot"
             ) from exc
 
-    def make_lot(self, *, lot_id: str, account_id: str, symbol: str, qty: float,
-                 cost_basis: float, opened_at: datetime, policy_version: str,
+    def make_lot(self, *, lot_id: str, account_id: str, symbol: str, qty: Decimal,
+                 cost_basis: Decimal, opened_at: datetime, policy_version: str,
                  settles_at: datetime | None = None) -> "Lot":
         policy = self.get(policy_version)
         return Lot(lot_id=lot_id, account_id=account_id, symbol=symbol, qty=qty,
@@ -107,8 +108,8 @@ class Lot:
     lot_id: str
     account_id: str                # required: a lot belongs to one account
     symbol: str
-    qty: float
-    cost_basis: float
+    qty: Decimal
+    cost_basis: Decimal
     opened_at: datetime           # the FILL timestamp, never order submit
     minimum_hold: timedelta       # frozen at fill
     holding_policy_version: str
@@ -153,7 +154,7 @@ def open_lots(lots, account_id: str, symbol: str | None = None):
 
 def sellable_qty(lots, account_id: str, symbol: str, now: datetime, *,
                  lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY
-                 ) -> float:
+                 ) -> Decimal:
     """Quantity a normal strategy exit may sell right now, for THIS account.
 
     REVIEW FIX (Commit 5): an internal `lot_id` does not control which lot
@@ -181,7 +182,7 @@ def sellable_qty(lots, account_id: str, symbol: str, now: datetime, *,
     here, uncaught -- a gate that falls back to a guessed ordering when it
     can't determine the real one is not a gate."""
     ordered = disposal_order(lot_selection_policy, open_lots(lots, account_id, symbol))
-    total = 0.0
+    total = Decimal("0")
     for l in ordered:
         if not (l.is_hold_eligible(now) and l.is_settled(now)):
             break
@@ -191,12 +192,12 @@ def sellable_qty(lots, account_id: str, symbol: str, now: datetime, *,
 
 def blocked_qty(lots, account_id: str, symbol: str, now: datetime, *,
                 lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY
-                ) -> float:
+                ) -> Decimal:
     """Everything open for this symbol that `sellable_qty` does not count --
     including lots that would look individually eligible but sit behind an
     ineligible FIFO predecessor (see `sellable_qty`'s docstring)."""
     ordered = open_lots(lots, account_id, symbol)
-    total_open = sum(l.qty for l in ordered)
+    total_open = sum((l.qty for l in ordered), start=Decimal("0"))
     return total_open - sellable_qty(lots, account_id, symbol, now,
                                      lot_selection_policy=lot_selection_policy)
 

@@ -32,6 +32,7 @@ from agent.ledger import (DuplicateFillError, Fill, LotOverdrawnError,
 from agent.ledger_store import LedgerStore, LedgerStoreError
 from agent.lot_selection import (ALPACA_DEFAULT_POLICY, LotSelectionMethod,
                                  LotSelectionPolicy)
+from agent.money import to_decimal
 
 ACCT = "acct-taxable"
 ACCT_B = "acct-ira"
@@ -49,8 +50,8 @@ def store(path=None, *, account_id=ACCT, reg=None, t_plus=1):
 
 def fill(fill_id="f1", account_id=ACCT, side="BUY", lot_id="l1", qty=1.0, price=100.0,
         at=T0, version="hp-v1"):
-    return Fill(fill_id=fill_id, account_id=account_id, symbol="SPY", side=side, qty=qty,
-               price=price, filled_at=at, lot_id=lot_id,
+    return Fill(fill_id=fill_id, account_id=account_id, symbol="SPY", side=side,
+               qty=to_decimal(qty), price=to_decimal(price), filled_at=at, lot_id=lot_id,
                holding_policy_version=version if side == "BUY" else None)
 
 

@@ -269,7 +269,7 @@ def _log_cycle(log: logging.Logger, *, now: datetime,
         log.info(
             "  account=%s new_fills=%d [%s] "
             "positions local=%s broker=%s "
-            "settled_cash local=%.2f broker=%.2f "
+            "settled_cash local=%s broker=%s "
             "open_orders local=%s broker=%s "
             "day_trades local=%d broker=%s",
             recon.account_id, len(fills), fill_summary,

@@ -189,8 +189,11 @@ def test_sync_fills_runs_before_reconciliation_so_a_real_fill_is_not_a_false_mis
     # This is what actually proves sync ran first: the halt comes from
     # reconcile_positions with real, both-sides-populated numbers, not from
     # sync_fills failing to run at all.
+    # `broker-reported positions` now carries a real Decimal qty (2026-07-28
+    # Decimal migration -- agent/broker/base.py's Position.qty), so the
+    # broker side's repr is `{'SPY': Decimal('1.0')}`, not `{'SPY': 1.0}`.
     from agent.reconciliation import ReconciliationMismatch
-    with pytest.raises(ReconciliationMismatch, match=r"\{'SPY': 1\.0\}"):
+    with pytest.raises(ReconciliationMismatch, match=r"\{'SPY': Decimal\('1\.0'\)\}"):
         run_cycle(
             accounts=[acct], adapter_factory=lambda a: b,
             mode_store=mode_store_at("PAPER", now=IN_SESSION),

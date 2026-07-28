@@ -312,6 +312,43 @@ this check; see that module's own docstring for why no tolerance is introduced).
 verifies the two *totals* agree — it says nothing about, and cannot say anything about,
 which individual lots are settled.
 
+**Confirmed against a real Alpaca paper account (2026-07-28): exact equality was right, but
+it must be exact `Decimal` equality, not exact binary-`float` equality.** Once the local
+ledger this section's earlier revision predicted (`agent.ledger.Ledger`) was actually built
+and run against a real fractional-share fill (0.027087234 shares), `reconcile_settled_cash`
+halted on `broker reports settled cash 480.01, local figure is 480.010000529276` — not a real
+discrepancy, but binary-`float` arithmetic's own representational noise on a fractional-share
+computation, surfacing at the fifteenth decimal place. The fix is not a tolerance (Option A's
+own reasoning against one stands unchanged — a tolerance reopens exactly the "what magnitude
+counts as real" question exact equality exists to avoid); it is removing `float` from the
+comparison entirely. Every money and share-quantity field this reaches — `AccountSnapshot`/
+`Position`/`Execution`/`BrokerOrder` (`agent/broker/base.py`, `agent/broker/alpaca.py`,
+`agent/broker/simulator.py`), `Fill`/`Lot`/`Ledger` (`agent/ledger.py`, `agent/holding.py`),
+`LedgerStore`/`ExecutionQuarantineStore`'s on-disk rows (`agent/ledger_store.py`,
+`agent/execution_quarantine.py`) — is now `decimal.Decimal`, constructed via the one shared
+coercion rule in `agent/money.py` (never `Decimal(a_float)` directly, which would just
+capture the float's own imprecision; always via `str()` first, or parsed directly from
+Alpaca's own decimal-string API response). Integer minor units (e.g. cents) were considered
+and rejected: the domain has no single natural scale — Alpaca prices carry three decimal
+digits, fractional-share quantities carry up to nine — so picking one fixed scale would
+reintroduce the same ambiguity a tolerance would. `reconcile_settled_cash`/
+`reconcile_positions`'s own comparison logic is *unchanged* by this fix: two exact `Decimal`
+values either agree exactly or they do not, so exact equality, the original design, still
+holds without modification — only the type flowing through it changed. `agent.audit.AuditLog`
+still rejects `Decimal` by design (`_assert_json_native`); the one call site that ever passed
+money into an audit payload (`agent.startup.run_startup`'s `reconcile_account` row) now
+stringifies it first. Two now-unnecessary `+ 1e-9` epsilon guards (one in
+`agent.ledger.Ledger.record_fill`'s overdraw check, one in
+`agent.broker.simulator.SimulatorBroker._submit_impl`'s cash/share-sufficiency checks) were
+removed outright rather than widened, since exact `Decimal` arithmetic never produces the
+binary rounding residue those guards existed to forgive. One boundary outside the money
+system proper still compares a `StagedOrder`'s own (deliberately unconverted) `float` qty
+against `agent.holding.sellable_qty`'s now-`Decimal` return (`agent/pipeline.py`'s holding
+gate) — resolved with a single `float()` conversion at that one call site, preserving
+`StagedOrder`'s existing float fields and its own pre-existing epsilon-tolerance semantics
+unchanged, since that tolerance is a caller-supplied-quantity allowance unrelated to (and
+untouched by) the settled-cash exact-equality invariant above.
+
 **Lot disposal order — an internal `lot_id` does not control which lot Alpaca actually
 sells (confirmed 2026-07-27, `agent/lot_selection.py`).** The `sellable_qty` formula above
 was originally evaluated per lot in isolation — summing whichever individual lots happened
@@ -1496,3 +1533,4 @@ plus a versioned `CapabilityChangeRequest` per §5.
 | v1.1 confirm | §4.1 records a second confirmed finding (2026-07-27, `agent/lot_selection.py`): an internal `lot_id` does not control which lot Alpaca actually disposes of. Alpaca's own documentation (not the Customer Agreement, which names no method) confirms Compressed FIFO for end-of-day positions, Weighted Average intraday, and no API-level lot designation. `sellable_qty` was evaluating hold-eligibility per lot in isolation, which could believe a seasoned lot was sold while the broker's FIFO order actually disposed of a fresh one — fixed to walk lots in broker-actual disposal order and block on the first ineligible FIFO predecessor, no override path. `Ledger.disposal_records()` now records intended-vs-broker-actual lot per SELL fill. |
 | v1.1 fix | §9.2 topology corrected (real gap found running the loop for the first time): PAUSED was modeled as the last element of a single five-mode chain, making it a dead end (no legal one-step path back to a mode paused from DISABLED, RESEARCH, or PAPER) and — independently, more seriously — permitting DISABLED → PAUSED → PRODUCTION_ACTIVE as an unintended two-hop bypass of the one-step escalation rule. PAUSED is now modeled as an overlay outside the four-mode escalation ordering, recording the specific mode it was paused from (`paused_from`) and requiring confirmation on resume only when that mode is PRODUCTION_ACTIVE. See §9.2 for the full correction. |
 | v1.1 fix | §4.1 records a real-account finding (2026-07-28): a manually-placed BUY in the broker's own dashboard has no staged `OrderRecord`, so `agent.fill_sync.sync_fills` correctly refused to guess its holding-policy version — but the refusal was fatal, halting the scheduled loop every cycle forever with no path forward. `agent.execution_quarantine.ExecutionQuarantineStore` now quarantines an execution with unresolved intent (a BUY missing `holding_policy_version`, or a SELL/CLOSE missing `lot_id`) instead of raising; the loop continues, and an operator resolves it via `scripts.run_agent --admit-execution`/`--reject-execution`, both recorded in the audit log. See §4.1 for the full reasoning, including why quarantine (not an auto-ingest default) was chosen for both sides uniformly, and how this interacts with the already-named CLOSE/multi-lot gap (§8.3). |
+| v1.1 fix | §4.1 records a real-account finding (2026-07-28): running the loop against a real fractional-share fill (0.027087234 shares) halted `reconcile_settled_cash` on binary-`float` representational noise at the fifteenth decimal place (`480.01` vs `480.010000529276`), not a real discrepancy — the exact-equality design (Option A) was right, but binary `float` cannot carry it exactly. Every money/quantity field reaching that comparison (`AccountSnapshot`, `Position`, `Execution`, `BrokerOrder`, `Fill`, `Lot`, and their on-disk rows in `LedgerStore`/`ExecutionQuarantineStore`) is now `decimal.Decimal`, via one shared coercion rule (`agent/money.py`); integer minor units were considered and rejected (no single natural scale across three-decimal prices and nine-decimal fractional-share quantities). The comparison logic itself is unchanged — exact equality still holds, only the type does not lie about itself anymore. See §4.1 for the full reasoning and `agent/money.py`'s own docstring for the coercion rule. |

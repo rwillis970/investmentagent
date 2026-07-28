@@ -17,6 +17,7 @@ to catch independently.
 """
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -29,6 +30,7 @@ from agent.broker.base import AccountSnapshot, BrokerAdapter, BrokerOrder
 from agent.cost import BudgetState, CostEntry, CostLedger
 from agent.daytrade import DayTradeGuard
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+from agent.money import to_decimal
 from agent.pipeline import Gatekeeper, StagedOrder, sign_staged_order
 from agent.policy import PolicyViolation, initial_policy
 from agent.risk import PortfolioState, RiskPolicy
@@ -75,8 +77,8 @@ def portfolio(nlv=500.0, settled_cash=500.0, **kw):
 
 
 def lot(qty, opened=T0):
-    return HOLD.make_lot(lot_id="l1", account_id=ACCT, symbol="SPY", qty=qty,
-                         cost_basis=500.0, opened_at=opened, policy_version="instant")
+    return HOLD.make_lot(lot_id="l1", account_id=ACCT, symbol="SPY", qty=to_decimal(qty),
+                         cost_basis=to_decimal(500.0), opened_at=opened, policy_version="instant")
 
 
 ORDER = dict(symbol="SPY", side="BUY", qty=0.2, order_type="LIMIT",
@@ -140,8 +142,12 @@ def test_fills_returns_one_execution_per_filled_order_with_a_stable_id():
     e = execs[0]
     assert e.execution_id == "sim::c1"
     assert e.client_order_id == "c1"
-    assert e.qty == 0.2
-    assert e.cum_qty == 0.2
+    # Decimal("0.2"), not the float literal 0.2: float(0.2) has no exact
+    # binary representation (it is really 0.200000000000000011...), so
+    # `Decimal("0.2") == 0.2` is False -- exactly the representational noise
+    # the 2026-07-28 Decimal migration exists to eliminate (agent/money.py).
+    assert e.qty == Decimal("0.2")
+    assert e.cum_qty == Decimal("0.2")
     assert e.price == 500.0
     # re-polling with no new activity yields the identical Execution
     assert b.fills() == execs

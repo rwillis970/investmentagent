@@ -12,13 +12,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 from .. import market_calendar
 from ..accounts import BrokerCredentials
+from ..money import to_decimal
 from ..pipeline import StagedOrder
 from ..policy import TradeCapabilityPolicy, initial_policy
 from .base import (AccountPosture, AccountSnapshot, BrokerAdapter, BrokerOrder,
                    Execution, Position)
+
+_ZERO = Decimal("0")
 
 
 class SimulatorBroker(BrokerAdapter):
@@ -31,7 +35,7 @@ class SimulatorBroker(BrokerAdapter):
     # the addition is a visible decision rather than a silent new method.
     _extra_public_methods = frozenset({"set_price", "advance"})
 
-    def __init__(self, *, account_id: str, cash: float = 500.0,
+    def __init__(self, *, account_id: str, cash: Decimal | float | str = Decimal("500"),
                  posture: AccountPosture = AccountPosture.CASH,
                  now: datetime | None = None,
                  credentials: BrokerCredentials | None = None,
@@ -43,20 +47,26 @@ class SimulatorBroker(BrokerAdapter):
         # attach_staging_key, or submit()/cancel() refuse everything (fail safe).
         super().__init__(account_id, credentials, capability_policy or initial_policy(),
                          staging_key)
+        # `to_decimal` at this one boundary lets a caller (overwhelmingly a
+        # test) still write `cash=500` or `cash=500.0` without every
+        # arithmetic op below mixing Decimal and float -- see agent/money.py
+        # for why a bare float is routed through str() first, never
+        # Decimal(a_float) directly.
+        cash = to_decimal(cash)
         self._cash = cash
         self._settled = cash
-        self._unsettled = 0.0
+        self._unsettled = _ZERO
         self._posture = posture
-        self._positions: dict[str, tuple[float, float]] = {}
+        self._positions: dict[str, tuple[Decimal, Decimal]] = {}
         self._orders: dict[str, BrokerOrder] = {}
-        self._prices: dict[str, float] = {}
+        self._prices: dict[str, Decimal] = {}
         self._now = now or datetime.now(timezone.utc)
-        self._settlements: list[tuple[datetime, float]] = []
+        self._settlements: list[tuple[datetime, Decimal]] = []
         self._day_trades = 0
 
     # -- test controls ----------------------------------------------------
-    def set_price(self, symbol: str, price: float) -> None:
-        self._prices[symbol.upper()] = price
+    def set_price(self, symbol: str, price: Decimal | float | str) -> None:
+        self._prices[symbol.upper()] = to_decimal(price)
 
     def advance(self, delta: timedelta) -> None:
         self._now += delta
@@ -75,12 +85,13 @@ class SimulatorBroker(BrokerAdapter):
 
     # -- interface --------------------------------------------------------
     def account(self) -> AccountSnapshot:
-        mv = sum(q * self._prices.get(s, p) for s, (q, p) in self._positions.items())
+        mv = sum((q * self._prices.get(s, p) for s, (q, p) in self._positions.items()),
+                start=_ZERO)
         return AccountSnapshot(
             account_id=self.account_id,
             equity=self._cash + mv, cash=self._cash, settled_cash=self._settled,
             unsettled_cash=self._unsettled, buying_power=self._settled,
-            multiplier=1.0 if self._posture is AccountPosture.CASH else 2.0,
+            multiplier=Decimal("1") if self._posture is AccountPosture.CASH else Decimal("2"),
             pattern_day_trader=False, day_trade_count=self._day_trades,
             fetched_at=self._now,
         )
@@ -103,10 +114,15 @@ class SimulatorBroker(BrokerAdapter):
 
         symbol = staged.symbol.upper()
         side = staged.side
-        qty = staged.authorized_qty
         order_type = staged.order_type
         time_in_force = staged.time_in_force
-        limit_price = staged.limit_price
+        # `staged.authorized_qty`/`staged.limit_price` are still float --
+        # agent.pipeline.StagedOrder is out of this unit's scope (§4.1's
+        # own report). This is the one boundary where that float enters a
+        # Decimal-only broker/ledger stack, via agent.money.to_decimal
+        # (never Decimal(a_float) directly).
+        qty = to_decimal(staged.authorized_qty)
+        limit_price = to_decimal(staged.limit_price) if staged.limit_price is not None else None
 
         price = limit_price or self._prices.get(symbol)
         if price is None:
@@ -114,24 +130,27 @@ class SimulatorBroker(BrokerAdapter):
                                 time_in_force, limit_price, "no price available")
 
         notional = qty * price
-        if side.upper() == "BUY" and notional > self._settled + 1e-9:
+        # No epsilon needed here (contrast the old `+ 1e-9` slack this
+        # replaced): Decimal arithmetic on exact inputs never accumulates
+        # the binary rounding error that guard existed to forgive.
+        if side.upper() == "BUY" and notional > self._settled:
             return self._reject(client_order_id, symbol, side, qty, order_type,
                                 time_in_force, limit_price, "insufficient settled cash")
         if side.upper() in ("SELL", "CLOSE"):
-            held = self._positions.get(symbol, (0.0, 0.0))[0]
-            if qty > held + 1e-9:
+            held = self._positions.get(symbol, (_ZERO, _ZERO))[0]
+            if qty > held:
                 return self._reject(client_order_id, symbol, side, qty, order_type,
                                     time_in_force, limit_price, "insufficient shares")
 
         if side.upper() == "BUY":
             self._settled -= notional
             self._cash -= notional
-            held, avg = self._positions.get(symbol, (0.0, 0.0))
+            held, avg = self._positions.get(symbol, (_ZERO, _ZERO))
             new_qty = held + qty
             self._positions[symbol] = (
-                new_qty, (held * avg + notional) / new_qty if new_qty else 0.0)
+                new_qty, (held * avg + notional) / new_qty if new_qty else _ZERO)
         else:
-            held, avg = self._positions.get(symbol, (0.0, 0.0))
+            held, avg = self._positions.get(symbol, (_ZERO, _ZERO))
             self._positions[symbol] = (held - qty, avg)
             self._cash += notional
             self._unsettled += notional
@@ -168,7 +187,7 @@ class SimulatorBroker(BrokerAdapter):
             account_id=self.account_id,
             client_order_id=cid, broker_order_id=None, symbol=symbol,
             side=side.upper(), qty=qty, order_type=ot.upper(), time_in_force=tif.upper(),
-            limit_price=lp, status="rejected", filled_qty=0.0, avg_fill_price=None,
+            limit_price=lp, status="rejected", filled_qty=_ZERO, avg_fill_price=None,
             submitted_at=self._now,
         )
         self._orders[cid] = order
@@ -212,7 +231,7 @@ class SimulatorBroker(BrokerAdapter):
                 symbol=o.symbol,
                 side=o.side,
                 qty=o.filled_qty,
-                price=o.avg_fill_price if o.avg_fill_price is not None else 0.0,
+                price=o.avg_fill_price if o.avg_fill_price is not None else _ZERO,
                 cum_qty=o.filled_qty,
                 filled_at=o.filled_at,
             )

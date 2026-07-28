@@ -231,6 +231,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 from . import market_calendar
 from . import mode as mode_fsm
@@ -327,9 +328,9 @@ class AccountReconciliation:
     # value actually comes from when a real caller wires this field up
     # (nothing does yet -- see the delivery report).
     broker_reported_day_trades: int | None
-    local_positions: dict[str, float]
+    local_positions: dict[str, Decimal]
     broker_positions: tuple[Position, ...]
-    local_settled_cash: float
+    local_settled_cash: Decimal
     broker_account: AccountSnapshot
     local_open_order_ids: frozenset[str]
     broker_open_orders: tuple[BrokerOrder, ...]
@@ -522,10 +523,15 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
         audit_log.append(
             actor="system", action="reconcile_account", object_type="account",
             object_id=acct.account_id,
+            # Decimal is not JSON-native -- agent.audit.AuditLog._assert_
+            # json_native rejects it outright, by design (see that module's
+            # own docstring). str() here, not float(), preserves the exact
+            # digits in the permanent audit record -- the same reasoning
+            # agent/money.py gives for never routing money through float.
             after={"broker_reported_day_trades": acct.broker_reported_day_trades,
                   "as_of": today.isoformat(),
-                  "positions": acct.local_positions,
-                  "settled_cash": acct.local_settled_cash,
+                  "positions": {sym: str(qty) for sym, qty in acct.local_positions.items()},
+                  "settled_cash": str(acct.local_settled_cash),
                   "open_order_ids": sorted(acct.local_open_order_ids)},
             correlation_id=correlation_id, timestamp=now,
         )

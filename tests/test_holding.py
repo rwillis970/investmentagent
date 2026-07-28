@@ -7,6 +7,7 @@ from agent.holding import (ExitCategory, HoldingPolicy, HoldingPolicyRegistry,
                            check_normal_exit, request_early_exit, sellable_qty)
 from agent.lot_selection import (LotSelectionMethod, LotSelectionPolicy,
                                  UnsupportedLotSelectionPolicy)
+from agent.money import to_decimal
 
 T0 = datetime(2026, 7, 20, 14, 30, tzinfo=timezone.utc)
 ACCT = "acct-taxable"
@@ -15,8 +16,8 @@ ACCT_B = "acct-ira"
 
 def lot(lid="l1", account_id=ACCT, hours=4, qty=10.0, opened=T0, settles=None,
        version="hp-v1"):
-    return Lot(lot_id=lid, account_id=account_id, symbol="SPY", qty=qty,
-              cost_basis=100.0, opened_at=opened, minimum_hold=timedelta(hours=hours),
+    return Lot(lot_id=lid, account_id=account_id, symbol="SPY", qty=to_decimal(qty),
+              cost_basis=to_decimal(100.0), opened_at=opened, minimum_hold=timedelta(hours=hours),
               holding_policy_version=version, settles_at=settles)
 
 

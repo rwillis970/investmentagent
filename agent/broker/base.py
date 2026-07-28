@@ -45,6 +45,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from enum import Enum
 
 from ..accounts import BrokerCredentials, CrossAccountError
@@ -60,7 +61,7 @@ class AccountPosture(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-PDT_EQUITY_THRESHOLD = 25_000.0
+PDT_EQUITY_THRESHOLD = Decimal("25000")
 
 
 class AdapterError(Exception):
@@ -93,12 +94,12 @@ class StagingForged(AdapterError):
 @dataclass(frozen=True)
 class AccountSnapshot:
     account_id: str
-    equity: float
-    cash: float
-    settled_cash: float
-    unsettled_cash: float
-    buying_power: float
-    multiplier: float               # 1.0 = cash account
+    equity: Decimal
+    cash: Decimal
+    settled_cash: Decimal
+    unsettled_cash: Decimal
+    buying_power: Decimal
+    multiplier: Decimal              # 1.0 = cash account
     # `None` means the broker did not report this at all -- genuinely
     # UNKNOWN, not "confirmed false"/"confirmed zero". See
     # agent.broker.alpaca.AlpacaPaperAdapter.account() (§13 probe,
@@ -116,9 +117,9 @@ class AccountSnapshot:
 class Position:
     account_id: str
     symbol: str
-    qty: float
-    avg_price: float
-    market_value: float
+    qty: Decimal
+    avg_price: Decimal
+    market_value: Decimal
 
 
 @dataclass(frozen=True)
@@ -142,9 +143,9 @@ class Execution:
     client_order_id: str
     symbol: str
     side: str
-    qty: float
-    price: float
-    cum_qty: float
+    qty: Decimal
+    price: Decimal
+    cum_qty: Decimal
     filled_at: datetime
 
 
@@ -155,13 +156,13 @@ class BrokerOrder:
     broker_order_id: str | None
     symbol: str
     side: str
-    qty: float
+    qty: Decimal
     order_type: str
     time_in_force: str
-    limit_price: float | None
+    limit_price: Decimal | None
     status: str                     # new|partially_filled|filled|canceled|rejected
-    filled_qty: float
-    avg_fill_price: float | None
+    filled_qty: Decimal
+    avg_fill_price: Decimal | None
     submitted_at: datetime | None = None
     filled_at: datetime | None = None
 

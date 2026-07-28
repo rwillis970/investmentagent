@@ -14,6 +14,7 @@ weekends" case this ledger's settlement handling has to get right.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -25,6 +26,7 @@ from agent.ledger import (DuplicateFillError, Fill, Ledger, LedgerError,
                           LotOverdrawnError, OrderRecord, UnknownLotError)
 from agent.lot_selection import (ALPACA_DEFAULT_POLICY, LotSelectionMethod,
                                  LotSelectionPolicy)
+from agent.money import to_decimal
 from agent.reconciliation import reconcile_settled_cash
 from agent.broker.base import AccountSnapshot
 
@@ -45,22 +47,22 @@ def registry():
 
 
 def ledger(account_id=ACCT, opening=500.0, reg=None):
-    return Ledger(account_id=account_id, opening_settled_cash=opening,
+    return Ledger(account_id=account_id, opening_settled_cash=to_decimal(opening),
                  policy_registry=reg or registry())
 
 
 def buy(lot_id="l1", account_id=ACCT, symbol="SPY", qty=1.0, price=100.0,
        at=FRI, fill_id=None, version="hp-v1"):
     return Fill(fill_id=fill_id or f"fill-{lot_id}-buy", account_id=account_id,
-               symbol=symbol, side="BUY", qty=qty, price=price, filled_at=at,
-               lot_id=lot_id, holding_policy_version=version)
+               symbol=symbol, side="BUY", qty=to_decimal(qty), price=to_decimal(price),
+               filled_at=at, lot_id=lot_id, holding_policy_version=version)
 
 
 def sell(lot_id="l1", account_id=ACCT, symbol="SPY", qty=1.0, price=110.0,
         at=FRI, fill_id=None):
     return Fill(fill_id=fill_id or f"fill-{lot_id}-sell-{qty}", account_id=account_id,
-               symbol=symbol, side="SELL", qty=qty, price=price, filled_at=at,
-               lot_id=lot_id, holding_policy_version=None)
+               symbol=symbol, side="SELL", qty=to_decimal(qty), price=to_decimal(price),
+               filled_at=at, lot_id=lot_id, holding_policy_version=None)
 
 
 # --------------------------------------------------------------- fresh ledger
@@ -258,7 +260,7 @@ def test_settlement_uses_market_calendar_settlement_date_directly():
     just_after = expected_instant
     before_cash = l.settled_cash(now=just_before)
     after_cash = l.settled_cash(now=just_after)
-    assert after_cash == before_cash + 100.0
+    assert after_cash == before_cash + Decimal("100.0")
 
 
 def test_a_freshly_bought_lot_is_not_settled_until_its_own_purchase_settles():
@@ -387,7 +389,7 @@ def test_ledger_is_fully_reconstructible_from_its_own_record_alone():
                                        status="OPEN", at=FRI))
 
     l2 = Ledger.from_records(
-        account_id=ACCT, opening_settled_cash=500.0, policy_registry=registry(),
+        account_id=ACCT, opening_settled_cash=Decimal("500.0"), policy_registry=registry(),
         fills=l1.fills, order_records=l1.order_records,
     )
 
@@ -481,7 +483,7 @@ def test_an_unsupported_lot_selection_policy_is_refused_not_approximated():
     reg = registry()
     unsupported = LotSelectionPolicy(version="hifo-hypothetical",
                                      method=LotSelectionMethod.HIFO)
-    l = Ledger(account_id=ACCT, opening_settled_cash=500.0, policy_registry=reg,
+    l = Ledger(account_id=ACCT, opening_settled_cash=Decimal("500.0"), policy_registry=reg,
               lot_selection_policy=unsupported)
     l.record_fill(buy(lot_id="a", qty=2.0, price=100.0, at=FRI))
     l.record_fill(buy(lot_id="b", qty=2.0, price=100.0, at=FRI + timedelta(hours=1)))

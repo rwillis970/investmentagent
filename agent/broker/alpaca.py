@@ -40,9 +40,13 @@ buying-power variants, but nothing that answers "how much of `cash` is
 actually available to spend today because it's already settled." This
 adapter maps:
 
-    settled_cash = float(data["cash"])   -- the closest available figure
-    unsettled_cash = 0.0                 -- ALWAYS, because there is nothing
-                                            to compute it from
+    settled_cash = Decimal(data["cash"])   -- the closest available figure
+                                              (parsed exactly, from the
+                                              decimal string Alpaca reports
+                                              -- see _dec and the Decimal
+                                              migration note below)
+    unsettled_cash = Decimal("0")           -- ALWAYS, because there is
+                                              nothing to compute it from
 
 This is an APPROXIMATION, not an exact mapping, and it is very likely wrong
 whenever a recent sale has proceeds still pending T+1 settlement -- Alpaca's
@@ -56,6 +60,27 @@ adapter's `account()` is trusted for real reconciliation, it needs
 verification against a real paper account's actual behaviour across a T+1
 settlement, or a better source (e.g. the Account Activities endpoint, which
 lists settlement-relevant non-trade activity) -- neither was in scope here.
+
+DECIMAL, NOT FLOAT (found running the loop against the real paper account,
+2026-07-28: a fractional-share fill produced a local settled-cash figure
+that disagreed with the broker's own at the fifteenth decimal place --
+representational float noise, not a real discrepancy, tripping the exact-
+equality reconciliation check in agent/reconciliation.py). Every money and
+quantity field this adapter parses -- `equity`, `cash`, `settled_cash`,
+`buying_power`, `multiplier`, position `qty`/`avg_price`/`market_value`,
+order `qty`/`limit_price`/`filled_qty`/`avg_fill_price`, and execution
+`qty`/`price`/`cum_qty` -- is now a `decimal.Decimal`, parsed via
+`agent.money.to_decimal` (imported here as `_dec`) directly from the JSON
+string Alpaca reports, never via `float(...)`. Alpaca's own API already
+reports these as decimal strings, so this is a lossless re-parse, not an
+approximation layered on top of one: the exact digits Alpaca sent are the
+exact digits this adapter now holds. `to_decimal` never calls
+`Decimal(a_float)` -- that would capture the float's own binary imprecision
+rather than curing it -- routing any float input through `str()` first
+instead (see agent/money.py, the one place this rule lives). See
+agent/ledger.py and agent/reconciliation.py for where this exactness is
+actually load-bearing (an exact-equality comparison against a local
+ledger's own Decimal arithmetic).
 
 EMPIRICALLY CONFIRMED (§13 probe, scripts/alpaca_probe.py, captured
 2026-07-27T18:00:18Z -- see scripts/fixtures/): a real paper `/v2/account`
@@ -130,8 +155,10 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 from ..accounts import BrokerCredentials
+from ..money import to_decimal as _dec
 from ..pipeline import StagedOrder
 from ..policy import TradeCapabilityPolicy
 from .. import market_calendar
@@ -297,15 +324,15 @@ class AlpacaPaperAdapter(BrokerAdapter):
         _, data = self._request("GET", "/v2/account", retryable=True)
         return AccountSnapshot(
             account_id=self.account_id,
-            equity=float(data["equity"]),
-            cash=float(data["cash"]),
+            equity=_dec(data["equity"]),
+            cash=_dec(data["cash"]),
             # APPROXIMATE, not exact -- see module docstring's CASH FIELD
             # MAPPING section. Alpaca's /v2/account has no settled/
             # unsettled split.
-            settled_cash=float(data["cash"]),
-            unsettled_cash=0.0,
-            buying_power=float(data["buying_power"]),
-            multiplier=float(data["multiplier"]),
+            settled_cash=_dec(data["cash"]),
+            unsettled_cash=Decimal("0"),
+            buying_power=_dec(data["buying_power"]),
+            multiplier=_dec(data["multiplier"]),
             # FINDING (§13 probe, 2026-07-27 -- scripts/fixtures/account.json):
             # a real cash account omits BOTH of these keys entirely -- not
             # `false`/`0`, absent. alpaca-py's own TradeAccount models both as
@@ -335,7 +362,7 @@ class AlpacaPaperAdapter(BrokerAdapter):
         _, data = self._request("GET", "/v2/positions", retryable=True)
         out = []
         for p in data:
-            qty = float(p["qty"])
+            qty = _dec(p["qty"])
             if p.get("side") == "short":
                 # Shorting is DISABLED at the capability layer (Appendix E)
                 # for this pilot regardless -- if one somehow existed, it
@@ -343,9 +370,9 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 # of truth), not coerced positive, so reconciliation can
                 # flag it as the anomaly it would be.
                 qty = -qty
-            avg_price = float(p["avg_entry_price"])
+            avg_price = _dec(p["avg_entry_price"])
             mv_raw = p.get("market_value")
-            market_value = float(mv_raw) if mv_raw not in (None, "") else qty * avg_price
+            market_value = _dec(mv_raw) if mv_raw not in (None, "") else qty * avg_price
             out.append(Position(account_id=self.account_id, symbol=p["symbol"],
                                qty=qty, avg_price=avg_price, market_value=market_value))
         return out
@@ -377,9 +404,9 @@ class AlpacaPaperAdapter(BrokerAdapter):
                     "something else placed one on this account outside this "
                     "system."
                 )
-            qty = float(filled)
+            qty = _dec(filled)
         else:
-            qty = float(qty_raw)
+            qty = _dec(qty_raw)
 
         alpaca_status = o["status"]
         status = STATUS_MAP.get(alpaca_status)
@@ -402,10 +429,10 @@ class AlpacaPaperAdapter(BrokerAdapter):
             qty=qty,
             order_type=order_type,
             time_in_force=o["time_in_force"].upper(),
-            limit_price=float(limit_price) if limit_price not in (None, "") else None,
+            limit_price=_dec(limit_price) if limit_price not in (None, "") else None,
             status=status,
-            filled_qty=float(o.get("filled_qty") or 0.0),
-            avg_fill_price=float(avg_fill_price) if avg_fill_price not in (None, "") else None,
+            filled_qty=_dec(o.get("filled_qty") or "0"),
+            avg_fill_price=_dec(avg_fill_price) if avg_fill_price not in (None, "") else None,
             submitted_at=_parse_ts(o.get("submitted_at")),
             filled_at=_parse_ts(o.get("filled_at")),
         )
@@ -491,9 +518,9 @@ class AlpacaPaperAdapter(BrokerAdapter):
             client_order_id=client_order_id,
             symbol=a["symbol"],
             side=a["side"].upper(),
-            qty=float(a["qty"]),
-            price=float(a["price"]),
-            cum_qty=float(a["cum_qty"]),
+            qty=_dec(a["qty"]),
+            price=_dec(a["price"]),
+            cum_qty=_dec(a["cum_qty"]),
             filled_at=_parse_ts(a["transaction_time"]),
         )
 

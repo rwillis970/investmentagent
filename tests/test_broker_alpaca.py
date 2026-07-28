@@ -12,6 +12,7 @@ file is not re-testing those, only what `AlpacaPaperAdapter` adds.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -109,7 +110,13 @@ def test_account_maps_the_documented_fields():
     snap = adapter(t).account()
     assert isinstance(snap, AccountSnapshot)
     assert snap.account_id == ACCT
-    assert snap.equity == 512.34
+    # Exact Decimal comparison, not a float literal: 512.34 has no exact
+    # binary float representation, so `Decimal('512.34') == 512.34` is False
+    # (float(512.34) is actually 512.33999999999996...) -- precisely the
+    # representational noise the 2026-07-28 Decimal migration exists to
+    # eliminate (see agent/money.py). Comparing against the same decimal
+    # string Alpaca sent is the exact, correct check here.
+    assert snap.equity == Decimal("512.34")
     assert snap.cash == 500.0
     assert snap.buying_power == 500.0
     assert snap.multiplier == 1.0
@@ -165,7 +172,7 @@ def test_account_settled_cash_is_mapped_from_cash_and_is_approximate():
     t = ScriptedTransport()
     t.enqueue(200, account_json(cash="123.45"))
     snap = adapter(t).account()
-    assert snap.settled_cash == 123.45
+    assert snap.settled_cash == Decimal("123.45")
     assert snap.unsettled_cash == 0.0
 
 

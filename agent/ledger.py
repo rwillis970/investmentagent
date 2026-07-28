@@ -132,11 +132,28 @@ adapter's order/activity data, and persistence (writing `Fill`/`OrderRecord`
 rows to durable storage, the way `agent.mode_store.ModeStore` does for mode
 changes). This module's job ends at "correct, reconstructible in-memory
 state from a record already handed to it."
+
+DECIMAL, NOT FLOAT (real-account finding, 2026-07-28): `opening_settled_
+cash`, `Fill.qty`/`.price`, and every value this module derives from them
+(`settled_cash`, `unsettled_cash`, `positions()`'s qty totals, `lots()`'s
+`cost_basis`) are `decimal.Decimal`, never `float`. A fractional-share fill
+(`agent.broker.alpaca.AlpacaPaperAdapter`) produced a local settled-cash
+figure that disagreed with the broker's own at the fifteenth decimal place
+-- pure binary-float representational noise, not a real discrepancy --
+which tripped `agent.reconciliation.reconcile_settled_cash`'s deliberate
+exact-equality check. See agent/money.py for why `Decimal`, not integer
+minor units, and the one rule (never `Decimal(a_float)` directly) that
+keeps a float from ever re-entering this module's own arithmetic. Two
+`+ 1e-9` epsilon guards this module used to need (`record_fill`'s lot-
+overdraw check, previously `already_sold + fill.qty > buy_fill.qty + 1e-9`)
+are gone outright, not just widened -- Decimal arithmetic on exact inputs
+never accumulates the rounding error that guard existed to forgive.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from decimal import Decimal
 
 from . import market_calendar
 from .accounts import CrossAccountError
@@ -145,6 +162,7 @@ from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy, disposal_o
 
 _SIDES = ("BUY", "SELL")
 _OPEN, _CLOSED = "OPEN", "CLOSED"
+_ZERO = Decimal("0")
 
 
 class LedgerError(Exception):
@@ -188,8 +206,8 @@ class Fill:
     account_id: str
     symbol: str
     side: str                              # "BUY" or "SELL"
-    qty: float
-    price: float
+    qty: Decimal
+    price: Decimal
     filled_at: datetime                    # tz-aware; the FILL time, never order submit
     lot_id: str
     holding_policy_version: str | None = None
@@ -257,7 +275,7 @@ class Ledger:
     `self.fills` + `self.order_records` + `opening_settled_cash` alone --
     nothing else here is state that could drift from that record."""
 
-    def __init__(self, *, account_id: str, opening_settled_cash: float,
+    def __init__(self, *, account_id: str, opening_settled_cash: Decimal,
                 policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
                 lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY):
         if opening_settled_cash < 0:
@@ -274,7 +292,7 @@ class Ledger:
         self._fill_ids: dict[str, Fill] = {}
 
     @classmethod
-    def from_records(cls, *, account_id: str, opening_settled_cash: float,
+    def from_records(cls, *, account_id: str, opening_settled_cash: Decimal,
                      policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
                      lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY,
                      fills=(), order_records=()) -> "Ledger":
@@ -349,9 +367,14 @@ class Ledger:
                     f"SELL fill {fill.fill_id!r} symbol {fill.symbol!r} does not match "
                     f"lot {fill.lot_id!r}'s symbol {buy_fill.symbol!r}"
                 )
-            already_sold = sum(f.qty for f in self._fills
-                               if f.lot_id == fill.lot_id and f.side.upper() == "SELL")
-            if already_sold + fill.qty > buy_fill.qty + 1e-9:
+            already_sold = sum((f.qty for f in self._fills
+                               if f.lot_id == fill.lot_id and f.side.upper() == "SELL"),
+                               start=_ZERO)
+            # Exact, no epsilon (contrast the old `+ 1e-9` this replaced,
+            # module docstring's DECIMAL section): Decimal arithmetic on
+            # exact Fill.qty inputs never accumulates the binary rounding
+            # error that guard existed to forgive.
+            if already_sold + fill.qty > buy_fill.qty:
                 raise LotOverdrawnError(
                     f"lot {fill.lot_id!r}: selling {fill.qty} would exceed the "
                     f"{buy_fill.qty - already_sold} still remaining (bought {buy_fill.qty})"
@@ -418,13 +441,13 @@ class Ledger:
         fully-closed lot's `cost_basis` is therefore correctly 0.0 here --
         nothing remains open to hold a basis -- not the original total."""
         buys: dict[str, Fill] = {}
-        sold_qty: dict[str, float] = {}
+        sold_qty: dict[str, Decimal] = {}
         last_sell_at: dict[str, datetime] = {}
         for f in self._fills:
             if f.side.upper() == "BUY":
                 buys[f.lot_id] = f
             else:
-                sold_qty[f.lot_id] = sold_qty.get(f.lot_id, 0.0) + f.qty
+                sold_qty[f.lot_id] = sold_qty.get(f.lot_id, _ZERO) + f.qty
                 last_sell_at[f.lot_id] = f.filled_at
 
         out: list[Lot] = []
@@ -436,11 +459,15 @@ class Ledger:
                 opened_at=buy_fill.filled_at, policy_version=buy_fill.holding_policy_version,
                 settles_at=settles_at,
             )
-            sold = sold_qty.get(lot_id, 0.0)
-            remaining = max(base_lot.qty - sold, 0.0)
-            remaining_fraction = (remaining / base_lot.qty) if base_lot.qty else 0.0
+            sold = sold_qty.get(lot_id, _ZERO)
+            remaining = max(base_lot.qty - sold, _ZERO)
+            remaining_fraction = (remaining / base_lot.qty) if base_lot.qty else _ZERO
             remaining_cost_basis = base_lot.cost_basis * remaining_fraction
-            closed_at = last_sell_at.get(lot_id) if remaining <= 1e-9 else None
+            # Exact, no epsilon (module docstring's DECIMAL section): a
+            # fully-sold lot's remaining qty is exactly zero under Decimal
+            # arithmetic, never a tiny float residue that `<= 1e-9` used to
+            # need to forgive.
+            closed_at = last_sell_at.get(lot_id) if remaining <= _ZERO else None
             out.append(replace(base_lot, qty=remaining, cost_basis=remaining_cost_basis,
                                closed_at=closed_at))
         return out
@@ -457,20 +484,22 @@ class Ledger:
         tracking remaining qty PER POINT IN TIME rather than only the final
         state, since the disposal order at fill N depends on what was still
         open just before fill N, not on what is open now."""
-        remaining: dict[str, float] = {}
+        remaining: dict[str, Decimal] = {}
         opened_at: dict[str, datetime] = {}
         symbol_of: dict[str, str] = {}
         out: list[DisposalRecord] = []
         for f in self._fills:
             if f.side.upper() == "BUY":
-                remaining[f.lot_id] = remaining.get(f.lot_id, 0.0) + f.qty
+                remaining[f.lot_id] = remaining.get(f.lot_id, _ZERO) + f.qty
                 opened_at.setdefault(f.lot_id, f.filled_at)
                 symbol_of[f.lot_id] = f.symbol
             else:
                 open_refs = [
                     _OpenLotRef(lid, opened_at[lid])
                     for lid, qty in remaining.items()
-                    if qty > 1e-9 and symbol_of.get(lid) == f.symbol
+                    # Exact, no epsilon -- see module docstring's DECIMAL
+                    # section.
+                    if qty > _ZERO and symbol_of.get(lid) == f.symbol
                 ]
                 ordered = disposal_order(self._lot_selection_policy, open_refs)
                 broker_lot_id = ordered[0].lot_id if ordered else f.lot_id
@@ -479,21 +508,21 @@ class Ledger:
                     intended_lot_id=f.lot_id, broker_lot_id=broker_lot_id,
                     at=f.filled_at,
                 ))
-                remaining[f.lot_id] = remaining.get(f.lot_id, 0.0) - f.qty
+                remaining[f.lot_id] = remaining.get(f.lot_id, _ZERO) - f.qty
         return out
 
-    def positions(self) -> dict[str, float]:
+    def positions(self) -> dict[str, Decimal]:
         """Total held qty per symbol, across all OPEN lots -- what a
         broker's own positions endpoint reports (settled or not). See the
         module docstring for why this is deliberately NOT
         `holding.sellable_qty`."""
-        by_symbol: dict[str, float] = {}
+        by_symbol: dict[str, Decimal] = {}
         for lot in self.lots():
             if lot.is_open() and lot.account_id == self.account_id:
-                by_symbol[lot.symbol] = by_symbol.get(lot.symbol, 0.0) + lot.qty
+                by_symbol[lot.symbol] = by_symbol.get(lot.symbol, _ZERO) + lot.qty
         return by_symbol
 
-    def settled_cash(self, *, now: datetime) -> float:
+    def settled_cash(self, *, now: datetime) -> Decimal:
         """Derived fresh from `opening_settled_cash` plus every fill's own
         contribution -- never a running counter mutated as fills arrive.
         A BUY debits immediately (funded by settled cash only, Appendix E).
@@ -509,13 +538,13 @@ class Ledger:
                     total += notional
         return total
 
-    def unsettled_cash(self, *, now: datetime) -> float:
+    def unsettled_cash(self, *, now: datetime) -> Decimal:
         """Not required by `AccountReconciliation`, but a near-free
         complement to `settled_cash` from the same replay -- useful for
         verifying the settlement mechanism directly (settled + unsettled
         proceeds should always equal opening_settled_cash plus every buy's
         debit and every sell's full notional, regardless of `now`)."""
-        total = 0.0
+        total = _ZERO
         for f in self._fills:
             if f.side.upper() == "SELL" and now < self._settlement_instant(f.filled_at):
                 total += f.qty * f.price

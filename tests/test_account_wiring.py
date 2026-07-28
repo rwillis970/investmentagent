@@ -25,6 +25,7 @@ from agent.daytrade import DayTradeGuard
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger import Fill
 from agent.ledger_store import LedgerStore
+from agent.money import to_decimal
 from agent.mode_store import ModeStore
 from agent.pipeline import Gatekeeper, StagedOrder
 from agent.policy import initial_policy
@@ -84,7 +85,7 @@ def test_a_subsequent_call_never_reseeds(tmp_path):
     build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
                                  day_trade_guard=guard(), now=NOW)
     s.write_fill(Fill(fill_id="f1", account_id=ACCT, symbol="SPY", side="BUY",
-                      qty=1.0, price=100.0, filled_at=NOW, lot_id="l1",
+                      qty=to_decimal(1.0), price=to_decimal(100.0), filled_at=NOW, lot_id="l1",
                       holding_policy_version="hp-v1"))
 
     # A fresh store instance at the same path, as a later restart would use.
@@ -115,7 +116,7 @@ def test_all_seven_fields_come_from_the_real_adapter_and_ledger(tmp_path):
     build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
                                  day_trade_guard=guard(), now=NOW)
     s.write_fill(Fill(fill_id="f1", account_id=ACCT, symbol="SPY", side="BUY",
-                      qty=2.0, price=100.0, filled_at=NOW, lot_id="l1",
+                      qty=to_decimal(2.0), price=to_decimal(100.0), filled_at=NOW, lot_id="l1",
                       holding_policy_version="hp-v1"))
     rec = build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
                                        day_trade_guard=guard(), now=NOW)
