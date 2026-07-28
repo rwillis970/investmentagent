@@ -23,17 +23,22 @@ a real process restart; `audit_log` is NOT (see KNOWN GAP below) so this is
 only safe for as long as one process keeps running -- a restart genuinely
 loses it, which is a real, load-bearing gap this module does not fix.
 
-`adapter`, the `LedgerStore` and the `DayTradeGuard` ARE (re)constructed
-every cycle, per account, via `adapter_factory(account_runtime)` and the
-plain `LedgerStore(...)`/`DayTradeGuard(...)` constructors -- literally,
-each cycle, matching the brief. This is safe for the different reasons
-specific to each:
+`adapter`, the `LedgerStore`, the `ExecutionQuarantineStore` and the
+`DayTradeGuard` ARE (re)constructed every cycle, per account, via
+`adapter_factory(account_runtime)` and the plain `LedgerStore(...)`/
+`ExecutionQuarantineStore(...)`/`DayTradeGuard(...)` constructors --
+literally, each cycle, matching the brief. This is safe for the different
+reasons specific to each:
 
-  - `LedgerStore` re-reads its whole JSONL file from disk on construction
-    (`_load_into`) -- cheap for a pilot's data volume, and reconstructing it
-    fresh every cycle means every cycle's local state is derived directly
-    from the durable file, never from a stale in-memory copy left over from
-    a previous cycle.
+  - `LedgerStore`/`ExecutionQuarantineStore` both re-read their whole JSONL
+    file from disk on construction (`_load_into`) -- cheap for a pilot's
+    data volume, and reconstructing them fresh every cycle means every
+    cycle's local state is derived directly from the durable file, never
+    from a stale in-memory copy left over from a previous cycle. This is
+    exactly what lets an operator's `--admit-execution`/`--reject-execution`
+    (run out-of-process, between cycles) actually take effect on the very
+    next cycle: there is no in-memory quarantine state anywhere that could
+    still be holding the PENDING view from before the operator resolved it.
 
   - The adapter is stateless in the way that matters: a real HTTP-backed
     adapter's actual account state lives at the broker, not in the Python
@@ -175,6 +180,7 @@ from .approval import ApprovalService
 from .audit import AuditLog
 from .broker.base import BrokerAdapter
 from .daytrade import DayTradeGuard
+from .execution_quarantine import ExecutionQuarantineStore
 from .fill_sync import sync_fills
 from .holding import HoldingPolicyRegistry
 from .ledger import Fill
@@ -194,6 +200,7 @@ class AccountRuntime:
     account_id: str
     credentials: BrokerCredentials
     ledger_store_path: str | Path
+    quarantine_store_path: str | Path
     policy_registry: HoldingPolicyRegistry
     max_day_trades_per_5_sessions: int
     t_plus: int = 1
@@ -308,10 +315,21 @@ def run_cycle(*, accounts: list[AccountRuntime],
                             policy_registry=acct.policy_registry, t_plus=acct.t_plus)
         guard = DayTradeGuard(account_id=acct.account_id,
                               max_per_5_sessions=acct.max_day_trades_per_5_sessions)
+        # Reconstructed fresh every cycle, like `store` above -- cheap, and
+        # every cycle's quarantine/resolution state is derived directly from
+        # the durable file, never a stale in-memory copy (see module
+        # docstring's reasoning for `LedgerStore`, which applies identically
+        # here).
+        quarantine = ExecutionQuarantineStore(acct.quarantine_store_path,
+                                              account_id=acct.account_id)
 
         # sync_fills BEFORE build_account_reconciliation -- see module
         # docstring for why this order is load-bearing, not incidental.
-        fills = sync_fills(adapter, store, now=now)
+        # `quarantine`/`audit_log` let sync_fills survive an execution with
+        # no resolvable intent (a manually-placed order) without raising --
+        # see agent/fill_sync.py's own module docstring.
+        fills = sync_fills(adapter, store, now=now, quarantine=quarantine,
+                          audit_log=audit_log)
         new_fills[acct.account_id] = fills
 
         recon = build_account_reconciliation(

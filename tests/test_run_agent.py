@@ -17,6 +17,7 @@ from agent import mode as mode_fsm
 from agent.accounts import BrokerCredentials
 from agent.audit import AuditLog
 from agent.holding import HoldingPolicyRegistry
+from agent.execution_quarantine import ADMITTED, REJECTED, ExecutionQuarantineStore
 from agent.mode_store import ModeStore
 from agent.secrets_provider import InMemorySecretsProvider
 from scripts.run_agent import build_account_runtime, main
@@ -36,6 +37,7 @@ def test_build_account_runtime_derives_the_holding_policy_from_config(tmp_path):
     acct = build_account_runtime(
         cfg, account_id="acct-a", credentials=creds,
         ledger_store_path=tmp_path / "l.jsonl",
+        quarantine_store_path=tmp_path / "q.jsonl",
     )
     assert acct.account_id == "acct-a"
     assert acct.credentials == creds
@@ -57,6 +59,7 @@ def test_main_returns_nonzero_and_logs_when_the_loop_raises(tmp_path, caplog):
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
+        "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -83,6 +86,7 @@ def test_main_calls_run_loop_with_the_configured_cadence_and_mode(tmp_path):
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
+        "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -122,6 +126,7 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
+        "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]
@@ -149,6 +154,7 @@ def _argv(tmp_path, config_path):
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
+        "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -259,6 +265,7 @@ def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
+        "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]
@@ -508,3 +515,143 @@ def test_advance_mode_resume_to_production_active_still_requires_confirmed(tmp_p
     code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
     assert code == 0
     assert ModeStore(mode_path).current() == "PRODUCTION_ACTIVE"
+
+
+# ------------------------------------------ --admit-execution / --reject-execution
+#
+# Found running the loop against the real paper account (§11): a manually-
+# placed BUY in the broker's own dashboard has no staged holding_policy_
+# version, so agent.fill_sync.sync_fills now quarantines it (rather than
+# halting the loop forever) -- these two flags are the operator's path to
+# resolve it. See agent/execution_quarantine.py's own module docstring.
+
+def _admit_argv(*, account_id, quarantine_path, audit_path, execution_id,
+               holding_policy_version=None, lot_id=None, reject=False):
+    argv = [
+        "--account-id", account_id,
+        "--quarantine-store-path", str(quarantine_path),
+        "--mode-store-path", "/unused/mode.jsonl",   # not required for this path
+        "--audit-log-path", str(audit_path),
+    ]
+    if reject:
+        argv += ["--reject-execution", execution_id]
+    else:
+        argv += ["--admit-execution", execution_id]
+        if holding_policy_version is not None:
+            argv += ["--admit-holding-policy-version", holding_policy_version]
+        if lot_id is not None:
+            argv += ["--admit-lot-id", lot_id]
+    return argv
+
+
+def _quarantine_a_buy(path, *, account_id="acct-a", execution_id="e1"):
+    from datetime import datetime, timezone
+    from agent.broker.base import Execution
+    store = ExecutionQuarantineStore(path, account_id=account_id)
+    store.quarantine(
+        Execution(execution_id=execution_id, account_id=account_id,
+                 client_order_id="c1", symbol="SPY", side="BUY", qty=1.0,
+                 price=100.0, cum_qty=1.0,
+                 filled_at=datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)),
+        reason="no holding_policy_version", at=datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc),
+    )
+    return store
+
+
+def test_admit_execution_requires_account_id_and_quarantine_store_path(tmp_path):
+    import pytest
+    argv = ["--admit-execution", "e1", "--mode-store-path", str(tmp_path / "m.jsonl"),
+           "--audit-log-path", str(tmp_path / "a.jsonl")]
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_admit_execution_writes_resolution_and_audit_row(tmp_path):
+    quarantine_path = tmp_path / "q.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_buy(quarantine_path)
+
+    code = main(_admit_argv(
+        account_id="acct-a", quarantine_path=quarantine_path, audit_path=audit_path,
+        execution_id="e1", holding_policy_version="hp-v1",
+    ))
+    assert code == 0
+
+    store = ExecutionQuarantineStore(quarantine_path, account_id="acct-a")
+    assert store.status("e1") == ADMITTED
+    resolution = store.resolution_for("e1")
+    assert resolution.holding_policy_version == "hp-v1"
+    assert resolution.decided_by == "operator"
+
+    log = AuditLog(path=audit_path)
+    admitted = [e for e in log.events if e.action == "execution_admitted"]
+    assert len(admitted) == 1
+    assert admitted[0].object_id == "e1"
+    assert admitted[0].actor == "operator"
+    assert admitted[0].after["holding_policy_version"] == "hp-v1"
+
+
+def test_reject_execution_writes_resolution_and_audit_row(tmp_path):
+    quarantine_path = tmp_path / "q.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_buy(quarantine_path)
+
+    code = main(_admit_argv(
+        account_id="acct-a", quarantine_path=quarantine_path, audit_path=audit_path,
+        execution_id="e1", reject=True,
+    ))
+    assert code == 0
+
+    store = ExecutionQuarantineStore(quarantine_path, account_id="acct-a")
+    assert store.status("e1") == REJECTED
+
+    log = AuditLog(path=audit_path)
+    rejected = [e for e in log.events if e.action == "execution_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].object_id == "e1"
+
+
+def test_admitting_a_buy_without_holding_policy_version_is_refused(tmp_path):
+    """Never guessed -- the CLI itself does not default this."""
+    quarantine_path = tmp_path / "q.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_buy(quarantine_path)
+
+    code = main(_admit_argv(
+        account_id="acct-a", quarantine_path=quarantine_path, audit_path=audit_path,
+        execution_id="e1",
+    ))
+    assert code == 1
+    store = ExecutionQuarantineStore(quarantine_path, account_id="acct-a")
+    assert store.status("e1") == "PENDING"
+
+
+def test_admit_and_reject_are_mutually_exclusive(tmp_path):
+    import pytest
+    argv = [
+        "--account-id", "acct-a", "--quarantine-store-path", str(tmp_path / "q.jsonl"),
+        "--mode-store-path", str(tmp_path / "m.jsonl"), "--audit-log-path", str(tmp_path / "a.jsonl"),
+        "--admit-execution", "e1", "--admit-holding-policy-version", "hp-v1",
+        "--reject-execution", "e1",
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_admit_execution_never_constructs_a_broker_adapter(tmp_path, monkeypatch):
+    import scripts.run_agent as run_agent_module
+
+    def _boom(*a, **k):
+        raise AssertionError("--admit-execution must never construct an adapter")
+
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _boom)
+    quarantine_path = tmp_path / "q.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_buy(quarantine_path)
+    code = main(_admit_argv(
+        account_id="acct-a", quarantine_path=quarantine_path, audit_path=audit_path,
+        execution_id="e1", holding_policy_version="hp-v1",
+    ))
+    assert code == 0

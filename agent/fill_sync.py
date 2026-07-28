@@ -31,10 +31,51 @@ crash-only, same as the rest of this codebase (§8.1). The lot a SELL
 intended to reduce, and the holding-policy version a BUY's new lot should
 open under, are recovered from `Ledger.latest_order_record(client_order_
 id)` -- durably persisted at staging time via `OrderRecord.lot_id`/
-`OrderRecord.holding_policy_version` (see agent/ledger.py). Neither is
-guessed: a SELL/CLOSE execution with no resolvable `lot_id`, or a BUY
-execution with no resolvable `holding_policy_version`, raises
-`SyncFillsError` rather than fabricating one -- fail safe (Appendix E).
+`OrderRecord.holding_policy_version` (see agent/ledger.py). Neither is ever
+guessed -- see QUARANTINE, NOT A HALT, below.
+
+QUARANTINE, NOT A HALT, FOR AN EXECUTION WITH NO RESOLVABLE INTENT (found
+running the loop against the real paper account, §11: a manually-placed BUY
+in the broker's own dashboard has no staged `OrderRecord` at all, so it has
+no `holding_policy_version` -- correct to refuse guessing one, wrong to
+treat that refusal as fatal). A SELL/CLOSE execution with no resolvable
+`lot_id`, or a BUY execution with no resolvable `holding_policy_version`,
+no longer raises `SyncFillsError`. Instead it is handed to
+`agent.execution_quarantine.ExecutionQuarantineStore.quarantine` and this
+call moves on to the next execution -- the loop keeps running. See that
+module's own docstring for the full reasoning (including why quarantine,
+not an auto-ingest default, was chosen for BOTH sides, not just the BUY
+case a default could arguably cover). Three things follow directly from
+this being a STORE, not an exception:
+
+  * a PENDING quarantined execution (still awaiting an operator) is a
+    silent no-op on every subsequent poll -- it is not re-quarantined
+    (`ExecutionQuarantineStore.quarantine` is itself idempotent) and does
+    not raise again. This is what makes the loop survive a restart-loop
+    that previously ran forever on the exact same failure.
+  * an ADMITTED execution (an operator supplied the missing
+    `holding_policy_version`/`lot_id` via `scripts.run_agent
+    --admit-execution`) is turned into a real `Fill` on the very next
+    `sync_fills` call that notices the resolution -- through the SAME
+    `store.write_fill` path, subject to every validation `Ledger.
+    record_fill` already enforces. An operator who admits a bad lot_id or
+    an unknown holding_policy_version is refused exactly as any other
+    caller would be (`UnknownLotError`, `LotOverdrawnError`,
+    `HoldingViolation`) -- never silently accepted.
+  * a REJECTED execution is skipped, permanently, forever -- no `Fill` is
+    ever written for it.
+
+Both the quarantine (discovery) and the resolution (an operator's
+admit/reject decision) are recorded in `audit_log` -- see `sync_fills`'s own
+`audit_log` argument, now required, and `_audit_quarantine`/
+`_audit_admission` below.
+
+STILL A HARD `SyncFillsError`, UNCHANGED: a wrong-account execution
+(`CrossAccountError`, not quarantined -- see below), a `filled_at` with no
+timezone, and a look-ahead/clock-skew `filled_at` after `now`. Quarantine is
+for "this execution is well-formed but its INTENT is unknown"; it is not a
+general escape hatch for a malformed or impossible execution, which Appendix
+E's fail-safe-to-NO-TRADE still applies to exactly as before.
 
 WHY EACH BUY-FILL INCREMENT BECOMES ITS OWN LOT. `Ledger.record_fill`
 already requires a BUY fill's `lot_id` to be unique across every BUY fill
@@ -83,27 +124,50 @@ from __future__ import annotations
 from datetime import datetime
 
 from .accounts import CrossAccountError
+from .audit import AuditLog
 from .broker.base import BrokerAdapter
+from .execution_quarantine import ADMITTED, ExecutionQuarantineStore
 from .ledger import Fill
 from .ledger_store import LedgerStore
 
 
 class SyncFillsError(Exception):
     """A broker-reported execution could not be safely turned into a
-    ledger `Fill` -- missing intended lot_id/holding_policy_version, or a
-    `filled_at` after `now`. Never raised for an execution that is simply
-    already known; that is a silent no-op, not an error."""
+    ledger `Fill` -- a malformed or impossible execution (no timezone-aware
+    `filled_at`, or one after `now`). Never raised for an execution that is
+    simply already known (a silent no-op) or one whose intent is merely
+    unresolved (quarantined instead -- see module docstring and
+    agent.execution_quarantine)."""
+
+
+def _audit_quarantine(audit_log: AuditLog, *, account_id: str, execution_id: str,
+                      client_order_id: str, side: str, reason: str,
+                      now: datetime) -> None:
+    audit_log.append(
+        actor="system", action="execution_quarantined", object_type="execution",
+        object_id=execution_id,
+        after={"account_id": account_id, "client_order_id": client_order_id,
+              "side": side, "reason": reason},
+        timestamp=now,
+    )
 
 
 def sync_fills(adapter: BrokerAdapter, store: LedgerStore, *,
-               now: datetime) -> tuple[Fill, ...]:
+               now: datetime, quarantine: ExecutionQuarantineStore,
+               audit_log: AuditLog) -> tuple[Fill, ...]:
     """Read `adapter.fills()` and record whatever is new into `store`.
     Returns only the `Fill`s newly written this call, in the order
     `adapter.fills()` reported them -- an execution already present in
     `store` (by `fill_id`, i.e. `Execution.execution_id`) is skipped
     silently, not re-validated or re-written. Does not build a cadence
     loop, a process entry point, a collector, or live mode -- this is the
-    function such things would call."""
+    function such things would call.
+
+    `quarantine`/`audit_log` are both required, not optional (see module
+    docstring's QUARANTINE section): an execution with no resolvable
+    intent is handed to `quarantine.quarantine(...)` and its discovery is
+    recorded in `audit_log`, rather than raising -- there is no way to
+    call this function and silently skip either."""
     if now.tzinfo is None:
         raise SyncFillsError("now must be a timezone-aware datetime")
 
@@ -137,15 +201,61 @@ def sync_fills(adapter: BrokerAdapter, store: LedgerStore, *,
         side = execution.side.upper()
         record = latest_by_client_order_id.get(execution.client_order_id)
 
+        resolution = quarantine.resolution_for(fill_id)
+        if resolution is not None and resolution.decision == ADMITTED:
+            # An operator supplied the missing field explicitly (see
+            # ExecutionQuarantineStore.admit) -- never guessed here, and
+            # still subject to every validation Ledger.record_fill already
+            # enforces via store.write_fill below (an unknown holding
+            # policy version, an unknown lot_id, or an overdrawn lot is
+            # still refused, exactly as any other caller would be).
+            if side == "BUY":
+                fill = Fill(
+                    fill_id=fill_id, account_id=execution.account_id,
+                    symbol=execution.symbol, side="BUY", qty=execution.qty,
+                    price=execution.price, filled_at=execution.filled_at,
+                    lot_id=fill_id,
+                    holding_policy_version=resolution.holding_policy_version,
+                )
+            else:
+                fill = Fill(
+                    fill_id=fill_id, account_id=execution.account_id,
+                    symbol=execution.symbol, side=side, qty=execution.qty,
+                    price=execution.price, filled_at=execution.filled_at,
+                    lot_id=resolution.lot_id, holding_policy_version=None,
+                )
+            store.write_fill(fill)
+            known_ids.add(fill_id)
+            new_fills.append(fill)
+            continue
+        if resolution is not None:
+            # REJECTED -- permanently excluded, no Fill ever written for it.
+            continue
+        if quarantine.status(fill_id) is not None:
+            # PENDING, already quarantined on an earlier poll -- silent
+            # no-op, not a re-raise, so the loop is never stuck re-reporting
+            # the same unresolved execution forever.
+            continue
+
         if side == "BUY":
             if record is None or record.holding_policy_version is None:
-                raise SyncFillsError(
-                    f"execution {fill_id!r} (client_order_id="
-                    f"{execution.client_order_id!r}) is a BUY with no "
-                    "holding_policy_version recorded at staging time; "
-                    "refusing to guess which policy the new lot should open "
-                    "under"
+                quarantine.quarantine(
+                    execution,
+                    reason=(
+                        f"BUY with no holding_policy_version recorded at "
+                        f"staging time (client_order_id="
+                        f"{execution.client_order_id!r}); refusing to guess "
+                        "which policy the new lot should open under"
+                    ),
+                    at=now,
                 )
+                _audit_quarantine(
+                    audit_log, account_id=execution.account_id, execution_id=fill_id,
+                    client_order_id=execution.client_order_id, side=side,
+                    reason="no holding_policy_version recorded at staging time",
+                    now=now,
+                )
+                continue
             fill = Fill(
                 fill_id=fill_id, account_id=execution.account_id,
                 symbol=execution.symbol, side="BUY", qty=execution.qty,
@@ -160,14 +270,24 @@ def sync_fills(adapter: BrokerAdapter, store: LedgerStore, *,
             )
         else:
             if record is None or record.lot_id is None:
-                raise SyncFillsError(
-                    f"execution {fill_id!r} (client_order_id="
-                    f"{execution.client_order_id!r}) is a {side} with no "
-                    "intended lot_id recorded at staging time; refusing to "
-                    "guess which lot it reduces (this is also where a "
-                    "CLOSE-originated fill lands -- see module docstring's "
-                    "named, unsolved CLOSE/multi-lot gap)"
+                quarantine.quarantine(
+                    execution,
+                    reason=(
+                        f"{side} with no intended lot_id recorded at staging "
+                        f"time (client_order_id={execution.client_order_id!r}); "
+                        "refusing to guess which lot it reduces (this is also "
+                        "where a CLOSE-originated fill lands -- see module "
+                        "docstring's named, unsolved CLOSE/multi-lot gap)"
+                    ),
+                    at=now,
                 )
+                _audit_quarantine(
+                    audit_log, account_id=execution.account_id, execution_id=fill_id,
+                    client_order_id=execution.client_order_id, side=side,
+                    reason="no intended lot_id recorded at staging time",
+                    now=now,
+                )
+                continue
             fill = Fill(
                 fill_id=fill_id, account_id=execution.account_id,
                 symbol=execution.symbol, side=side, qty=execution.qty,

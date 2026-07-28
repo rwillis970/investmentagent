@@ -61,6 +61,7 @@ def account_runtime(tmp_path, account_id=ACCT, max_day_trades=3):
     return AccountRuntime(
         account_id=account_id, credentials=credentials(account_id),
         ledger_store_path=tmp_path / f"{account_id}.jsonl",
+        quarantine_store_path=tmp_path / f"{account_id}.quarantine.jsonl",
         policy_registry=registry(), max_day_trades_per_5_sessions=max_day_trades,
     )
 
@@ -177,15 +178,19 @@ def test_sync_fills_runs_before_reconciliation_so_a_real_fill_is_not_a_false_mis
     b.submit(staged)   # a real fill now exists at the broker, unknown to any ledger
 
     acct = account_runtime(tmp_path)
-    # First cycle: seeds opening balance BEFORE the fill would otherwise be
-    # visible; must still reconcile clean because sync_fills ran first and
-    # OrderRecord for c1 was never staged through this loop -- BUY with no
-    # holding_policy_version recorded is refused by sync_fills, so nothing
-    # is synced and reconciliation legitimately halts. This proves the
-    # order of operations is real (sync attempted first), not that every
-    # fill is always recoverable without ever having staged it.
-    from agent.fill_sync import SyncFillsError
-    with pytest.raises(SyncFillsError):
+    # OrderRecord for c1 was never staged through this loop, so sync_fills
+    # cannot recover a holding_policy_version for this BUY -- it no longer
+    # raises (agent/execution_quarantine.py's own unit: unresolved intent is
+    # quarantined, not fatal), so `local_positions` stays legitimately empty
+    # rather than fabricating the real SPY position. Reconciliation therefore
+    # STILL correctly halts -- not on a phantom mismatch invented by ordering,
+    # but on the genuine, real fact that this position exists at the broker
+    # and is not yet tracked locally (an operator must --admit-execution it).
+    # This is what actually proves sync ran first: the halt comes from
+    # reconcile_positions with real, both-sides-populated numbers, not from
+    # sync_fills failing to run at all.
+    from agent.reconciliation import ReconciliationMismatch
+    with pytest.raises(ReconciliationMismatch, match=r"\{'SPY': 1\.0\}"):
         run_cycle(
             accounts=[acct], adapter_factory=lambda a: b,
             mode_store=mode_store_at("PAPER", now=IN_SESSION),

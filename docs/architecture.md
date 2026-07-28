@@ -356,6 +356,62 @@ fill, both the lot our strategy intended and the lot the broker's actual disposa
 would consume first, so any divergence between the two is visible rather than silently
 invisible.
 
+**Externally-originated fills — quarantine, not a guess or a halt (found running the loop
+against the real paper account, 2026-07-28).** `agent.fill_sync.sync_fills` recovers a BUY's
+intended `holding_policy_version` and a SELL's intended `lot_id` from an `OrderRecord`
+written when this system staged the order (§8.3). A trade placed directly in the broker's
+own dashboard — normal operator behaviour, not an error — stages nothing, so neither value
+exists. Refusing to guess either is correct; treating that refusal as fatal was not: the
+execution never leaves the broker, so it re-triggered the same refusal on every subsequent
+cycle, halting the scheduled loop forever with no path forward.
+
+Two resolutions were considered. Auto-ingest under whichever holding-policy version is
+"current" was rejected as the general answer, for one reason that outweighs its simplicity:
+it is BUY-only. A SELL's missing value is a `lot_id`, which must name one real, specific,
+already-open lot with enough remaining quantity — there is no analogous safe default, and
+choosing the wrong one is a silent misbooking, not a conservative fallback. Adopting
+auto-ingest for BUY would still leave SELL needing a second, different mechanism for the
+same underlying problem (unresolved intent) — the kind of duplication this plan's control
+architecture avoids elsewhere (one path from store to orders; one disposal-order
+computation, above). The adopted answer instead handles both sides uniformly:
+`agent.execution_quarantine.ExecutionQuarantineStore` quarantines the execution — the loop
+keeps running, and the execution is neither recorded nor lost — pending one explicit,
+permanent operator decision: **admit**, supplying the exact missing field (never any other),
+or **reject**, excluding it from the ledger forever. Both the quarantine and the resolution
+are recorded in the audit log. An admitted execution's `Fill` is written through the same
+`Ledger.record_fill` validation as any other — an operator-supplied lot_id or policy version
+that is wrong is refused exactly as any other caller's would be, never silently accepted.
+
+This changes what "policy version captured at fill" (above) means for an admitted BUY: the
+version is whichever one the operator names at *admission* time, which may be later than the
+trade's real placement time at the broker — the gap bounded by how long the execution sat
+quarantined, not by the reconciliation cadence alone. Whether this matters depends entirely
+on whether the holding-policy version in force ever actually changes between those two
+instants: today it does not, because the real entry point
+(`scripts.run_agent.build_account_runtime`) registers exactly one version, always named
+`"config"`, with no mechanism to swap it while a process runs — so the distinction is
+currently moot in practice. It stops being moot the day a live version-swap mechanism is
+built (not yet designed): a version is immutable once registered (`HoldingPolicyRegistry.
+register`) and a lot's minimum hold is permanently frozen to whichever version resolves at
+the moment its `Fill` is recorded (invariant #5) — an admission made after such a swap would
+freeze the externally-placed lot under the *new* version, not the one actually in force when
+the human placed the trade. Quarantine does not remove this ambiguity; it converts it from a
+silent default into a conscious, audited, one-time human choice.
+
+A manually-placed SELL hits the identical quarantine path (no resolvable `lot_id`) and is
+worse in one respect the BUY case does not share: `Ledger.record_fill` accepts exactly one
+`lot_id` per SELL fill and enforces that its quantity does not exceed that lot's remaining
+balance. A real external sale spanning more than one lot has no single correct `lot_id` an
+operator can supply at all — it cannot be admitted as one `Fill` under the ledger's current
+one-lot-per-fill model without being split, by hand, into multiple synthetic fills with
+invented per-lot quantities and fabricated fill ids, which this system has no built-in,
+verifiable way to derive from a single broker execution. This is the same shape as the
+already-named CLOSE/multi-lot gap (§8.3): a CLOSE-originated order submits as a plain SELL
+with no single intended `lot_id` either, and its fills land on this exact path. Quarantine
+does not solve that gap — an operator still cannot admit a multi-lot execution safely — but
+it does mean a CLOSE order's fills, like a genuine external sell's, are no longer fatal to
+the loop; they wait for an operator instead of halting it forever.
+
 ### 4.2 Early exit
 
 All six exception categories from Change Request §4.3 are adopted. The mechanism has four
@@ -1439,3 +1495,4 @@ plus a versioned `CapabilityChangeRequest` per §5.
 | v1.1 confirm | §4.1 records a real-account finding (§13 probe, 2026-07-27): Alpaca's cash-account API has no settled/unsettled cash field anywhere. `lot.settled` and cash-account free-riding protection can only be enforced from a local ledger's own T+1 expectation, never from broker-reported state. Settled-cash reconciliation (exact equality, Option A) is unaffected — it checks that two cash *totals* agree, not which lots are settled. The local ledger itself remains unbuilt. |
 | v1.1 confirm | §4.1 records a second confirmed finding (2026-07-27, `agent/lot_selection.py`): an internal `lot_id` does not control which lot Alpaca actually disposes of. Alpaca's own documentation (not the Customer Agreement, which names no method) confirms Compressed FIFO for end-of-day positions, Weighted Average intraday, and no API-level lot designation. `sellable_qty` was evaluating hold-eligibility per lot in isolation, which could believe a seasoned lot was sold while the broker's FIFO order actually disposed of a fresh one — fixed to walk lots in broker-actual disposal order and block on the first ineligible FIFO predecessor, no override path. `Ledger.disposal_records()` now records intended-vs-broker-actual lot per SELL fill. |
 | v1.1 fix | §9.2 topology corrected (real gap found running the loop for the first time): PAUSED was modeled as the last element of a single five-mode chain, making it a dead end (no legal one-step path back to a mode paused from DISABLED, RESEARCH, or PAPER) and — independently, more seriously — permitting DISABLED → PAUSED → PRODUCTION_ACTIVE as an unintended two-hop bypass of the one-step escalation rule. PAUSED is now modeled as an overlay outside the four-mode escalation ordering, recording the specific mode it was paused from (`paused_from`) and requiring confirmation on resume only when that mode is PRODUCTION_ACTIVE. See §9.2 for the full correction. |
+| v1.1 fix | §4.1 records a real-account finding (2026-07-28): a manually-placed BUY in the broker's own dashboard has no staged `OrderRecord`, so `agent.fill_sync.sync_fills` correctly refused to guess its holding-policy version — but the refusal was fatal, halting the scheduled loop every cycle forever with no path forward. `agent.execution_quarantine.ExecutionQuarantineStore` now quarantines an execution with unresolved intent (a BUY missing `holding_policy_version`, or a SELL/CLOSE missing `lot_id`) instead of raising; the loop continues, and an operator resolves it via `scripts.run_agent --admit-execution`/`--reject-execution`, both recorded in the audit log. See §4.1 for the full reasoning, including why quarantine (not an auto-ingest default) was chosen for both sides uniformly, and how this interacts with the already-named CLOSE/multi-lot gap (§8.3). |

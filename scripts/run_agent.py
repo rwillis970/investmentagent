@@ -92,6 +92,29 @@ PRODUCTION_ACTIVE while nothing can ever run under it), and is a genuine,
 separate gap this flag does not close -- building `AlpacaLiveAdapter` is
 Day 10 scope, not attempted here.
 
+--ADMIT-EXECUTION / --REJECT-EXECUTION: THE OPERATOR PATH FOR A QUARANTINED
+EXECUTION (found running the loop against the real paper account, §11: a
+manually-placed BUY in the broker's own dashboard halted every cycle
+forever -- see agent/execution_quarantine.py's own module docstring for the
+full reasoning). `agent.fill_sync.sync_fills` now quarantines, rather than
+raises on, an execution with no resolvable intent (a BUY with no staged
+`holding_policy_version`, or a SELL/CLOSE with no staged `lot_id`) -- the
+loop keeps running, but that execution is never turned into a ledger `Fill`
+until an operator explicitly admits or rejects it. These two flags are that
+operator action, mirroring `--advance-mode-to`'s own shape: a narrow,
+one-shot administrative command, NOT the real scheduled loop -- no adapter,
+no reconciliation, no calendar check, just `ExecutionQuarantineStore.admit`/
+`.reject` plus one `audit_log` row, then exit. `--admit-execution` requires
+EXACTLY ONE of `--admit-holding-policy-version` (for a quarantined BUY) or
+`--admit-lot-id` (for a quarantined SELL/CLOSE) -- never both, never
+neither, and never guessed; which one is required is determined by the
+quarantined execution's own recorded `side`, not by which flag happens to
+be given (giving the wrong one for that side is refused). Neither flag
+validates the admitted value against `agent.ledger.Ledger` -- that
+validation happens for free, the NEXT time `sync_fills` runs (an unknown
+holding_policy_version or lot_id is refused there, exactly as any other
+caller would be); this command only records the decision.
+
 WHAT THIS SCRIPT DOES NOT SOLVE (see agent/run_loop.py's own docstring for
 the full reasoning on each):
 
@@ -133,6 +156,7 @@ from agent.approval import ApprovalService
 from agent.audit import AuditLog
 from agent.broker.alpaca import AlpacaPaperAdapter
 from agent.broker.base import BrokerAdapter
+from agent.execution_quarantine import ExecutionQuarantineError, ExecutionQuarantineStore
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.mode_store import ModeStore
 from agent.run_loop import AccountRuntime, run_loop as real_run_loop
@@ -165,20 +189,26 @@ def _default_notify(message: str) -> None:
 
 def build_account_runtime(cfg: config_module.Config, *, account_id: str,
                           credentials: BrokerCredentials,
-                          ledger_store_path: str | Path) -> AccountRuntime:
+                          ledger_store_path: str | Path,
+                          quarantine_store_path: str | Path) -> AccountRuntime:
     """One holding-policy version, named "config", derived directly from
     the loaded Config's own minimum_hold/cooldown -- there is no existing
     Config -> HoldingPolicyRegistry helper anywhere else in this codebase
     (checked directly); this is a minimal, single-version registry, not a
     general-purpose one, because this loop never stages an order under any
-    OTHER version."""
+    OTHER version. `quarantine_store_path` is the durable file
+    `agent.execution_quarantine.ExecutionQuarantineStore` uses to remember
+    an unresolved execution across restarts, and that `--admit-execution`/
+    `--reject-execution` (below) write an operator's decision into -- see
+    agent/execution_quarantine.py's own module docstring."""
     registry = HoldingPolicyRegistry([
         HoldingPolicy(version="config", minimum_holding_period=cfg.minimum_hold,
                      cooldown_period=cfg.cooldown),
     ])
     return AccountRuntime(
         account_id=account_id, credentials=credentials,
-        ledger_store_path=ledger_store_path, policy_registry=registry,
+        ledger_store_path=ledger_store_path,
+        quarantine_store_path=quarantine_store_path, policy_registry=registry,
         max_day_trades_per_5_sessions=cfg.max_day_trades_per_5_sessions,
     )
 
@@ -295,6 +325,55 @@ def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
         return 1
 
 
+def _run_admit_or_reject(*, decision: str, execution_id: str, account_id: str,
+                         quarantine_store_path: str | Path,
+                         audit_log_path: str | Path,
+                         holding_policy_version: str | None,
+                         lot_id: str | None,
+                         now_fn: Callable[[], datetime], log: logging.Logger) -> int:
+    """The operator path for a quarantined execution (see module docstring's
+    --ADMIT-EXECUTION / --REJECT-EXECUTION section). `decision` is
+    `"admit"` or `"reject"`. Like `_run_advance_mode`: no adapter, no
+    reconciliation, no calendar check -- ONLY
+    `ExecutionQuarantineStore.admit`/`.reject` plus one audit row, then
+    exit. Deliberately does NOT touch `agent.failure_sentinel` for the same
+    reason `_run_advance_mode` does not: this is a one-shot, interactively-
+    run operator command, not the unattended scheduled loop."""
+    try:
+        store = ExecutionQuarantineStore(quarantine_store_path, account_id=account_id)
+        audit_log = AuditLog(path=audit_log_path)
+        now = now_fn()
+
+        try:
+            if decision == "admit":
+                resolution = store.admit(
+                    execution_id, decided_by="operator", decided_at=now,
+                    holding_policy_version=holding_policy_version, lot_id=lot_id,
+                )
+            else:
+                resolution = store.reject(execution_id, decided_by="operator", decided_at=now)
+        except ExecutionQuarantineError as exc:
+            log.error("refusing --%s-execution %s: %s", decision, execution_id, exc)
+            return 1
+
+        audit_log.append(
+            actor="operator",
+            action="execution_admitted" if decision == "admit" else "execution_rejected",
+            object_type="execution", object_id=execution_id,
+            after={"account_id": account_id, "lot_id": resolution.lot_id,
+                  "holding_policy_version": resolution.holding_policy_version},
+            timestamp=now,
+        )
+        log.info("%s execution %s", "admitted" if decision == "admit" else "rejected",
+                execution_id)
+        return 0
+    except Exception as exc:   # noqa: BLE001 -- never raise out of this
+        # script; see _run_advance_mode's own docstring for why this
+        # deliberately does not touch agent.failure_sentinel either.
+        log.error("--%s-execution %s failed: %s", decision, execution_id, exc)
+        return 1
+
+
 def _parse_args(argv: list[str] | None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",
@@ -309,7 +388,13 @@ def _parse_args(argv: list[str] | None):
                         help="keychain account name the API secret is stored under; "
                              "required unless --advance-mode-to is given")
     parser.add_argument("--ledger-store-path",
-                        help="required unless --advance-mode-to is given")
+                        help="required unless --advance-mode-to/--admit-execution/"
+                             "--reject-execution is given")
+    parser.add_argument("--quarantine-store-path",
+                        help="durable ExecutionQuarantineStore file (agent/"
+                             "execution_quarantine.py) -- survives a restart; required "
+                             "unless --advance-mode-to is given. Also required, alongside "
+                             "--account-id, for --admit-execution/--reject-execution.")
     parser.add_argument("--mode-store-path", required=True,
                         help="durable ModeStore file -- survives a restart")
     parser.add_argument("--audit-log-path", required=True,
@@ -323,21 +408,52 @@ def _parse_args(argv: list[str] | None):
                              "enforces the one-step rule and, for PAPER/PAUSED -> "
                              "PRODUCTION_ACTIVE, --confirmed. When given, every account/"
                              "broker flag above is ignored.")
+    parser.add_argument("--admit-execution", default=None, metavar="EXECUTION_ID",
+                        help="admit a quarantined execution (agent/execution_quarantine.py) "
+                             "with an explicit --admit-holding-policy-version (for a "
+                             "quarantined BUY) or --admit-lot-id (for a quarantined SELL/"
+                             "CLOSE), then exit -- see module docstring's --ADMIT-EXECUTION "
+                             "section. Requires --account-id and --quarantine-store-path; "
+                             "every other account/broker flag is ignored.")
+    parser.add_argument("--reject-execution", default=None, metavar="EXECUTION_ID",
+                        help="permanently exclude a quarantined execution from ever "
+                             "becoming a ledger Fill, then exit. Requires --account-id and "
+                             "--quarantine-store-path; every other account/broker flag is "
+                             "ignored.")
+    parser.add_argument("--admit-holding-policy-version", default=None,
+                        help="required by --admit-execution for a quarantined BUY; refused "
+                             "for anything else")
+    parser.add_argument("--admit-lot-id", default=None,
+                        help="required by --admit-execution for a quarantined SELL/CLOSE; "
+                             "refused for anything else")
     parser.add_argument("--confirmed", action="store_true",
                         help="required for the PAPER/PAUSED -> PRODUCTION_ACTIVE edges (§9.2); "
                              "irrelevant, and harmless, for PAPER")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
-    if args.advance_mode_to is None:
+    if args.admit_execution is not None and args.reject_execution is not None:
+        parser.error("--admit-execution and --reject-execution are mutually exclusive")
+    if args.admit_execution is not None or args.reject_execution is not None:
+        missing = [name for name, val in (
+            ("--account-id", args.account_id),
+            ("--quarantine-store-path", args.quarantine_store_path),
+        ) if val is None]
+        if missing:
+            parser.error(
+                "the following arguments are required for --admit-execution/"
+                "--reject-execution: " + ", ".join(missing)
+            )
+    elif args.advance_mode_to is None:
         missing = [name for name, val in (
             ("--config", args.config), ("--account-id", args.account_id),
             ("--key-id", args.key_id), ("--secret-ref", args.secret_ref),
             ("--ledger-store-path", args.ledger_store_path),
+            ("--quarantine-store-path", args.quarantine_store_path),
         ) if val is None]
         if missing:
             parser.error(
-                "the following arguments are required unless --advance-mode-to "
-                "is given: " + ", ".join(missing)
+                "the following arguments are required unless --advance-mode-to/"
+                "--admit-execution/--reject-execution is given: " + ", ".join(missing)
             )
     return args
 
@@ -363,8 +479,10 @@ def main(argv: list[str] | None = None, *,
 
     If `--advance-mode-to` was given, dispatches to `_run_advance_mode` and
     returns immediately -- see module docstring for the dead end that flag
-    exists to route around. None of the account/broker/failure-sentinel
-    machinery below is touched on that path."""
+    exists to route around. If `--admit-execution`/`--reject-execution` was
+    given, dispatches to `_run_admit_or_reject` and returns immediately --
+    see module docstring's --ADMIT-EXECUTION section. None of the account/
+    broker/failure-sentinel machinery below is touched on either path."""
     args = _parse_args(argv)
     logging.basicConfig(level=args.log_level)
     log = logging.getLogger(LOGGER_NAME)
@@ -376,6 +494,17 @@ def main(argv: list[str] | None = None, *,
             now_fn=now_fn, log=log,
         )
 
+    if args.admit_execution is not None or args.reject_execution is not None:
+        decision = "admit" if args.admit_execution is not None else "reject"
+        execution_id = args.admit_execution or args.reject_execution
+        return _run_admit_or_reject(
+            decision=decision, execution_id=execution_id, account_id=args.account_id,
+            quarantine_store_path=args.quarantine_store_path,
+            audit_log_path=args.audit_log_path,
+            holding_policy_version=args.admit_holding_policy_version,
+            lot_id=args.admit_lot_id, now_fn=now_fn, log=log,
+        )
+
     try:
         cfg = config_module.load(json.loads(Path(args.config).read_text()))
         secrets_provider = secrets_provider_factory(cfg.mode)
@@ -384,6 +513,7 @@ def main(argv: list[str] | None = None, *,
         account = build_account_runtime(
             cfg, account_id=args.account_id, credentials=credentials,
             ledger_store_path=args.ledger_store_path,
+            quarantine_store_path=args.quarantine_store_path,
         )
 
         mode_store = ModeStore(args.mode_store_path)
