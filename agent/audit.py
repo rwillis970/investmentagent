@@ -50,11 +50,37 @@ therefore fsyncs on every call when a `path` is set, same as `ModeStore.
 write` -- and, matching that same discipline, persists to disk BEFORE
 mutating the in-memory event list, so a failed disk write can never leave
 `events`/`verify` claiming a row that isn't actually there.
+
+A CRASH-TRUNCATED TRAILING LINE IS NOT CORRUPTION; A TRUNCATED ROW ANYWHERE
+ELSE IS. `_load` reads the whole file up front (never observes a row
+written during its own replay). fsync's own guarantee -- every row but a
+possible final one was completely, durably written before the next append
+began -- means a malformed row can only ever be explained by a crash if it
+is the LAST line; a malformed row anywhere else cannot be, and is treated
+as tampering (raises `AuditError`). A crash-truncated final line does not
+raise: it is recorded on the instance (`truncated_tail_on_load`) and logged
+as a warning, so it is never silently discarded -- an operator needs to
+know a row was lost, even though the log itself remains startable.
+
+NON-JSON-NATIVE `before`/`after`: REJECTED AT `append`, NOT TOLERATED.
+`_digest` and the literal `json.dumps(_encode_event(ev))` disk write used
+to disagree -- `_digest` tolerated a datetime/Decimal via `default=str`,
+the disk write did not, so such a payload would hash successfully and then
+raise a bare TypeError at persist time, inside the log whose job is
+recording failures. Chosen fix: reject non-JSON-native values in `before`/
+`after` up front, in `append`, before either hashing or writing happens --
+not tolerate in both. A silent `str(x)` fallback can hide a real bug at the
+call site (a raw datetime instead of the `.isoformat()` every other
+timestamp in this codebase uses; a Decimal instead of the float everything
+else uses for money), and for evidence whose whole purpose is precision, an
+implicit, not-obviously-canonical string conversion is a worse failure mode
+than an immediate, loud rejection. See `_assert_json_native`.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,6 +88,7 @@ from pathlib import Path
 from typing import Any
 
 GENESIS = "0" * 64
+LOGGER_NAME = "investmentagent.audit"
 
 
 class AuditError(Exception):
@@ -104,8 +131,54 @@ class AuditEvent:
     hash: str
 
 
+_JSON_NATIVE_SCALARS = (str, int, float, bool, type(None))
+
+
+def _assert_json_native(value: Any, *, field: str) -> None:
+    """`append`'s ONE shared validation, so hashing (`_digest`) and
+    persistence (the literal `json.dumps(_encode_event(ev))` write in
+    `append`) can never disagree about what's acceptable again: previously
+    `_digest` silently tolerated a datetime/Decimal via `default=str` while
+    the disk write did not, so a payload like that would hash successfully
+    and then raise a bare TypeError at persist time -- inside the log whose
+    entire job is recording failures. Rejecting here, before either hashing
+    or writing happens, is the chosen direction over tolerating in both:
+    a silent `str(x)` fallback can hide a real bug at the call site (e.g. a
+    raw datetime slipping into `before`/`after` instead of the `.isoformat()`
+    every other timestamp in this codebase uses), and for evidence whose
+    whole purpose is precision, an implicit, non-obviously-canonical string
+    conversion is a worse failure mode than an immediate, loud rejection."""
+    if isinstance(value, _JSON_NATIVE_SCALARS):
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise AuditError(
+                    f"{field}: dict key {k!r} ({type(k).__name__}) is not "
+                    f"a str -- not JSON-native")
+            _assert_json_native(v, field=f"{field}[{k!r}]")
+        return
+    if isinstance(value, (list, tuple)):
+        for i, v in enumerate(value):
+            _assert_json_native(v, field=f"{field}[{i}]")
+        return
+    raise AuditError(
+        f"{field} contains a {type(value).__name__}, which is not "
+        f"JSON-native (str/int/float/bool/None/dict/list) -- convert it "
+        f"explicitly at the call site (e.g. .isoformat() for a datetime, "
+        f"float() or str() for a Decimal) before calling AuditLog.append. "
+        f"See agent/audit.py's own module docstring for why this is "
+        f"rejected here rather than silently stringified."
+    )
+
+
 def _digest(payload: dict, prev_hash: str) -> str:
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    # No `default=` fallback: every payload reaching here has already
+    # passed `_assert_json_native` in `append` (or, on `verify`, came from
+    # `json.loads` in the first place) -- guaranteed JSON-native already,
+    # so a TypeError here would mean that guarantee was violated, not that
+    # tolerance is needed.
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256((prev_hash + body).encode("utf-8")).hexdigest()
 
 
@@ -141,6 +214,10 @@ class AuditLog:
     def __init__(self, path: str | Path | None = None):
         self._events: _AppendOnlyList = _AppendOnlyList()
         self._path = Path(path) if path else None
+        # Set on every _load(): the raw text of a crash-truncated trailing
+        # row, if the most recent load found one, else None. See _load's
+        # own docstring for why this must be recorded, not just discarded.
+        self.truncated_tail_on_load: str | None = None
         if self._path and self._path.exists():
             self._load()
 
@@ -152,6 +229,13 @@ class AuditLog:
                before: Any = None, after: Any = None,
                correlation_id: str | None = None,
                timestamp: datetime | None = None) -> AuditEvent:
+        # Reject non-JSON-native before/after BEFORE computing a prev/seq or
+        # touching disk -- see _assert_json_native's own docstring for why
+        # this, not silent stringification, is the chosen direction, and why
+        # doing it here (once) is what keeps hashing and persistence from
+        # ever disagreeing about what's acceptable again.
+        _assert_json_native(before, field="before")
+        _assert_json_native(after, field="after")
         ts = timestamp or datetime.now(timezone.utc)
         prev = self._events[-1].hash if self._events else GENESIS
         payload = {
@@ -178,13 +262,57 @@ class AuditLog:
         return ev
 
     def _load(self) -> None:
+        """A malformed row can mean one of two very different things, and
+        they must not be handled the same way:
+
+        - The LAST line fails to parse, and every line before it is fine:
+          this is a crash mid-write. `append` persists BEFORE mutating
+          memory and fsyncs on every call (module docstring), which
+          guarantees every row before the one in flight at the moment of a
+          crash was already completely, durably written -- only the row
+          that was actively being written when the process died can ever
+          be incomplete, and it can only ever be the last one. This is
+          evidence of an unclean shutdown, not corruption: tolerate it,
+          but it must not vanish without a trace -- record the raw partial
+          text (`truncated_tail_on_load`) and log a warning, so an
+          operator can see a row was lost.
+        - Any OTHER line fails to parse -- one that is not the last line in
+          the file: fsync's own guarantee rules out a crash as the
+          explanation, since every row but a possible final one was
+          durably complete before the next append began. This can only be
+          an edit made after the fact -- tampering -- and must raise, not
+          be silently tolerated.
+        """
         # Read the whole file before appending anything -- matching
         # ModeStore._load/FactStore._load's own reasoning: the reader must
         # never observe a row written during its own replay.
         with self._path.open(encoding="utf-8") as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
-        for line in lines:
-            self._events.append(_decode_event(json.loads(line)))
+        self.truncated_tail_on_load = None
+        for i, line in enumerate(lines):
+            is_last = i == len(lines) - 1
+            try:
+                decoded = json.loads(line)
+            except json.JSONDecodeError as exc:
+                if not is_last:
+                    raise AuditError(
+                        f"AuditLog {self._path}: malformed row at line "
+                        f"{i + 1} of {len(lines)}, which is NOT the final "
+                        f"line -- fsync guarantees every row but a "
+                        f"possible last one was completely written before "
+                        f"the next append began, so this cannot be a "
+                        f"crash. Treating this as tampering: {exc}"
+                    ) from exc
+                self.truncated_tail_on_load = line
+                logging.getLogger(LOGGER_NAME).warning(
+                    "AuditLog %s: discarding an unparseable final line "
+                    "(%d chars) on load -- every earlier row parses "
+                    "cleanly, so this looks like a crash mid-write, not "
+                    "tampering. The row is lost; nothing else re-supplies "
+                    "it. Raw content: %r", self._path, len(line), line,
+                )
+                break
+            self._events.append(_decode_event(decoded))
 
     def verify(self) -> bool:
         prev = GENESIS

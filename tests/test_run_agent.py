@@ -10,11 +10,14 @@ alpaca_probe.py's own test file's approach.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from agent import config as config_module
+from agent import mode as mode_fsm
 from agent.accounts import BrokerCredentials
+from agent.audit import AuditLog
 from agent.holding import HoldingPolicyRegistry
+from agent.mode_store import ModeStore
 from agent.secrets_provider import InMemorySecretsProvider
 from scripts.run_agent import build_account_runtime, main
 
@@ -191,25 +194,54 @@ def test_the_same_failure_recurring_three_times_notifies_on_the_third(tmp_path):
     assert "3" in notified[0] or "keychain locked" in notified[0]
 
 
-def test_a_different_failure_each_time_never_notifies(tmp_path):
+def test_a_different_exception_type_each_time_never_notifies(tmp_path):
+    """Recurrence is keyed on exception TYPE (see agent/failure_sentinel.py),
+    not message text -- three genuinely different problems, one per
+    relaunch, must never accumulate into a false alert."""
     config_path = tmp_path / "config.json"
     config_path.write_text(__import__("json").dumps(base_config()))
 
-    messages = ["first failure", "second failure", "third failure"]
+    exc_types = [RuntimeError, ValueError, OSError]
     notified = []
-    for msg in messages:
-        def make_failing_run_loop(_msg):
+    for exc_type in exc_types:
+        def make_failing_run_loop(_exc_type):
             def failing_run_loop(**kwargs):
-                raise RuntimeError(_msg)
+                raise _exc_type("boom")
             return failing_run_loop
 
         code = main(
-            _argv(tmp_path, config_path), run_loop_fn=make_failing_run_loop(msg),
+            _argv(tmp_path, config_path), run_loop_fn=make_failing_run_loop(exc_type),
             secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
             notify_fn=notified.append,
         )
         assert code == 1
     assert notified == []
+
+
+def test_the_same_exception_type_recurring_with_a_varying_message_still_notifies(tmp_path):
+    """The actual bug being fixed: a permanent failure (e.g. a
+    reconciliation halt) whose message carries incidental, ever-changing
+    detail -- here, a different dollar figure each relaunch -- must still
+    be recognized as the SAME recurring failure and notify on the 3rd,
+    because it is the same exception type every time."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+
+    cash_figures = ["498.13", "501.77", "496.02"]
+    notified = []
+    for cash in cash_figures:
+        def make_failing_run_loop(_cash):
+            def failing_run_loop(**kwargs):
+                raise RuntimeError(f"settled_cash mismatch: broker={_cash}")
+            return failing_run_loop
+
+        code = main(
+            _argv(tmp_path, config_path), run_loop_fn=make_failing_run_loop(cash),
+            secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+            notify_fn=notified.append,
+        )
+        assert code == 1
+    assert len(notified) == 1
 
 
 def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
@@ -254,3 +286,151 @@ def test_a_raising_notify_fn_does_not_change_the_exit_code_or_propagate(tmp_path
             notify_fn=bad_notify,
         )
     assert code == 1
+
+
+# ------------------------------------------------------- --advance-mode-to
+#
+# Found running the loop for the first time: §9.2's one-step rule means
+# PAPER is unreachable from a fresh DISABLED install in one step, and
+# run_cycle constructs a broker adapter (unconditionally, for every
+# account, before run_startup ever runs) even when the operator sets
+# mode: RESEARCH to legally take the FIRST step -- but RESEARCH must never
+# have an adapter, and AlpacaPaperAdapter refuses a secrets_provider bound
+# to any mode but PAPER. Both refusals are individually correct; together
+# they make PAPER unreachable via the real loop. --advance-mode-to runs
+# ONLY the mode transition (agent.mode.assert_legal_startup + ModeStore),
+# with no adapter, no accounts, no reconciliation at all.
+
+def _mode_argv(mode_store_path, audit_log_path, target, *, confirmed=False):
+    argv = [
+        "--mode-store-path", str(mode_store_path),
+        "--audit-log-path", str(audit_log_path),
+        "--advance-mode-to", target,
+    ]
+    if confirmed:
+        argv.append("--confirmed")
+    return argv
+
+
+def test_advance_mode_does_not_require_account_or_broker_flags(tmp_path):
+    """The whole point: this path needs none of --config/--account-id/
+    --key-id/--secret-ref/--ledger-store-path."""
+    code = main(_mode_argv(tmp_path / "mode.jsonl", tmp_path / "audit.jsonl", "RESEARCH"))
+    assert code == 0
+
+
+def test_missing_account_flags_without_advance_mode_still_errors(tmp_path):
+    """The normal (real-loop) path must still require every account/broker
+    flag exactly as before -- only --advance-mode-to relaxes that."""
+    import pytest
+    argv = [
+        "--mode-store-path", str(tmp_path / "mode.jsonl"),
+        "--audit-log-path", str(tmp_path / "audit.jsonl"),
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_advance_mode_from_disabled_to_research_writes_mode_and_audit_row(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    code = main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    assert code == 0
+
+    store = ModeStore(mode_path)
+    assert store.current() == "RESEARCH"
+
+    log = AuditLog(path=audit_path)
+    assert log.verify() is True
+    transitions = [e for e in log.events if e.action == "mode_transition"]
+    assert len(transitions) == 1
+    assert transitions[0].actor == "operator"
+    assert transitions[0].before == {"mode": None}
+    assert transitions[0].after == {"mode": "RESEARCH"}
+
+
+def test_advance_mode_two_steps_at_once_is_refused(tmp_path):
+    """DISABLED -> PAPER directly is illegal (two steps); nothing is
+    written to either store on refusal."""
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    code = main(_mode_argv(mode_path, audit_path, "PAPER"))
+    assert code == 1
+    assert not mode_path.exists()
+    assert not audit_path.exists()
+
+
+def test_advance_mode_walks_disabled_research_paper(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    assert main(_mode_argv(mode_path, audit_path, "RESEARCH")) == 0
+    assert main(_mode_argv(mode_path, audit_path, "PAPER")) == 0
+    assert ModeStore(mode_path).current() == "PAPER"
+
+
+def test_advance_mode_to_paper_to_production_active_requires_confirmed(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    main(_mode_argv(mode_path, audit_path, "PAPER"))
+
+    before_events = len(AuditLog(path=audit_path).events)
+    code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=False))
+    assert code == 1
+    assert ModeStore(mode_path).current() == "PAPER"   # unchanged
+    assert len(AuditLog(path=audit_path).events) == before_events   # nothing written
+
+
+def test_advance_mode_to_paper_to_production_active_succeeds_when_confirmed(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    main(_mode_argv(mode_path, audit_path, "PAPER"))
+
+    code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
+    assert code == 0
+    assert ModeStore(mode_path).current() == "PRODUCTION_ACTIVE"
+
+
+def test_advance_mode_to_the_current_mode_is_a_no_op_and_writes_nothing(tmp_path):
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    before = len(AuditLog(path=audit_path).events)
+
+    code = main(_mode_argv(mode_path, audit_path, "RESEARCH"))
+    assert code == 0
+    assert len(AuditLog(path=audit_path).events) == before   # no duplicate row
+    assert ModeStore(mode_path).current() == "RESEARCH"
+
+
+def test_advance_mode_unknown_mode_name_is_rejected_by_argparse(tmp_path):
+    import pytest
+    argv = _mode_argv(tmp_path / "mode.jsonl", tmp_path / "audit.jsonl", "NOT_A_REAL_MODE")
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_advance_mode_never_constructs_a_broker_adapter(tmp_path, monkeypatch):
+    """The exact gap being fixed: this path must not touch AlpacaPaperAdapter
+    (or any adapter) at all -- monkeypatch it to raise if constructed."""
+    import scripts.run_agent as run_agent_module
+
+    def _boom(*a, **k):
+        raise AssertionError("--advance-mode-to must never construct an adapter")
+
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _boom)
+    code = main(_mode_argv(tmp_path / "mode.jsonl", tmp_path / "audit.jsonl", "RESEARCH"))
+    assert code == 0
+
+
+def test_advance_mode_uses_the_injected_now_fn(tmp_path):
+    fixed = datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    code = main(_mode_argv(mode_path, audit_path, "RESEARCH"), now_fn=lambda: fixed)
+    assert code == 0
+    change = ModeStore(mode_path).history()[-1]
+    assert change.changed_at == fixed

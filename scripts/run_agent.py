@@ -38,6 +38,60 @@ transient failure never notifies. See deploy/README.md for the manual
 fallback (`launchctl list`, tailing the log files) alongside this automatic
 path.
 
+--ADVANCE-MODE-TO: THE OPERATOR PATH AROUND A REAL DEAD END (found running
+the loop for the first time). §9.2's one-step rule requires DISABLED ->
+RESEARCH -> PAPER; a fresh install cannot reach PAPER in one step. Setting
+`mode: RESEARCH` in config.json to legally take the first step does not
+work either: `run_cycle` (agent/run_loop.py) constructs a broker adapter
+for every configured account UNCONDITIONALLY, before `run_startup` ever
+runs -- and `_real_adapter_factory` below always builds an
+`AlpacaPaperAdapter`, whose constructor refuses any `secrets_provider` not
+bound to `PAPER`. Since `secrets_provider_factory(cfg.mode)` binds the
+provider to whatever `cfg.mode` says, setting `cfg.mode: RESEARCH` makes
+the secrets provider RESEARCH-bound, which `AlpacaPaperAdapter` then
+refuses at construction -- before `run_startup` even gets a chance to
+correctly refuse "accounts handed to RESEARCH" on its own terms. Both
+refusals are individually correct; together, run through the real loop,
+they make PAPER unreachable.
+
+`--advance-mode-to MODE` is the fix: it runs ONLY the mode transition --
+`agent.startup._reconcile_mode_persistence` (the same mode_store-vs-
+audit_log divergence check `run_startup` performs; reused, not
+reimplemented, per DECISION 7 in agent/startup.py's own docstring) followed
+by `mode.assert_legal_startup` (the one-step rule AND the PAPER/PAUSED ->
+PRODUCTION_ACTIVE confirmation gate) -- then writes `ModeStore` and one
+`mode_transition` audit row (actor="operator", distinguishing a manual
+advance from `run_startup`'s own actor="system" rows) and exits. NO account,
+NO adapter, NO secrets provider, NO reconciliation, NO calendar-coverage
+check is ever constructed or run on this path -- see `_run_advance_mode`'s
+own docstring for exactly what that last omission does and does not cost.
+When given, every account/broker flag (`--config`/`--account-id`/`--key-id`/
+`--secret-ref`/`--ledger-store-path`) becomes optional and is ignored;
+without it, they are required exactly as before. `--confirmed` is shared
+with the real loop's own flag -- required for PAPER -> PRODUCTION_ACTIVE and
+PAUSED -> PRODUCTION_ACTIVE, exactly per §9.2, not bypassed here.
+
+DOES THE SAME DEAD END EXIST FOR PAPER -> PRODUCTION_ACTIVE? Yes, and worse.
+PAPER -> PRODUCTION_ACTIVE is only ONE step (legal on the chain, gated only
+by `--confirmed`) so the FSM itself is not the blocker -- but
+`_real_adapter_factory` is hardcoded to construct an `AlpacaPaperAdapter`
+regardless of `cfg.mode`, and there is no `AlpacaLiveAdapter` anywhere in
+this codebase (agent/broker/alpaca.py's own docstring: "only the PAPER half
+... is actually built and enabled here" -- Day 10, not built). So setting
+`cfg.mode: PRODUCTION_ACTIVE` and running the real loop would hit the exact
+same `AlpacaPaperAdapter`-refuses-a-mismatched-secrets_provider crash, for
+an even more fundamental reason: there is currently no adapter implementation
+capable of ever operating in PRODUCTION_ACTIVE at all, not just a
+wrongly-bound one. `--advance-mode-to PRODUCTION_ACTIVE --confirmed` WILL
+still succeed at flipping the persisted mode (it constructs no adapter, so
+the missing live adapter is not in its way) -- but every subsequent attempt
+to actually run the real loop in that mode will immediately fail at adapter
+construction, every cycle, until a live adapter exists. This is safe (no
+live trading can occur) but operationally confusing (mode claims
+PRODUCTION_ACTIVE while nothing can ever run under it), and is a genuine,
+separate gap this flag does not close -- building `AlpacaLiveAdapter` is
+Day 10 scope, not attempted here.
+
 WHAT THIS SCRIPT DOES NOT SOLVE (see agent/run_loop.py's own docstring for
 the full reasoning on each):
 
@@ -73,6 +127,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent import config as config_module
 from agent import failure_sentinel
+from agent import mode as mode_fsm
 from agent.accounts import BrokerCredentials
 from agent.approval import ApprovalService
 from agent.audit import AuditLog
@@ -82,6 +137,7 @@ from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.mode_store import ModeStore
 from agent.run_loop import AccountRuntime, run_loop as real_run_loop
 from agent.secrets_provider import KeychainSecretsProvider, SecretsProvider
+from agent.startup import _reconcile_mode_persistence
 
 LOGGER_NAME = "investmentagent.run_loop"
 
@@ -143,46 +199,165 @@ def _real_adapter_factory(secrets_provider: SecretsProvider,
     return factory
 
 
+def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
+                      audit_log_path: str | Path, confirmed: bool,
+                      now_fn: Callable[[], datetime], log: logging.Logger) -> int:
+    """The operator path around the PAPER-unreachable-on-a-fresh-install
+    dead end (see module docstring). Deliberately narrower than
+    `run_startup`: no accounts, no adapter, no reconciliation, no
+    audit-chain verification, no approval sweep -- ONLY the mode
+    transition, through the exact same two pieces `run_startup` itself
+    uses (`_reconcile_mode_persistence`, `mode.assert_legal_startup`),
+    reused rather than reimplemented so there is still exactly one way
+    this codebase ever decides "what mode are we really in" (agent/
+    startup.py's own DECISION 7 already rejected a second reader of that
+    durable value).
+
+    On a REFUSAL (illegal step, or a guarded edge without --confirmed),
+    NOTHING is written to either store -- this is a validation failure on
+    an administrative command, not a failed startup attempt with a real
+    cycle behind it, so there is no reason for `_halt`'s own forced-PAUSED
+    behaviour to apply here; the persisted mode is left exactly as it was.
+
+    Target-equals-persisted is treated as a legal, silent no-op (mirroring
+    `run_startup`'s own "only write a REAL transition" rule) -- advancing
+    into the mode already persisted writes nothing to either store.
+
+    NOT DONE HERE, ON PURPOSE: `market_calendar.assert_calendar_coverage_
+    at_startup`. See agent/mode.py's own pre-existing "KNOWN GAP -- RUNTIME
+    MODE TRANSITIONS" comment above `assert_legal_startup`: it says a
+    runtime transition function, when built, must also run that check for
+    a target that exercises the calendar. This function is exactly that
+    runtime transition function, and deliberately does not -- the scope
+    given for this flag was `assert_legal_startup` + `ModeStore` only. This
+    is still safe: the calendar check runs, fresh, inside `run_startup` on
+    the very next REAL cycle (`agent.run_loop.run_cycle` always calls it),
+    which is the only place any account is ever actually reconciled or any
+    order could ever be routed. This flag can legally write a
+    calendar-doomed mode into the store; it cannot make anything trade on
+    it.
+
+    Any unexpected exception (e.g. `mode_store_path`'s parent directory
+    does not exist) is caught and logged, matching this script's own
+    never-raises, always-0-or-1 contract -- but deliberately does NOT touch
+    `agent.failure_sentinel`: that mechanism exists for the UNATTENDED
+    scheduled loop across launchd relaunches, not for a one-shot,
+    interactively-run operator command, and sharing the same sentinel file
+    (derived from the same --audit-log-path) would cross-contaminate the
+    real loop's own recurrence count with this command's."""
+    try:
+        mode_store = ModeStore(mode_store_path)
+        audit_log = AuditLog(path=audit_log_path)
+        now = now_fn()
+
+        persisted = _reconcile_mode_persistence(
+            mode_store, audit_log, now=now, correlation_id=None)
+
+        try:
+            mode_fsm.assert_legal_startup(persisted, target_mode, confirmed=confirmed)
+        except mode_fsm.ModeTransitionError as exc:
+            log.error("refusing --advance-mode-to %s: %s", target_mode, exc)
+            return 1
+
+        if target_mode == persisted:
+            log.info("already in mode %s; nothing to advance", target_mode)
+            return 0
+
+        mode_store.write(target_mode, changed_at=now,
+                         reason="--advance-mode-to operator command")
+        audit_log.append(actor="operator", action="mode_transition",
+                         object_type="mode", object_id="system",
+                         before={"mode": persisted}, after={"mode": target_mode},
+                         timestamp=now)
+        log.info("advanced mode %s -> %s", persisted, target_mode)
+        return 0
+    except Exception as exc:   # noqa: BLE001 -- never raise out of this
+        # script; see module docstring for why this deliberately does not
+        # touch agent.failure_sentinel.
+        log.error("--advance-mode-to %s failed: %s", target_mode, exc)
+        return 1
+
+
 def _parse_args(argv: list[str] | None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="path to a config.json (config.example.json shape)")
-    parser.add_argument("--account-id", required=True)
-    parser.add_argument("--key-id", required=True, help="Alpaca paper API key id (not the secret)")
-    parser.add_argument("--secret-ref", required=True,
-                        help="keychain account name the API secret is stored under")
-    parser.add_argument("--ledger-store-path", required=True)
+    parser.add_argument("--config",
+                        help="path to a config.json (config.example.json shape); "
+                             "required unless --advance-mode-to is given")
+    parser.add_argument("--account-id",
+                        help="required unless --advance-mode-to is given")
+    parser.add_argument("--key-id",
+                        help="Alpaca paper API key id (not the secret); required "
+                             "unless --advance-mode-to is given")
+    parser.add_argument("--secret-ref",
+                        help="keychain account name the API secret is stored under; "
+                             "required unless --advance-mode-to is given")
+    parser.add_argument("--ledger-store-path",
+                        help="required unless --advance-mode-to is given")
     parser.add_argument("--mode-store-path", required=True,
                         help="durable ModeStore file -- survives a restart")
     parser.add_argument("--audit-log-path", required=True,
                         help="durable AuditLog file -- survives a restart, fsynced on every "
                              "append (see agent/audit.py's own docstring for why)")
+    parser.add_argument("--advance-mode-to", choices=list(mode_fsm.CHAIN), default=None,
+                        help="advance the PERSISTED mode one legal §9.2 step, with no "
+                             "broker adapter and no account reconciliation, then exit -- "
+                             "the operator path around the PAPER-unreachable-in-one-step "
+                             "dead end on a fresh install (see module docstring). Still "
+                             "enforces the one-step rule and, for PAPER/PAUSED -> "
+                             "PRODUCTION_ACTIVE, --confirmed. When given, every account/"
+                             "broker flag above is ignored.")
     parser.add_argument("--confirmed", action="store_true",
                         help="required for the PAPER/PAUSED -> PRODUCTION_ACTIVE edges (§9.2); "
                              "irrelevant, and harmless, for PAPER")
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.advance_mode_to is None:
+        missing = [name for name, val in (
+            ("--config", args.config), ("--account-id", args.account_id),
+            ("--key-id", args.key_id), ("--secret-ref", args.secret_ref),
+            ("--ledger-store-path", args.ledger_store_path),
+        ) if val is None]
+        if missing:
+            parser.error(
+                "the following arguments are required unless --advance-mode-to "
+                "is given: " + ", ".join(missing)
+            )
+    return args
 
 
 def main(argv: list[str] | None = None, *,
         run_loop_fn: Callable = real_run_loop,
         secrets_provider_factory: Callable[[str], SecretsProvider] = KeychainSecretsProvider,
         notify_fn: Callable[[str], None] = _default_notify,
+        now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         ) -> int:
     """Returns 0 or 1 -- never raises. `run_loop_fn`/`secrets_provider_factory`/
-    `notify_fn` are injectable so this can be tested with no real keychain,
-    network, infinite loop, or actual macOS notification (see tests/
-    test_run_agent.py); the real entry point below calls this with all
-    three left at their real defaults.
+    `notify_fn`/`now_fn` are injectable so this can be tested with no real
+    keychain, network, infinite loop, actual macOS notification, or real
+    clock (see tests/test_run_agent.py); the real entry point below calls
+    this with all four left at their real defaults.
 
     `notify_fn` backs the "how does an operator find out" requirement for a
     PERMANENT failure (a locked keychain, an expired credential, a genuine
     reconciliation halt): see agent/failure_sentinel.py. It is called at
     most once per FAILURE_ALERT_THRESHOLD-recurrence, never on a single
     occurrence, and a raising `notify_fn` is caught here -- it must never
-    change this function's exit code or propagate past it."""
+    change this function's exit code or propagate past it.
+
+    If `--advance-mode-to` was given, dispatches to `_run_advance_mode` and
+    returns immediately -- see module docstring for the dead end that flag
+    exists to route around. None of the account/broker/failure-sentinel
+    machinery below is touched on that path."""
     args = _parse_args(argv)
     logging.basicConfig(level=args.log_level)
     log = logging.getLogger(LOGGER_NAME)
+
+    if args.advance_mode_to is not None:
+        return _run_advance_mode(
+            target_mode=args.advance_mode_to, mode_store_path=args.mode_store_path,
+            audit_log_path=args.audit_log_path, confirmed=args.confirmed,
+            now_fn=now_fn, log=log,
+        )
 
     try:
         cfg = config_module.load(json.loads(Path(args.config).read_text()))
@@ -222,22 +397,27 @@ def main(argv: list[str] | None = None, *,
         # "How does an operator find out" (§11 final unit, Commit 2): the
         # sentinel file lives next to the audit log -- no new required CLI
         # flag -- and survives across separate launchd relaunches (each its
-        # own main() call). See agent/failure_sentinel.py's own docstring
-        # for why this recurrence check, rather than a plain retry count,
-        # is what distinguishes a PERMANENT failure from a transient one.
+        # own main() call). Recurrence is keyed on exception TYPE
+        # (type(exc).__name__), not message text -- see agent.
+        # failure_sentinel's own docstring for why: a message can carry
+        # incidental, ever-changing detail (a timestamp, a request id, the
+        # cash figure in a reconciliation mismatch) that would otherwise
+        # make a genuinely permanent failure never look like a recurrence
+        # at all.
         try:
             sentinel_path = Path(args.audit_log_path).parent / "failure_sentinel.json"
             prior = failure_sentinel.load(sentinel_path)
             record = failure_sentinel.record_failure(
-                prior, message=str(exc), now=datetime.now(timezone.utc))
+                prior, exc_type=type(exc).__name__, message=str(exc),
+                now=datetime.now(timezone.utc))
             failure_sentinel.save(sentinel_path, record)
             if failure_sentinel.should_alert(record, threshold=FAILURE_ALERT_THRESHOLD):
                 message = (
-                    f"investmentagent: the SAME failure has now recurred "
-                    f"{record.consecutive_count} times in a row since "
-                    f"{record.first_at.isoformat()} -- this looks PERMANENT "
-                    f"(a locked keychain, an expired credential, or a genuine "
-                    f"reconciliation halt), not transient: {exc}"
+                    f"investmentagent: the SAME failure ({record.exc_type}) has "
+                    f"now recurred {record.consecutive_count} times in a row "
+                    f"since {record.first_at.isoformat()} -- this looks "
+                    f"PERMANENT (a locked keychain, an expired credential, or a "
+                    f"genuine reconciliation halt), not transient. Latest: {exc}"
                 )
                 log.error(message)
                 try:

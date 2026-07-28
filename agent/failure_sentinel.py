@@ -17,7 +17,31 @@ DELIBERATELY NOT append-only, unlike every other durable store in this
 codebase (`ModeStore`/`LedgerStore`/`AuditLog`). This is disposable
 operational state -- what failed last time, and how many times in a row --
 not evidence anything downstream needs a permanent history of; overwriting
-it on every save is the right choice, not an oversight."""
+it on every save is the right choice, not an oversight.
+
+`save` CREATES ITS OWN PARENT DIRECTORY (real gap found running the loop
+for the first time): unlike `ModeStore`/`LedgerStore`/`AuditLog`, which
+deliberately do NOT do this (an operator is expected to create `state/`
+first; their own tests rely on a missing parent raising), this file's
+entire purpose is making a permanent failure visible -- refusing to write
+because the very `state/` directory a fresh install hasn't created yet
+doesn't exist would silently disable the one mechanism meant to surface
+exactly this kind of problem, at exactly the moment it's most likely to be
+needed. See `save`'s own docstring.
+
+KEYED ON EXCEPTION TYPE, NOT MESSAGE TEXT. This originally compared the raw
+exception message string, which was wrong: a genuinely permanent failure
+whose message carries incidental, ever-changing detail -- a timestamp, a
+request id, the cash figure in a reconciliation mismatch -- never
+reproduces the same string twice, so it never looked like a recurrence at
+all and would restart-loop forever without ever notifying. `type(exc).
+__name__` is what this codebase's call sites actually vary meaningfully
+by (`SecretNotFoundError`, `TransportError`, `ReconciliationError`, ...);
+the same exception TYPE recurring, whatever its message's incidental
+details, is "the same permanent failure" in every sense that matters here.
+`message` is still recorded and updated to the latest occurrence (useful
+for an operator to see exactly what's happening right now), but it is no
+longer part of what determines recurrence."""
 from __future__ import annotations
 
 import json
@@ -28,26 +52,29 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class FailureRecord:
+    exc_type: str
     message: str
     first_at: datetime
     last_at: datetime
     consecutive_count: int
 
 
-def record_failure(prior: FailureRecord | None, *, message: str,
+def record_failure(prior: FailureRecord | None, *, exc_type: str, message: str,
                    now: datetime) -> FailureRecord:
-    """The same `message` as `prior` extends the streak (increments
-    `consecutive_count`, keeps `first_at`); anything else -- including no
-    prior record at all -- starts a fresh one at count 1. Comparing the
-    raw exception message string is a deliberately simple signal: it is
-    exactly what scripts/run_agent.py already has in hand (`str(exc)`), and
-    a genuinely stuck failure (the same locked keychain, the same expired
-    credential, the same reconciliation mismatch) reliably reproduces the
-    same message on every relaunch, while an unrelated failure reliably
-    does not."""
-    if prior is not None and prior.message == message:
-        return replace(prior, last_at=now, consecutive_count=prior.consecutive_count + 1)
-    return FailureRecord(message=message, first_at=now, last_at=now, consecutive_count=1)
+    """The same `exc_type` as `prior` extends the streak (increments
+    `consecutive_count`, keeps `first_at`, updates `message` to this
+    occurrence's) -- regardless of whether `message` itself matches;
+    anything else -- a different `exc_type`, or no prior record at all --
+    starts a fresh one at count 1. See module docstring for why exception
+    type, not message text, is the recurrence key: `type(exc).__name__` is
+    exactly what scripts/run_agent.py already has in hand alongside
+    `str(exc)`, and it is stable across restarts in a way an interpolated
+    message (a timestamp, a request id, a dollar figure) is not."""
+    if prior is not None and prior.exc_type == exc_type:
+        return replace(prior, message=message, last_at=now,
+                      consecutive_count=prior.consecutive_count + 1)
+    return FailureRecord(exc_type=exc_type, message=message, first_at=now,
+                        last_at=now, consecutive_count=1)
 
 
 def should_alert(record: FailureRecord, *, threshold: int = 3) -> bool:
@@ -64,6 +91,7 @@ def load(path: str | Path) -> FailureRecord | None:
         return None
     d = json.loads(p.read_text())
     return FailureRecord(
+        exc_type=d["exc_type"],
         message=d["message"],
         first_at=datetime.fromisoformat(d["first_at"]),
         last_at=datetime.fromisoformat(d["last_at"]),
@@ -73,8 +101,21 @@ def load(path: str | Path) -> FailureRecord | None:
 
 def save(path: str | Path, record: FailureRecord) -> None:
     """Overwrites whatever was there -- see module docstring for why this
-    one, unlike this codebase's other durable stores, is NOT append-only."""
+    one, unlike this codebase's other durable stores, is NOT append-only.
+
+    Creates its own parent directory if missing (real gap found running the
+    loop for the first time): ModeStore/LedgerStore/AuditLog deliberately do
+    NOT do this -- an operator is expected to create state/ before those are
+    ever written to, and their own tests rely on a missing parent raising.
+    This file is different: its entire purpose is making a permanent
+    failure visible, and refusing to write because the very state/
+    directory that a fresh install hasn't created yet doesn't exist is
+    self-defeating -- it silently disables the one mechanism meant to
+    surface exactly this kind of problem, at exactly the moment (a fresh
+    install) it's most likely to be needed."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     d = asdict(record)
     d["first_at"] = record.first_at.isoformat()
     d["last_at"] = record.last_at.isoformat()
-    Path(path).write_text(json.dumps(d))
+    p.write_text(json.dumps(d))
