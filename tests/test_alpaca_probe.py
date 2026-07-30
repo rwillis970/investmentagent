@@ -21,7 +21,8 @@ from pathlib import Path
 
 from agent.broker.transport import ScriptedTransport
 from agent.secrets_provider import InMemorySecretsProvider
-from scripts.alpaca_probe import DEFAULT_SYMBOLS, _get, _redact, probe
+from scripts.alpaca_probe import (DEFAULT_ACTIVITIES_SINCE, DEFAULT_SYMBOLS, _fetch_all_activities_since,
+                                  _get, _redact, probe)
 
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "alpaca_probe.py"
 
@@ -88,16 +89,20 @@ def test_get_helper_forwards_params():
 
 # --------------------------------------------------------------- probe()
 
-def _queued_transport(symbols):
+def _queued_transport(symbols, *, activities_since_pages=([],)):
     """A ScriptedTransport pre-loaded with one response per endpoint, in the
     exact order `probe()` is expected to call them: the original four,
-    then configurations, then one /v2/assets/{symbol} per symbol."""
+    then configurations, then the paginated activities-since sweep (one
+    response per page -- a single empty page by default), then one
+    /v2/assets/{symbol} per symbol."""
     t = ScriptedTransport()
     t.enqueue(200, {"cash": "500"})       # account
     t.enqueue(200, [])                    # positions
     t.enqueue(200, [])                    # orders
-    t.enqueue(200, [])                    # activities
+    t.enqueue(200, [])                    # activities (unfiltered, single-shot)
     t.enqueue(200, {"fractional_trading": True, "no_shorting": False})  # configurations
+    for page in activities_since_pages:
+        t.enqueue(200, page)             # /v2/account/activities?after=...&direction=asc (paginated)
     for _ in symbols:
         t.enqueue(200, {"fractionable": True, "shortable": True})       # /v2/assets/{symbol}
     return t
@@ -144,6 +149,118 @@ def test_default_symbols_is_a_small_fixed_set():
     universe, and not configurable-by-surprise: a fixed, named default."""
     assert 1 <= len(DEFAULT_SYMBOLS) <= 5
     assert len(DEFAULT_SYMBOLS) == len(set(DEFAULT_SYMBOLS))
+
+
+# ---------------------------------- _fetch_all_activities_since (2026-07-30)
+# The settled-cash-halt investigation: every Account Activity since the
+# Decimal-migration fix date, every type, not just FILL. Confirmed directly
+# against docs.alpaca.markets/reference/getaccountactivities-2 (fetched
+# 2026-07-30): `after`/`direction`/`page_size`/`page_token` are real query
+# params on this exact endpoint (paper-api.alpaca.markets/v2/account/
+# activities) -- the same pagination contract `AlpacaPaperAdapter.fills()`
+# already relies on for `/v2/account/activities/FILL` (agent/broker/
+# alpaca.py), now reused here for the unfiltered endpoint.
+
+def test_fetch_activities_since_sends_after_and_ascending_direction_no_type_filter():
+    """No `activity_types`/`category` param is ever sent -- filtering by
+    type before knowing what happened is exactly the mistake this capture
+    exists to avoid (module docstring: "do not invent the output")."""
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    _fetch_all_activities_since(t, {"APCA-API-KEY-ID": "x"}, after="2026-07-28")
+    call = t.calls[0]
+    assert call["path"] == "https://paper-api.alpaca.markets/v2/account/activities"
+    assert call["params"]["after"] == "2026-07-28"
+    assert call["params"]["direction"] == "asc"
+    assert "activity_types" not in call["params"]
+    assert "category" not in call["params"]
+
+
+def test_fetch_activities_since_returns_a_single_short_page_unpaginated():
+    t = ScriptedTransport()
+    t.enqueue(200, [{"id": "a1", "activity_type": "FILL"}])
+    result = _fetch_all_activities_since(t, {}, after="2026-07-28", page_size=100)
+    assert result == [{"id": "a1", "activity_type": "FILL"}]
+    assert len(t.calls) == 1
+
+
+def test_fetch_activities_since_paginates_on_a_full_page_using_the_last_ids_page_token():
+    """A page exactly `page_size` long is not, by itself, proof there is
+    nothing left -- the real signal (per Alpaca's own docs and the already-
+    confirmed `fills()` contract) is a page SHORTER than `page_size`. A full
+    first page must trigger a second request carrying `page_token` set to
+    the first page's own last activity id."""
+    t = ScriptedTransport()
+    page1 = [{"id": f"a{i}", "activity_type": "FILL"} for i in range(2)]
+    page2 = [{"id": "a2", "activity_type": "CSD"}]
+    t.enqueue(200, page1)
+    t.enqueue(200, page2)
+    result = _fetch_all_activities_since(t, {}, after="2026-07-28", page_size=2)
+    assert result == page1 + page2
+    assert len(t.calls) == 2
+    assert t.calls[1]["params"]["page_token"] == "a1"
+
+
+def test_fetch_activities_since_stops_on_a_page_shorter_than_page_size():
+    t = ScriptedTransport()
+    t.enqueue(200, [{"id": "a0", "activity_type": "FILL"}])   # 1 < page_size=2 -- done
+    result = _fetch_all_activities_since(t, {}, after="2026-07-28", page_size=2)
+    assert result == [{"id": "a0", "activity_type": "FILL"}]
+    assert len(t.calls) == 1
+
+
+def test_fetch_activities_since_stops_on_an_empty_page():
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    result = _fetch_all_activities_since(t, {}, after="2026-07-28")
+    assert result == []
+    assert len(t.calls) == 1
+
+
+def test_default_activities_since_is_the_decimal_fix_date():
+    """The specific date the Decimal-migration fix (and the settled-cash
+    halt this capture investigates) actually happened -- named, not
+    guessed, and overridable via --activities-since for future use."""
+    assert DEFAULT_ACTIVITIES_SINCE == "2026-07-28"
+
+
+# --------------------------------- probe() wiring for the activities-since sweep
+
+def test_probe_writes_activities_since_json_preserving_every_activity_type(tmp_path):
+    """Non-FILL types (CSD, FEE, ...) must survive verbatim, not be dropped
+    or reshaped -- this file exists specifically to show the operator
+    exactly what the broker reported, unfiltered."""
+    t = _queued_transport(
+        ("SPY",),
+        activities_since_pages=([
+            {"id": "a1", "activity_type": "FILL", "qty": "0.027087234", "price": "737.986"},
+            {"id": "a2", "activity_type": "CSD", "net_amount": "0.01"},
+            {"id": "a3", "activity_type": "FEE", "net_amount": "-0.01"},
+        ],),
+    )
+    probe("AK123", "alpaca-secret", tmp_path, symbols=("SPY",),
+         transport=t, secrets_provider=secrets_provider())
+    captured = json.loads((tmp_path / "activities_since.json").read_text())
+    assert captured["after"] == DEFAULT_ACTIVITIES_SINCE
+    types = {a["activity_type"] for a in captured["activities"]}
+    assert types == {"FILL", "CSD", "FEE"}
+    assert captured["activity_type_counts"] == {"FILL": 1, "CSD": 1, "FEE": 1}
+
+
+def test_probe_manifest_lists_the_activities_since_sweep(tmp_path):
+    t = _queued_transport(("SPY",), activities_since_pages=([],))
+    probe("AK123", "alpaca-secret", tmp_path, symbols=("SPY",),
+         transport=t, secrets_provider=secrets_provider())
+    manifest = json.loads((tmp_path / "capture_manifest.json").read_text())
+    assert any("after=2026-07-28" in e and "direction=asc" in e for e in manifest["endpoints"])
+
+
+def test_probe_activities_since_is_overridable(tmp_path):
+    t = _queued_transport(("SPY",), activities_since_pages=([],))
+    probe("AK123", "alpaca-secret", tmp_path, symbols=("SPY",),
+         activities_since="2026-01-01", transport=t, secrets_provider=secrets_provider())
+    captured = json.loads((tmp_path / "activities_since.json").read_text())
+    assert captured["after"] == "2026-01-01"
 
 
 # ---------------------------------------------- structural no-write-path proof

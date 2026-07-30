@@ -153,7 +153,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN
 
 from . import market_calendar
 from .accounts import CrossAccountError
@@ -163,6 +163,18 @@ from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy, disposal_o
 _SIDES = ("BUY", "SELL")
 _OPEN, _CLOSED = "OPEN", "CLOSED"
 _ZERO = Decimal("0")
+_USD_CENT = Decimal("0.01")
+
+
+def _cash_notional(qty: Decimal, price: Decimal) -> Decimal:
+    """Return the broker-posted USD cash effect for one fill.
+
+    Alpaca carries fractional share quantity and price at higher precision,
+    but posts the resulting account cash movement at USD cent precision.
+    Reconciliation remains exact after each fill contribution is converted
+    to the same canonical precision using banker\'s rounding.
+    """
+    return (qty * price).quantize(_USD_CENT, rounding=ROUND_HALF_EVEN)
 
 
 class LedgerError(Exception):
@@ -530,7 +542,7 @@ class Ledger:
         real T+1 trading SESSION, never a calendar-day guess."""
         total = self._opening_settled_cash
         for f in self._fills:
-            notional = f.qty * f.price
+            notional = _cash_notional(f.qty, f.price)
             if f.side.upper() == "BUY":
                 total -= notional
             else:
@@ -547,7 +559,7 @@ class Ledger:
         total = _ZERO
         for f in self._fills:
             if f.side.upper() == "SELL" and now < self._settlement_instant(f.filled_at):
-                total += f.qty * f.price
+                total += _cash_notional(f.qty, f.price)
         return total
 
     def open_order_ids(self) -> frozenset[str]:

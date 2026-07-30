@@ -20,6 +20,17 @@ answer, from evidence:
      lives on `/v2/account/configurations` (fractional_trading, no_shorting,
      pdt_check) and per-symbol `/v2/assets/{symbol}` (fractionable,
      shortable, marginable). This script now hits both.
+  4. What actually caused a real settled-cash figure to move from
+     Decimal('480.01') to Decimal('480') overnight, with the market closed
+     and no new fill (found running the loop, 2026-07-29)? Not float noise
+     (the Decimal migration ruled that out) -- a real external cash
+     movement. `_fetch_all_activities_since` pulls EVERY Account Activity
+     (FILL and every non-trade type -- CSD, CSW, FEE, INT, DIV, and
+     whatever else the account actually reports) since a given date,
+     unfiltered by type, so the actual cause can be read off the response
+     rather than guessed at. See that function's own docstring for the
+     pagination contract, confirmed directly against Alpaca's docs today
+     (2026-07-30), and DEFAULT_ACTIVITIES_SINCE below.
 
 READ-ONLY, BY CONSTRUCTION, NOT BY COMMENT. Every HTTP call in this file
 goes through `_get()`, and `_get()` is hardcoded to call
@@ -45,15 +56,19 @@ and (b) has outbound network access to paper-api.alpaca.markets):
 
     python scripts/alpaca_probe.py --key-id <your Alpaca paper key id> \\
         --secret-ref <keychain account name the secret is stored under> \\
-        --out scripts/fixtures/ [--symbols SPY,QQQ,AAPL]
+        --out scripts/fixtures/ [--symbols SPY,QQQ,AAPL] \\
+        [--activities-since 2026-07-28]
 
 This writes account.json, positions.json, orders.json, activities.json,
 configurations.json (`/v2/account/configurations`), assets.json (one entry
-per `--symbols` symbol, from `/v2/assets/{symbol}`), and
+per `--symbols` symbol, from `/v2/assets/{symbol}`), activities_since.json
+(EVERY Account Activity, every type, created on or after `--activities-since`
+-- see `_fetch_all_activities_since`'s own docstring), and
 capture_manifest.json (capture timestamp, base URL, every endpoint hit)
 into --out, and prints a one-line summary per endpoint to stdout.
 `--symbols` defaults to `DEFAULT_SYMBOLS` below -- a small, fixed set, not
-the whole tradable universe.
+the whole tradable universe. `--activities-since` defaults to
+`DEFAULT_ACTIVITIES_SINCE` below.
 
 REDACTION: `_redact` recursively blanks any dict value whose key looks
 credential-shaped (secret, api_key, password, token, and Alpaca's own
@@ -97,6 +112,11 @@ _ENDPOINTS = (
 # ordinary large-cap names, without turning this into a universe crawl.
 DEFAULT_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ", "AAPL")
 
+# The date the Decimal-migration fix went in and the settled-cash-halt
+# investigation this capture exists for actually starts -- named, not
+# guessed. Overridable via --activities-since for any future investigation.
+DEFAULT_ACTIVITIES_SINCE = "2026-07-28"
+
 
 def _redact(obj):
     """Recursively blank any dict value whose key looks credential-shaped.
@@ -122,8 +142,48 @@ def _get(transport, headers, path, *, params=None, timeout=10.0):
     return status, body
 
 
+def _fetch_all_activities_since(transport, headers, *, after: str,
+                                page_size: int = 100) -> list[dict]:
+    """Every Account Activity created on or after `after`, oldest first --
+    FILL and every non-trade type alike. Deliberately never passes
+    `activity_types` or `category`: filtering by type before knowing what
+    actually happened would risk hiding the answer this capture exists to
+    find (module docstring, point 4 -- "do not invent the output" applies
+    just as much to silently excluding a type as to fabricating one).
+
+    Confirmed directly against Alpaca's own docs
+    (docs.alpaca.markets/reference/getaccountactivities-2, fetched
+    2026-07-30) for this exact endpoint
+    (paper-api.alpaca.markets/v2/account/activities): `after`, `direction`,
+    `page_size` and `page_token` are real, documented query params on it.
+    Pagination walks forward with `direction=asc` (oldest first) and
+    `page_token` set to the LAST-SEEN activity's own `id`, in batches of
+    `page_size`, stopping the first time a page comes back shorter than
+    `page_size` -- the documented signal that nothing is left. This is the
+    same contract `agent.broker.alpaca.AlpacaPaperAdapter.fills()` already
+    relies on for the FILL-only endpoint; re-confirmed here independently
+    for the unfiltered one, not assumed to carry over.
+
+    GET only, via `_get()` -- see module docstring's read-only guarantee."""
+    activities: list[dict] = []
+    page_token: str | None = None
+    while True:
+        params: dict = {"after": after, "direction": "asc", "page_size": str(page_size)}
+        if page_token is not None:
+            params["page_token"] = page_token
+        _, data = _get(transport, headers, "/v2/account/activities", params=params)
+        if not data:
+            break
+        activities.extend(data)
+        if len(data) < page_size:
+            break
+        page_token = data[-1]["id"]
+    return activities
+
+
 def probe(key_id: str, secret_ref: str, out_dir: Path, *,
          symbols: tuple[str, ...] = DEFAULT_SYMBOLS,
+         activities_since: str = DEFAULT_ACTIVITIES_SINCE,
          transport: Transport | None = None,
          secrets_provider: SecretsProvider | None = None) -> dict:
     """Resolve real paper credentials via `KeychainSecretsProvider` (or the
@@ -160,6 +220,32 @@ def probe(key_id: str, secret_ref: str, out_dir: Path, *,
         endpoints_hit.append(f"{path}?{params}" if params else path)
         print(f"{name}: HTTP {status}, {len(json.dumps(body))} bytes captured")
 
+    # EVERY Account Activity since `activities_since`, every type -- not
+    # the single-shot, unfiltered-but-unpaginated `activities` entry above
+    # (which silently truncates at 100 rows and carries no explicit date
+    # filter). See `_fetch_all_activities_since`'s own docstring.
+    since_activities = _fetch_all_activities_since(transport, headers, after=activities_since)
+    redacted_since_activities = _redact(since_activities)
+    activity_type_counts: dict[str, int] = {}
+    for a in redacted_since_activities:
+        t = a.get("activity_type", "UNKNOWN")
+        activity_type_counts[t] = activity_type_counts.get(t, 0) + 1
+    activities_since_payload = {
+        "after": activities_since,
+        "direction": "asc",
+        "count": len(redacted_since_activities),
+        "activity_type_counts": activity_type_counts,
+        "activities": redacted_since_activities,
+    }
+    (out_dir / "activities_since.json").write_text(
+        json.dumps(activities_since_payload, indent=2, sort_keys=True))
+    results["activities_since"] = activities_since_payload
+    endpoints_hit.append(
+        f"/v2/account/activities?after={activities_since}&direction=asc (paginated, all types)"
+    )
+    print(f"activities_since: {len(redacted_since_activities)} activities captured, "
+         f"types={activity_type_counts}")
+
     assets: dict[str, dict] = {}
     for symbol in symbols:
         path = f"/v2/assets/{symbol}"
@@ -194,9 +280,15 @@ def main() -> int:
         help="comma-separated symbols to GET /v2/assets/{symbol} for (small set, "
              f"not a universe crawl; default: {','.join(DEFAULT_SYMBOLS)})",
     )
+    parser.add_argument(
+        "--activities-since", default=DEFAULT_ACTIVITIES_SINCE,
+        help="pull every Account Activity (all types, paginated) created on or "
+             f"after this date (YYYY-MM-DD); default: {DEFAULT_ACTIVITIES_SINCE}",
+    )
     args = parser.parse_args()
     symbols = tuple(s.strip() for s in args.symbols.split(",") if s.strip())
-    probe(args.key_id, args.secret_ref, Path(args.out), symbols=symbols)
+    probe(args.key_id, args.secret_ref, Path(args.out), symbols=symbols,
+         activities_since=args.activities_since)
     return 0
 
 
