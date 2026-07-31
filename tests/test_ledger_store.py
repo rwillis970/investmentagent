@@ -536,6 +536,44 @@ def test_a_bad_row_never_permanently_poisons_a_fresh_restart(tmp_path):
     assert [f.fill_id for f in fills] == ["f1"]
 
 
+# ------------------------------------------------- backward-compat: oldest on-disk shape
+# Audit, 2026-07-31 (see agent/cash_event_quarantine.py's real KeyError-on-
+# replay incident, which prompted auditing every store's _decode/_load for
+# the same defect class): confirmed via git archaeology (commit 09cfe98, the
+# earliest commit of this file) that fill/order_record rows have ALWAYS
+# lacked holding_policy_version/lot_id optionally (already .get() at that
+# commit) and ALWAYS carried qty/price as raw JSON floats before the later
+# Decimal-as-string migration -- to_decimal() already tolerates either
+# encoding (agent/money.py). No field read via a required d["..."] key was
+# ever added after this store's first version, so this is a confirming
+# regression test, not a bug fix: an old-shape file must still load cleanly.
+
+def test_a_pre_decimal_pre_holding_policy_version_file_loads_cleanly(tmp_path):
+    """holding_policy_version is only legally absent on a SELL fill (a BUY
+    must carry one -- Ledger.record_fill's own validation, unrelated to this
+    decode-tolerance question), so the SELL leg is what actually exercises
+    _decode_fill's d.get("holding_policy_version") tolerance here."""
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(
+        '{"kind": "opening_balance", "amount": 500.0, "at": "2026-01-20T15:00:00+00:00"}\n'
+        '{"kind": "fill", "fill_id": "f1", "account_id": "%s", "symbol": "SPY", '
+        '"side": "BUY", "qty": 2.0, "price": 100.0, '
+        '"filled_at": "2026-01-20T15:00:00+00:00", "lot_id": "l1", '
+        '"holding_policy_version": "hp-v1"}\n'
+        '{"kind": "fill", "fill_id": "f2", "account_id": "%s", "symbol": "SPY", '
+        '"side": "SELL", "qty": 1.0, "price": 105.0, '
+        '"filled_at": "2026-01-20T16:00:00+00:00", "lot_id": "l1"}\n'
+        '{"kind": "order_record", "client_order_id": "c1", "account_id": "%s", '
+        '"status": "OPEN", "at": "2026-01-20T15:00:00+00:00"}\n' % (ACCT, ACCT, ACCT)
+    )
+    s = store(path, reg=registry())   # must not raise -- no holding_policy_version/lot_id key at all
+    opening, fills, orders = s.load()
+    assert opening == Decimal("500.0")
+    assert fills[1].holding_policy_version is None
+    assert orders[0].lot_id is None
+    assert orders[0].holding_policy_version is None
+
+
 def test_writes_reach_disk_only_after_validation_not_before():
     """A stronger structural version of the byte-identical tests above:
     the validating Ledger inside LedgerStore must reject BEFORE

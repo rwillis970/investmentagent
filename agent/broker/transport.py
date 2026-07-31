@@ -65,6 +65,27 @@ class Transport(ABC):
         transport-level failure (never returns a partial or guessed
         result)."""
 
+    @abstractmethod
+    def request_raw(self, method: str, path: str, *, headers: dict[str, str],
+                    timeout: float, max_bytes: int | None = None,
+                    ) -> tuple[int, bytes, bool]:
+        """Make exactly one HTTP request and return the response body as
+        RAW BYTES, never JSON-decoded -- added for `agent.edgar.EdgarClient.
+        filing_document` (T4 prerequisite unit, 2026-07-31), the first
+        caller in this codebase fetching something that is not a JSON API
+        response. Returns (status_code, body_bytes, truncated).
+
+        `max_bytes`, if given, is enforced DURING the read, not sliced off
+        a fully-buffered response afterward -- the whole point of a byte
+        cap is to bound memory/time spent on a single response, which a
+        read-then-slice approach would not do for a response that is
+        enormous or never terminates. `truncated=True` means body_bytes is
+        EXACTLY max_bytes long and more was available; `truncated=False`
+        means body_bytes is the complete body (whether or not max_bytes was
+        given). Same status/exception contract as `request`: any status
+        code (including non-2xx) is returned, not raised; `TransportTimeout`
+        on timeout, `TransportError` on any other transport failure."""
+
 
 class UrllibTransport(Transport):
     """The real transport. Stdlib `urllib.request` only."""
@@ -98,6 +119,48 @@ class UrllibTransport(Transport):
                 raise TransportTimeout(f"{method} {path} timed out after {timeout}s") from None
             raise TransportError(f"{method} {path} failed: {exc.reason}") from None
 
+    def request_raw(self, method: str, path: str, *, headers: dict[str, str],
+                    timeout: float, max_bytes: int | None = None,
+                    ) -> tuple[int, bytes, bool]:
+        req = urllib.request.Request(path, headers=dict(headers), method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body, truncated = self._read_capped(resp, max_bytes)
+                return resp.status, body, truncated
+        except urllib.error.HTTPError as exc:
+            # Same posture as request(): a non-2xx status IS the response.
+            body, truncated = self._read_capped(exc, max_bytes)
+            return exc.code, body, truncated
+        except TimeoutError:
+            raise TransportTimeout(f"{method} {path} timed out after {timeout}s") from None
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise TransportTimeout(f"{method} {path} timed out after {timeout}s") from None
+            raise TransportError(f"{method} {path} failed: {exc.reason}") from None
+
+    @staticmethod
+    def _read_capped(fp, max_bytes: int | None) -> tuple[bytes, bool]:
+        """Reads `fp` (a file-like response object) in bounded chunks,
+        stopping as soon as `max_bytes` is exceeded -- so an oversized or
+        never-ending response never gets fully buffered into memory before
+        being capped. Returns (body[:max_bytes], truncated) when capped;
+        (body, False) when `max_bytes` is None or the body fit within it."""
+        if max_bytes is None:
+            return fp.read(), False
+        chunk_size = 65536
+        chunks: list[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            chunk = fp.read(chunk_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        body = b"".join(chunks)
+        if total > max_bytes:
+            return body[:max_bytes], True
+        return body, False
+
 
 class ScriptedTransport(Transport):
     """Test double. Never opens a socket. Enqueue responses (`enqueue`) or
@@ -114,7 +177,13 @@ class ScriptedTransport(Transport):
     def enqueue(self, status: int, body: dict) -> None:
         self._queue.append(("response", (status, body)))
 
+    def enqueue_raw(self, status: int, body: bytes, *, truncated: bool = False) -> None:
+        self._queue.append(("raw_response", (status, body, truncated)))
+
     def enqueue_error(self, exc: Exception) -> None:
+        # Shared between request() and request_raw() -- an error is an
+        # error regardless of which shape of response was expected, so
+        # either method consuming this entry is correct, not a mismatch.
         self._queue.append(("error", exc))
 
     def request(self, method: str, path: str, *, headers: dict[str, str],
@@ -122,12 +191,37 @@ class ScriptedTransport(Transport):
                timeout: float) -> tuple[int, dict]:
         self.calls.append(dict(method=method, path=path, headers=dict(headers),
                                params=params, json_body=json_body, timeout=timeout))
-        if not self._queue:
-            raise AssertionError(
-                "ScriptedTransport: no more responses queued for "
-                f"{method} {path} -- enqueue one before this call"
-            )
-        kind, value = self._queue.pop(0)
+        kind, value = self._pop("request")
         if kind == "error":
             raise value
         return value
+
+    def request_raw(self, method: str, path: str, *, headers: dict[str, str],
+                    timeout: float, max_bytes: int | None = None,
+                    ) -> tuple[int, bytes, bool]:
+        self.calls.append(dict(method=method, path=path, headers=dict(headers),
+                               timeout=timeout, max_bytes=max_bytes))
+        kind, value = self._pop("request_raw")
+        if kind == "error":
+            raise value
+        return value
+
+    def _pop(self, caller: str) -> tuple[str, object]:
+        if not self._queue:
+            raise AssertionError(
+                f"ScriptedTransport: no more responses queued for {caller} "
+                "-- enqueue one before this call"
+            )
+        kind, value = self._queue.pop(0)
+        if kind == "error":
+            return kind, value
+        expected = "raw_response" if caller == "request_raw" else "response"
+        if kind != expected:
+            raise AssertionError(
+                f"ScriptedTransport: {caller} expected an entry enqueued via "
+                f"{'enqueue_raw' if caller == 'request_raw' else 'enqueue'}, "
+                f"but the next queued entry was enqueued via "
+                f"{'enqueue_raw' if kind == 'raw_response' else 'enqueue'} "
+                "-- fix the test's enqueue order"
+            )
+        return kind, value

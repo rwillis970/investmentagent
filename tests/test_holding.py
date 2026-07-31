@@ -4,7 +4,8 @@ import pytest
 
 from agent.holding import (ExitCategory, HoldingPolicy, HoldingPolicyRegistry,
                            HoldingViolation, Lot, blocked_qty,
-                           check_normal_exit, request_early_exit, sellable_qty)
+                           check_normal_exit, request_early_exit, sellable_qty,
+                           symbols_in_cooldown)
 from agent.lot_selection import (LotSelectionMethod, LotSelectionPolicy,
                                  UnsupportedLotSelectionPolicy)
 from agent.money import to_decimal
@@ -213,3 +214,63 @@ def test_policy_versions_are_immutable():
     reg.register(HoldingPolicy("hp-v1", timedelta(days=7), timedelta(days=30)))
     with pytest.raises(HoldingViolation, match="already registered"):
         reg.register(HoldingPolicy("hp-v1", timedelta(days=1), timedelta(days=30)))
+
+
+# ------------------------------------------------------ symbols_in_cooldown
+# §3.2's `not in_cooldown(symbol)` conjunct (Commit 4, collectors unit): a
+# symbol whose most recently CLOSED lot is still inside THAT LOT'S OWN
+# frozen cooldown_period (resolved via its holding_policy_version, never
+# today's config value) -- the same "frozen at fill" invariant already
+# tested above for minimum_hold, applied to the cooldown a closed lot
+# leaves behind.
+
+def closed_lot(lid="a", symbol="SPY", closed_at=None, version="hp-v1"):
+    return Lot(lot_id=lid, account_id=ACCT, symbol=symbol, qty=to_decimal(10.0),
+              cost_basis=to_decimal(100.0), opened_at=T0,
+              minimum_hold=timedelta(hours=4), holding_policy_version=version,
+              closed_at=closed_at)
+
+
+def test_a_symbol_with_no_lots_at_all_is_not_in_cooldown():
+    assert symbols_in_cooldown([], registry(), now=T0) == frozenset()
+
+
+def test_an_open_lot_does_not_put_its_symbol_in_cooldown():
+    l = closed_lot(closed_at=None)   # still open
+    assert symbols_in_cooldown([l], registry(), now=T0 + timedelta(days=100)) == frozenset()
+
+
+def test_a_recently_closed_lot_puts_its_symbol_in_cooldown():
+    # hp-v1's cooldown_period is 30 days (see registry() above)
+    l = closed_lot(closed_at=T0)
+    assert symbols_in_cooldown([l], registry(), now=T0 + timedelta(days=5)) == frozenset({"SPY"})
+
+
+def test_cooldown_expires_once_the_lots_own_policy_period_elapses():
+    l = closed_lot(closed_at=T0)
+    assert symbols_in_cooldown([l], registry(), now=T0 + timedelta(days=31)) == frozenset()
+
+
+def test_cooldown_is_evaluated_against_the_lots_own_frozen_policy_not_todays_config():
+    """hp-v2's cooldown is only 1 day; a lot closed under hp-v1 (30 days)
+    must use hp-v1's cooldown even if the registry's OTHER version would
+    say otherwise -- mirrors test_shortening_policy_does_not_release_open_lots
+    for minimum_hold, applied to cooldown_period instead."""
+    l = closed_lot(closed_at=T0, version="hp-v1")
+    assert symbols_in_cooldown([l], registry(), now=T0 + timedelta(days=5)) == frozenset({"SPY"})
+
+
+def test_multiple_symbols_and_lots_are_each_evaluated_independently():
+    lots = [
+        closed_lot(lid="a", symbol="SPY", closed_at=T0, version="hp-v1"),   # 30d cooldown
+        closed_lot(lid="b", symbol="QQQ", closed_at=T0, version="hp-v2"),   # 1d cooldown
+        closed_lot(lid="c", symbol="IWM", closed_at=None),                  # still open
+    ]
+    result = symbols_in_cooldown(lots, registry(), now=T0 + timedelta(days=5))
+    assert result == frozenset({"SPY"})   # QQQ's 1-day cooldown has already elapsed
+
+
+def test_an_unknown_policy_version_on_a_closed_lot_is_refused_not_guessed():
+    l = closed_lot(closed_at=T0, version="hp-v9")
+    with pytest.raises(HoldingViolation, match="unknown holding policy version"):
+        symbols_in_cooldown([l], registry(), now=T0 + timedelta(days=1))

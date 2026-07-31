@@ -202,6 +202,34 @@ def blocked_qty(lots, account_id: str, symbol: str, now: datetime, *,
                                      lot_selection_policy=lot_selection_policy)
 
 
+def symbols_in_cooldown(lots: list[Lot], registry: HoldingPolicyRegistry, *,
+                        now: datetime) -> frozenset[str]:
+    """§3.2's `not in_cooldown(symbol)` conjunct (§2, §11 Day 4 collectors
+    unit, Commit 4): the set of symbols a fresh materiality candidate must
+    be excluded from triggering on, because a lot in that symbol closed too
+    recently.
+
+    A symbol is in cooldown if ANY of its CLOSED lots closed within THAT
+    LOT'S OWN `cooldown_period` -- resolved via `registry.get(lot.
+    holding_policy_version)`, never today's config value. This mirrors
+    `Lot.minimum_hold` already being frozen at fill (§4.1): a policy change
+    today must not retroactively shorten (or lengthen) the cooldown a lot
+    closed under a DIFFERENT version already earned. An unknown policy
+    version on a closed lot raises via `registry.get` exactly as it already
+    does everywhere else in this module -- refused, not guessed.
+
+    Open lots (`closed_at is None`) never contribute to cooldown; only a
+    CLOSE starts one."""
+    in_cooldown: set[str] = set()
+    for lot in lots:
+        if lot.is_open():
+            continue
+        policy = registry.get(lot.holding_policy_version)
+        if now - lot.closed_at < policy.cooldown_period:
+            in_cooldown.add(lot.symbol)
+    return frozenset(in_cooldown)
+
+
 def check_normal_exit(lot: Lot, now: datetime) -> None:
     """Raise unless a normal (non-exception) exit is permitted."""
     if not lot.is_open():

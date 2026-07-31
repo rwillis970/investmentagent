@@ -219,3 +219,30 @@ def test_refuse_admission_reason_refuses_when_created_at_is_none_with_a_real_bas
         opening_balance_established_at=CREATED_AT,
     )
     assert reason is not None
+
+
+# --------------------------------------------- backward-compat: pre-2026-07-31 rows
+# Real defect, 2026-07-31: state/cash_quarantine.jsonl on the real account has
+# "quarantined" rows written before created_at existed on QuarantinedCashEvent
+# at all (confirmed via git archaeology -- commit a4f1d8f, the earliest commit
+# with this file, has no created_at field anywhere in QuarantinedCashEvent or
+# _decode_activity). _decode_activity's row["created_at"] raised KeyError
+# replaying those real rows at store-construction time. This is the exact
+# oldest on-disk shape those old rows have -- copied from a real row in
+# state/cash_quarantine.jsonl, not hand-built from the current dataclass.
+
+def test_a_pre_created_at_row_from_the_real_account_decodes_with_created_at_none(tmp_path):
+    path = tmp_path / "cash_quarantine.jsonl"
+    path.write_text(
+        '{"kind": "quarantined", "activity_id": "a1", "account_id": "%s", '
+        '"activity_type": "FEE", "activity_sub_type": "CAT", '
+        '"net_amount": "-0.01", "date": "2026-07-28", "symbol": null, '
+        '"description": "CAT fee for proceed of 1 trades on 2026-07-28 by '
+        'PA3XZX944LRR", "reason": "unexplained cash movement: FEE/CAT", '
+        '"quarantined_at": "2026-07-28T16:00:00+00:00"}\n' % ACCT
+    )
+    s = CashEventQuarantineStore(path, account_id=ACCT)   # must not raise KeyError
+    assert s.status("a1") == PENDING
+    pending = s.pending()
+    assert len(pending) == 1
+    assert pending[0].created_at is None

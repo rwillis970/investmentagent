@@ -15,16 +15,17 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agent.materiality import (MaterialityCandidate, MaterialityInputError,
-                               MaterialityPolicy, compute_score, filing_weight,
-                               screen)
+from agent.materiality import (DEFAULT_FILING_WEIGHTS, MaterialityCandidate,
+                               MaterialityInputError, MaterialityPolicy,
+                               compute_score, filing_weight, screen)
 from agent.policy import initial_policy
 
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
 CAPS = initial_policy()
 
 POLICY = MaterialityPolicy(version="mat-v1", w1=1.0, w2=1.0, w3=1.0, w4=1.0,
-                           w5=1.0, w6=1.0, threshold=2.0)
+                           w5=1.0, w6=1.0, threshold=2.0,
+                           filing_weights=DEFAULT_FILING_WEIGHTS)
 
 
 def candidate(**over):
@@ -87,7 +88,120 @@ def test_unknown_form_type_defaults_to_no_weight():
     assert filing_weight("6-K") == 0.0
 
 
+# --------------------------------------------- per-form/item weight table
+# REVIEW FIX (Commit 5): `filing_weight` used to return a flat `1.0` for
+# every allowlisted form/item, so `w3` could only scale every filing
+# together. `weights` is now a real per-form/item table (§3.2's own words:
+# "filing_weight[form_type, item_codes]", a table, not a flat scalar), with
+# `DEFAULT_FILING_WEIGHTS` reproducing the old flat-1.0 behaviour so every
+# existing call site above (which never passes `weights`) is unaffected.
+
+def test_default_weights_reproduce_the_old_flat_allowlist_behaviour():
+    assert filing_weight("8-K", ("2.02",)) == 1.0
+    assert filing_weight("8-K", ("9.01",)) == 0.0
+    assert filing_weight("10-K") == 1.0
+    assert filing_weight("6-K") == 0.0
+
+
+def test_a_custom_weight_table_actually_differentiates_between_items():
+    weights = dict(DEFAULT_FILING_WEIGHTS)
+    weights["8-K:4.02"] = 3.0   # a restatement, weighted higher than a routine item
+    assert filing_weight("8-K", ("4.02",), weights=weights) == 3.0
+    assert filing_weight("8-K", ("2.02",), weights=weights) == 1.0
+
+
+def test_a_form_item_combination_absent_from_the_weight_table_is_zero():
+    """default-deny: `weights` IS the allowlist now, not a separate one --
+    dropping a key entirely is a legitimate way to say "this no longer
+    carries any weight"."""
+    weights = {k: v for k, v in DEFAULT_FILING_WEIGHTS.items() if k != "8-K:7.01"}
+    assert filing_weight("8-K", ("7.01",), weights=weights) == 0.0
+
+
+def test_an_8k_matching_multiple_weighted_items_takes_the_maximum_not_the_sum():
+    weights = dict(DEFAULT_FILING_WEIGHTS)
+    weights["8-K:2.02"] = 1.0
+    weights["8-K:4.02"] = 3.0
+    assert filing_weight("8-K", ("2.02", "4.02"), weights=weights) == 3.0
+
+
+def test_compute_score_uses_the_policys_own_filing_weights_table():
+    weights = dict(DEFAULT_FILING_WEIGHTS)
+    weights["8-K:4.02"] = 5.0
+    policy = MaterialityPolicy(version="mat-v3", w1=1.0, w2=1.0, w3=1.0, w4=1.0,
+                               w5=1.0, w6=1.0, threshold=2.0, filing_weights=weights)
+    cand = candidate(form_type="8-K", item_codes=("4.02",))
+    score, components = compute_score(cand, policy, analyses_today=0,
+                                      max_model_analyses_per_day=8)
+    assert components["raw_terms"]["filing_weight"] == 5.0
+    assert components["weighted_terms"]["filing"] == pytest.approx(1.0 * 5.0)
+
+
 # --------------------------------------------------------------- score math
+
+# ----------------------------------------- UNKNOWN-INPUT RULE (REVIEW FIX)
+# `earnings_proximity` and `sector_ret` can each be `None` -- "we don't
+# know", not "we know and it's zero". Under a ZERO weight this is harmless
+# (the term is already inert) and the score computes normally, contributing
+# zero while `raw_terms` preserves the real `None`. Under a NONZERO weight,
+# `compute_score` now REFUSES to score at all (`MaterialityInputError`) --
+# disqualification, not renormalisation, and applied identically to both
+# terms (this used to differ: `earnings_proximity` silently contributed
+# zero regardless of `w4`; that inconsistency is what this fix closes).
+
+ZERO_W4_W5_POLICY = MaterialityPolicy(version="mat-v1-zeroed", w1=1.0, w2=1.0, w3=1.0,
+                                      w4=0.0, w5=0.0, w6=1.0, threshold=2.0,
+                                      filing_weights=DEFAULT_FILING_WEIGHTS)
+
+
+def test_none_earnings_proximity_under_a_zero_weight_contributes_zero_but_stays_visible_as_none():
+    known_zero = candidate(earnings_proximity=0.0)
+    unknown = candidate(earnings_proximity=None)
+
+    zero_score, zero_components = compute_score(known_zero, ZERO_W4_W5_POLICY,
+                                                analyses_today=0, max_model_analyses_per_day=8)
+    none_score, none_components = compute_score(unknown, ZERO_W4_W5_POLICY,
+                                                analyses_today=0, max_model_analyses_per_day=8)
+
+    assert zero_score == none_score
+    assert zero_components["weighted_terms"]["earnings_proximity"] == 0.0
+    assert none_components["weighted_terms"]["earnings_proximity"] == 0.0
+    assert zero_components["raw_terms"]["earnings_proximity"] == 0.0
+    assert none_components["raw_terms"]["earnings_proximity"] is None
+
+
+def test_none_earnings_proximity_under_a_nonzero_weight_is_refused_not_guessed():
+    """POLICY has w4=1.0 (nonzero) -- an unknown proximity here must
+    disqualify the candidate, not silently score as zero."""
+    unknown = candidate(earnings_proximity=None)
+    with pytest.raises(MaterialityInputError, match="earnings_proximity is unknown"):
+        compute_score(unknown, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
+
+def test_none_sector_ret_under_a_zero_weight_contributes_zero_but_stays_visible_as_none():
+    known_zero = candidate(sector_ret=0.0)
+    unknown = candidate(sector_ret=None)
+
+    zero_score, zero_components = compute_score(known_zero, ZERO_W4_W5_POLICY,
+                                                analyses_today=0, max_model_analyses_per_day=8)
+    none_score, none_components = compute_score(unknown, ZERO_W4_W5_POLICY,
+                                                analyses_today=0, max_model_analyses_per_day=8)
+
+    assert zero_score == none_score
+    assert zero_components["weighted_terms"]["idiosyncratic_vs_sector"] == 0.0
+    assert none_components["weighted_terms"]["idiosyncratic_vs_sector"] == 0.0
+    assert zero_components["raw_terms"]["sector_ret"] == 0.0
+    assert none_components["raw_terms"]["sector_ret"] is None
+
+
+def test_none_sector_ret_under_a_nonzero_weight_is_refused_not_guessed():
+    """POLICY has w5=1.0 (nonzero) -- an unknown peer-return input here
+    must disqualify the candidate, exactly like earnings_proximity does,
+    not treat it as zero."""
+    unknown = candidate(sector_ret=None)
+    with pytest.raises(MaterialityInputError, match="sector_ret is unknown"):
+        compute_score(unknown, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
 
 def test_compute_score_matches_hand_calculation():
     cand = candidate(ret_since_open=0.5, atr_20=0.25, volume_so_far=300.0,
@@ -178,7 +292,8 @@ def test_only_risk_profile_style_change_changing_weights_changes_the_score():
     cand = candidate(ret_since_open=1.0, atr_20=1.0)
     a, _ = compute_score(cand, POLICY, analyses_today=0, max_model_analyses_per_day=8)
     other = MaterialityPolicy(version="mat-v2", w1=5.0, w2=1.0, w3=1.0, w4=1.0,
-                              w5=1.0, w6=1.0, threshold=2.0)
+                              w5=1.0, w6=1.0, threshold=2.0,
+                              filing_weights=DEFAULT_FILING_WEIGHTS)
     b, _ = compute_score(cand, other, analyses_today=0, max_model_analyses_per_day=8)
     assert a != b
 
@@ -247,6 +362,46 @@ def test_above_threshold_capability_denied_is_suppressed():
            eligible_universe=frozenset({"BTCUSD"}))
     assert o.analysis_status == "SUPPRESSED"
     assert o.suppressed_reason == "capability_denied"
+
+
+# ------------------------------------------------------- side (Commit 5 fix)
+# REVIEW FIX: `screen()` used to hardcode `side="BUY"` in its capability
+# check unconditionally, so a material event on a HELD position (where the
+# warranted action is an exit, i.e. a SELL) could be wrongly suppressed as
+# capability-denied whenever SELL_SHORT/BUY_TO_COVER-only distinctions
+# didn't apply but some future BUY-specific restriction did. `side` is now
+# a real, caller-supplied parameter (default "BUY", preserving every
+# existing caller above that never held a position), not an assumption
+# baked into the screen itself.
+
+def test_side_defaults_to_buy_preserving_existing_behaviour():
+    o = run(candidate(ret_since_open=5.0, atr_20=0.1))
+    assert o.score_components["gates"]["capability_allowed"] is True
+
+
+def test_a_caller_can_screen_a_held_position_as_a_sell():
+    caps = initial_policy()
+    o = run(candidate(ret_since_open=5.0, atr_20=0.1), capability_policy=caps, side="SELL")
+    assert o.score_components["gates"]["capability_allowed"] is True
+
+
+def test_sell_is_not_silently_treated_as_buy_when_sell_is_disabled():
+    """Proves `side` actually reaches the capability check, not just that
+    the parameter exists: SELL disabled + BUY allowed must suppress a SELL
+    screen even though a BUY screen of the identical candidate would pass."""
+    from agent.policy import CapabilityStatus, TradeCapabilityPolicy
+    caps = TradeCapabilityPolicy(
+        version="sell-disabled-test",
+        asset_class={"US_EQUITY": CapabilityStatus.PRODUCTION_ALLOWED},
+        side={"BUY": CapabilityStatus.PRODUCTION_ALLOWED,
+             "SELL": CapabilityStatus.DISABLED},
+        funding={"SETTLED_CASH": CapabilityStatus.PRODUCTION_ALLOWED},
+    )
+    buy_side = run(candidate(ret_since_open=5.0, atr_20=0.1), capability_policy=caps, side="BUY")
+    sell_side = run(candidate(ret_since_open=5.0, atr_20=0.1), capability_policy=caps, side="SELL")
+    assert buy_side.score_components["gates"]["capability_allowed"] is True
+    assert sell_side.score_components["gates"]["capability_allowed"] is False
+    assert sell_side.suppressed_reason == "capability_denied"
 
 
 def test_above_threshold_in_cooldown_is_suppressed():

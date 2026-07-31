@@ -13,7 +13,7 @@ from typing import Any
 
 from . import mode as mode_fsm
 from .durations import parse_duration
-from .materiality import MaterialityPolicy
+from .materiality import DEFAULT_FILING_WEIGHTS, MaterialityPolicy
 from .policy import CapabilityStatus, TradeCapabilityPolicy
 
 # The single source of truth for legal mode values is agent.mode -- keeping
@@ -147,11 +147,41 @@ class Config:
     materiality_w1: float = 1.0
     materiality_w2: float = 1.0
     materiality_w3: float = 1.0
-    materiality_w4: float = 1.0
+    # w4 (earnings_proximity, §3.2) is 0.0, not the same "1.0, uncalibrated"
+    # placeholder as w1/w2/w3/w5/w6 -- and deliberately NOT the same posture.
+    # This is INERT BY DESIGN, not merely uncalibrated: no free forward-
+    # looking earnings-calendar source exists (confirmed during the Day-4
+    # collectors unit's Commit 3 -- Alpaca's Market Data API has no
+    # fundamentals/earnings endpoint, and EDGAR only records that a release
+    # already happened, never when the next one will be). `agent.earnings.
+    # earnings_proximity` still computes a real, estimated value from a
+    # symbol's own historical filing cadence (see that module's docstring),
+    # and it is fully plumbed through `MaterialityCandidate`/`compute_score`
+    # -- but the term's CONTRIBUTION to the score is switched off at w4=0.0
+    # until it can be calibrated against replayed history, because the
+    # estimate is weaker than a true scheduled-date calendar (a company can
+    # report early or late relative to its own past cadence) and this unit's
+    # instruction was not to invent a confident number for an unconfirmed
+    # signal. Raising this above 0.0 is a future calibration decision, not a
+    # config typo to "fix".
+    materiality_w4: float = 0.0
     materiality_w5: float = 1.0
     materiality_w6: float = 1.0
     materiality_threshold: float = 2.0
     threshold_version: str = "materiality-v1-uncalibrated"
+    # REVIEW FIX (Commit 5, §2/§11 Day 4 collectors unit): `agent.materiality.
+    # filing_weight` used to return a flat `1.0` for every allowlisted
+    # form/item, so `materiality_w3` could only scale every material filing
+    # together -- §3.2 itself writes this as a TABLE, "filing_weight[form_type,
+    # item_codes]". `DEFAULT_FILING_WEIGHTS` (agent/materiality.py) reproduces
+    # that OLD flat-1.0 behaviour exactly (every key `MATERIAL_8K_ITEMS`/
+    # `WEIGHTED_FORMS` already allowlisted, each at 1.0) -- these ARE real
+    # numbers now capable of differing per form/item, but every one of them
+    # is still UNCALIBRATED, same posture as materiality_w1-w6 above: no
+    # historical replay has ever informed "a restatement (4.02) deserves more
+    # weight than a Reg FD disclosure (7.01)"; this commit only makes that
+    # differentiation POSSIBLE, not calibrated.
+    materiality_filing_weights: dict = field(default_factory=lambda: dict(DEFAULT_FILING_WEIGHTS))
 
     monthly_budget_usd: float = 20.0
     budget_warning_usd: float = 15.0
@@ -174,6 +204,86 @@ class Config:
     # resolved via get_by_client_id, never blindly resubmitted or retried.
     broker_http_timeout_seconds: float = 10.0
     broker_http_max_retries: int = 2
+
+    # Alpaca MARKET DATA API (agent/broker/alpaca_market_data.py, §11 Day 4
+    # collectors unit) -- a separate product from the trading API above
+    # (data.alpaca.markets, not paper-api.alpaca.markets), added in the same
+    # commit that reads it (§9.1). `market_data_feed` DEFAULTS TO "iex"
+    # DELIBERATELY, NEVER LEFT UNSET: Alpaca's own bars endpoint defaults
+    # `feed` to "sip" when the caller doesn't pass one at all, and a
+    # Basic-plan account (every paper account, and this pilot's account) has
+    # no real-time SIP access -- confirmed directly against Alpaca's own API
+    # reference (docs.alpaca.markets/reference/stockbars, fetched
+    # 2026-07-31): "end ... Default: the current time if the user has
+    # real-time access for the feed, otherwise 15 minutes before the current
+    # time." A Basic account that omitted `feed` would silently get bars
+    # truncated to 15 minutes ago, with no error -- exactly the kind of
+    # silent degradation this codebase's fail-safe discipline exists to
+    # prevent. "iex" is the only feed documented as usable without a paid
+    # subscription (same reference page: "This is the only feed that can be
+    # used without a subscription"), so this collector always passes it
+    # explicitly rather than trusting Alpaca's own default. See
+    # agent/market_data_collector.py's own module docstring for what this
+    # means for a screen that scores intraday moves (IEX is real-time with
+    # no time delay, but covers only ~2.5% of consolidated US equity
+    # volume -- a coverage gap, not a clock delay).
+    market_data_feed: str = "iex"
+    market_data_http_timeout_seconds: float = 10.0
+    market_data_http_max_retries: int = 2
+
+    # EDGAR filings collector (agent/edgar.py, §11 Day 4 collectors unit,
+    # Commit 2). Confirmed directly against the SEC's own webmaster FAQ
+    # (sec.gov/about/webmaster-frequently-asked-questions, fetched
+    # 2026-07-31): "our current maximum access rate is 10 requests per
+    # second" and "Please declare your user agent in request headers" --
+    # naming the requester and a contact email ("Sample Company Name
+    # AdminContact@<domain>.com"). `edgar_user_agent` has NO real default:
+    # this codebase does not invent a contact identity on Ray's behalf (the
+    # same "never guess a credential-shaped value" posture
+    # agent/secrets_provider.py already takes for actual secrets) --
+    # validate() below refuses to load a config that leaves it blank or
+    # without an "@". `edgar_min_request_interval_seconds` defaults to 0.15s
+    # (~6.7 requests/second) -- deliberately BELOW the documented 10/s
+    # ceiling, the same conservative-margin posture
+    # `cat_fee_auto_admit_ceiling`'s own comment already argues for (a 5x
+    # margin over the one observed data point), here a margin against
+    # clock/scheduling jitter across many symbols in one collection cycle
+    # rather than shaving the throttle exactly to the documented limit.
+    edgar_user_agent: str = ""
+    edgar_min_request_interval_seconds: float = 0.15
+    edgar_http_timeout_seconds: float = 10.0
+    edgar_http_max_retries: int = 2
+    # SEC's own company_tickers.json "periodically updated... we do not
+    # guarantee accuracy or scope" (sec.gov/about/webmaster-frequently-
+    # asked-questions) -- no official refresh cadence is published, so this
+    # is this pilot's own choice, not a documented SEC figure: 24 hours,
+    # UNCALIBRATED, same posture as materiality_w1-w6 -- a ticker/CIK
+    # association changes rarely (a listing change, a ticker reuse after a
+    # delisting), so daily is a conservative, revisit-later placeholder, not
+    # a claim about how often SEC actually republishes the file.
+    edgar_ticker_cik_refresh_interval_hours: int = 24
+
+    # Filing DOCUMENT BODY fetch cap (agent/edgar.py's `EdgarClient.
+    # filing_document`, T4 prerequisite unit, 2026-07-31, same-commit rule
+    # per §9.1). A 10-K's primary HTML document is routinely well over a
+    # megabyte -- CONFIRMED directly against a real, committed fixture
+    # (scripts/fixtures/edgar/AAPL_10K_0000320193-25-000079.htm, 1,520,208
+    # bytes, a genuinely routine filing, not a hand-picked outlier). This cap
+    # bounds two real costs a byte-count alone doesn't show elsewhere: the
+    # memory/time spent parsing an admitted document (agent/filing_text.py's
+    # html.parser pass is O(size)), and a rate-limited, unbounded-worst-case
+    # fetch (EDGAR's Archives path has no documented per-file size ceiling;
+    # some filers' inline-XBRL 10-Ks run tens of megabytes). 5,000,000 bytes
+    # (5MB) is roughly 3.3x the confirmed routine 10-K above -- generous
+    # enough that this pilot's ordinary filings (8-Ks, 10-Qs, and 10-Ks in
+    # the observed size class) are never truncated, while still bounding the
+    # pathological case to a few times normal rather than leaving it
+    # unbounded. UNCALIBRATED beyond that one real data point -- same
+    # "revisit once more real filings are observed" posture as
+    # cat_fee_auto_admit_ceiling's own comment above. Truncation is recorded,
+    # never silent -- see `agent.edgar.FilingDocumentFetch.truncated` and
+    # agent/filing_text.py's module docstring.
+    edgar_document_max_bytes: int = 5_000_000
 
     # CAT-fee narrow auto-admit ceiling (agent/cash_events.py, Commit 2,
     # 2026-07-31) -- real, required number, added in the same commit that
@@ -201,6 +311,45 @@ class Config:
     order_types: dict = field(default_factory=dict)
     sessions: dict = field(default_factory=dict)
     time_in_force: dict = field(default_factory=dict)
+
+    # §3.2's `eligible_universe` (§2, §11 Day 4 collectors unit, Commit 4):
+    # before this field, nothing in this codebase named a tradeable symbol
+    # set at all (verified directly -- see agent/materiality.py's own module
+    # docstring). {SYMBOL: asset_class}, not a bare list, for the same
+    # reason trade_capabilities/sides/funding/... above are dicts, not sets:
+    # `agent.materiality.MaterialityCandidate.asset_class` is required by
+    # `screen()`'s own capability check, and nothing else in this codebase
+    # classifies a symbol into an asset class either -- this field is the
+    # one place that association is declared, explicitly, per symbol, rather
+    # than guessed (e.g. assuming every configured symbol is "US_EQUITY").
+    # EMPTY BY DEFAULT: default-deny, same posture as every other allowlist
+    # in this file -- an unconfigured universe makes `eligible_universe`
+    # always empty, so nothing is ever eligible to trigger, rather than
+    # trading whatever collectors happen to have data for.
+    symbol_universe: dict = field(default_factory=dict)
+
+    # REVIEW FIX (§2, §11 Day 4 collectors unit, review round 2):
+    # `agent.materiality_cycle`'s peer-median substitute for `sector_ret`
+    # (see that module's own PEER_MEDIAN_RETURN section for why it is NOT a
+    # real sector return) degenerates below a real cross-sectional sample:
+    # over one peer, it is just that one peer's own return; over two,
+    # Python's `statistics.median` is their mean, not a value resistant to
+    # either one being an outlier -- the entire point of a median. THREE is
+    # the smallest peer count at which "median" behaves as a median (a real
+    # middle value, robust to one outlier) rather than degenerating into
+    # "that one other stock's return" or "the average of two" -- that
+    # reasoning, not a replayed calibration, is why 3 is the default here.
+    # Below this floor, `agent.materiality_cycle.build_materiality_candidates`
+    # reports `sector_ret=None` for that candidate rather than a number
+    # (mirroring `earnings_proximity`'s own "insufficient history -> None"
+    # posture) -- `agent.materiality.compute_score`'s UNKNOWN-INPUT RULE
+    # decides what that means for the score. CONSEQUENCE: `symbol_universe`
+    # is empty by default and `materiality_w5` is NONZERO (1.0) by default,
+    # so a universe smaller than this floor (per asset_class) will disqualify
+    # every candidate from ever triggering -- fail-safe-to-NO-TRADE working
+    # as intended, not a bug, but worth knowing before wondering why nothing
+    # fires.
+    materiality_min_peer_group_size: int = 3
 
     # -- derived -----------------------------------------------------------
     @property
@@ -237,6 +386,7 @@ class Config:
             w3=self.materiality_w3, w4=self.materiality_w4,
             w5=self.materiality_w5, w6=self.materiality_w6,
             threshold=self.materiality_threshold,
+            filing_weights=self.materiality_filing_weights,
         )
 
 
@@ -396,6 +546,31 @@ def validate(cfg: Config) -> None:
     if not cfg.threshold_version:
         err.append("threshold_version must be set; a threshold change is a policy "
                    "version, never an unversioned float (§3.2)")
+
+    # §3.2 filing_weight table (Commit 5): same non-negative posture as
+    # materiality_w1-w6 above -- a negative per-form/item weight would flip
+    # that item's contribution to term3's intended direction.
+    for key, value in cfg.materiality_filing_weights.items():
+        if value < 0:
+            err.append(f"materiality_filing_weights[{key!r}] cannot be negative (§3.2)")
+
+    # §3.2 `eligible_universe` (Commit 4): every declared symbol must be a
+    # non-empty, upper-case ticker, and its asset_class must be a dimension
+    # `trade_capabilities` itself has an opinion on -- default-deny already
+    # makes an unrecognised asset_class DISABLED at the capability gate
+    # regardless (agent.policy.TradeCapabilityPolicy.status), but a typo'd
+    # asset_class name here is still a configuration error worth rejecting
+    # at load, not silently trading nothing for that symbol forever.
+    for symbol, asset_class in cfg.symbol_universe.items():
+        if not symbol or symbol != symbol.upper():
+            err.append(f"symbol_universe key {symbol!r} must be a non-empty, "
+                       "upper-case ticker")
+        if asset_class not in cfg.trade_capabilities:
+            err.append(f"symbol_universe[{symbol!r}]={asset_class!r} is not a "
+                       "recognised asset_class (must be a key in trade_capabilities)")
+    if cfg.materiality_min_peer_group_size < 1:
+        err.append("materiality_min_peer_group_size must be a positive integer")
+
     if cfg.max_day_trades_per_5_sessions > 3:
         err.append("max_day_trades_per_5_sessions above 3 risks a PDT restriction (§4.4)")
     if not cfg.budget_warning_usd < cfg.monthly_budget_usd <= cfg.budget_hard_stop_usd:
@@ -405,6 +580,48 @@ def validate(cfg: Config) -> None:
         err.append("broker_http_timeout_seconds must be positive")
     if cfg.broker_http_max_retries < 0:
         err.append("broker_http_max_retries cannot be negative")
+
+    # Alpaca's own documented feed enum (docs.alpaca.markets/reference/
+    # stockbars) -- "sip"/"boats"/"otc" all require a paid subscription this
+    # pilot does not have; kept legal here (config may name them explicitly,
+    # e.g. once a real subscription exists) rather than restricted to "iex"
+    # only, but the default stays "iex" (see the field's own comment above).
+    if cfg.market_data_feed not in ("iex", "sip", "boats", "otc"):
+        err.append("market_data_feed must be one of iex, sip, boats, otc")
+    if cfg.market_data_http_timeout_seconds <= 0:
+        err.append("market_data_http_timeout_seconds must be positive")
+    if cfg.market_data_http_max_retries < 0:
+        err.append("market_data_http_max_retries cannot be negative")
+
+    # EDGAR requires a declaring User-Agent naming the requester and a
+    # contact email (sec.gov's own webmaster FAQ) -- refusing to load
+    # rather than silently sending a blank or made-up one (§9.1: config may
+    # be more conservative than the platform allows, never less; a missing
+    # identity here isn't a platform maximum question, but the same
+    # "refuse rather than guess" direction applies).
+    if not cfg.edgar_user_agent or "@" not in cfg.edgar_user_agent:
+        err.append(
+            "edgar_user_agent must be set to a real requester name and "
+            "contact email (e.g. 'InvestmentAgent Pilot ray@example.com') "
+            "-- EDGAR's own acceptable-use policy requires a declaring "
+            "User-Agent identifying who is making the request; this is "
+            "never invented on your behalf"
+        )
+    if cfg.edgar_min_request_interval_seconds <= 0:
+        err.append("edgar_min_request_interval_seconds must be positive")
+    if cfg.edgar_min_request_interval_seconds < 0.1:
+        err.append(
+            "edgar_min_request_interval_seconds below 0.1s exceeds EDGAR's "
+            "documented 10 requests/second maximum access rate"
+        )
+    if cfg.edgar_http_timeout_seconds <= 0:
+        err.append("edgar_http_timeout_seconds must be positive")
+    if cfg.edgar_http_max_retries < 0:
+        err.append("edgar_http_max_retries cannot be negative")
+    if cfg.edgar_ticker_cik_refresh_interval_hours <= 0:
+        err.append("edgar_ticker_cik_refresh_interval_hours must be positive")
+    if cfg.edgar_document_max_bytes <= 0:
+        err.append("edgar_document_max_bytes must be positive")
 
     if cfg.cat_fee_auto_admit_ceiling <= 0:
         err.append("cat_fee_auto_admit_ceiling must be positive")

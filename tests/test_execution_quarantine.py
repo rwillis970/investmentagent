@@ -153,3 +153,34 @@ def test_store_is_append_only(tmp_path):
         s.update()
     with pytest.raises(ExecutionQuarantineError):
         s.delete()
+
+
+# ------------------------------------------------- backward-compat: oldest on-disk shape
+# Audit, 2026-07-31 (prompted by a real KeyError-on-replay defect found in
+# agent/cash_event_quarantine.py -- see that module's docstring). Confirmed
+# via git archaeology (commit ca96642, the earliest available commit of this
+# file) that QuarantinedExecution/ExecutionResolution/_decode_execution were
+# already IDENTICAL in field shape to today -- no field has ever been added
+# to an already-existing row kind. This is therefore a confirming regression
+# test (an old-shape file, using the pre-Decimal-migration raw-float qty/
+# price encoding, must still load cleanly), not a fix for an observed gap --
+# unlike agent/cash_event_quarantine.py, there is no missing-key risk here.
+
+def test_a_pre_decimal_file_with_the_earliest_known_row_shape_loads_cleanly(tmp_path):
+    path = tmp_path / "quarantine.jsonl"
+    path.write_text(
+        '{"kind": "quarantined", "execution_id": "e1", "account_id": "%s", '
+        '"client_order_id": "c1", "symbol": "SPY", "side": "BUY", "qty": 1.0, '
+        '"price": 100.0, "filled_at": "2026-07-28T15:00:00+00:00", '
+        '"reason": "no holding_policy_version", '
+        '"quarantined_at": "2026-07-28T15:00:00+00:00"}\n'
+        '{"kind": "resolution", "execution_id": "e1", "account_id": "%s", '
+        '"decision": "ADMITTED", "decided_by": "ray", '
+        '"decided_at": "2026-07-28T16:00:00+00:00", "lot_id": null, '
+        '"holding_policy_version": "hp-v1", "notes": null}\n' % (ACCT, ACCT)
+    )
+    s = ExecutionQuarantineStore(path, account_id=ACCT)   # must not raise
+    assert s.status("e1") == ADMITTED
+    quarantined, resolutions = s.load()
+    assert quarantined[0].qty == 1.0
+    assert resolutions[0].holding_policy_version == "hp-v1"

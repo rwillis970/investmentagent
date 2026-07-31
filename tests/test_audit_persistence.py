@@ -67,6 +67,29 @@ def test_a_reloaded_log_continues_the_same_seq_sequence(tmp_path):
     assert second.verify() is True
 
 
+# ------------------------------------------------- backward-compat: oldest on-disk shape
+# Audit, 2026-07-31 (prompted by a real KeyError-on-replay defect found in
+# agent/cash_event_quarantine.py -- see that module's docstring). Per this
+# module's own docstring, durable persistence (and _decode_event) was
+# introduced as ONE atomic commit, so no genuinely older on-disk shape of
+# an audit row has ever existed in real operation. correlation_id is the
+# one field _decode_event reads via .get() rather than a required key --
+# this is a confirming regression test that the tolerance holds, not a fix
+# for an observed gap.
+
+def test_a_row_with_no_correlation_id_key_at_all_decodes_as_none(tmp_path):
+    path = tmp_path / "audit.jsonl"
+    path.write_text(
+        '{"seq": 1, "actor": "system", "action": "a", "object_type": "t", '
+        '"object_id": "1", "before": null, "after": null, '
+        '"timestamp": "2026-07-20T15:00:00+00:00", '
+        '"prev_hash": "%s", "hash": "%s"}\n' % ("0" * 64, "a" * 64)
+    )
+    log = AuditLog(path=path)   # must not raise KeyError
+    assert len(log) == 1
+    assert log.events[0].correlation_id is None
+
+
 def test_hash_chain_is_unbroken_across_many_appends_and_a_restart(tmp_path):
     path = tmp_path / "audit.jsonl"
     first = AuditLog(path=path)

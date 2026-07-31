@@ -242,3 +242,93 @@ def test_cat_fee_auto_admit_ceiling_must_be_positive():
         C.load(base(cat_fee_auto_admit_ceiling=0))
     with pytest.raises(C.ConfigError, match="cat_fee_auto_admit_ceiling must be positive"):
         C.load(base(cat_fee_auto_admit_ceiling=-0.01))
+
+
+# --------------------------------------------------- symbol_universe (Commit 4)
+
+def test_symbol_universe_defaults_empty():
+    cfg = C.load(base())
+    assert cfg.symbol_universe == {}
+
+
+def test_symbol_universe_accepts_a_declared_symbol_asset_class_pair():
+    cfg = C.load(base(symbol_universe={"AAPL": "US_EQUITY", "SPY": "ETF"}))
+    assert cfg.symbol_universe == {"AAPL": "US_EQUITY", "SPY": "ETF"}
+
+
+def test_symbol_universe_rejects_a_lower_case_symbol():
+    with pytest.raises(C.ConfigError, match="upper-case ticker"):
+        C.load(base(symbol_universe={"aapl": "US_EQUITY"}))
+
+
+def test_symbol_universe_rejects_an_unrecognised_asset_class():
+    with pytest.raises(C.ConfigError, match="not a recognised asset_class"):
+        C.load(base(symbol_universe={"AAPL": "BOND"}))
+
+
+# ---------------------------------------------- materiality_filing_weights (Commit 5)
+
+def test_materiality_filing_weights_default_reproduces_the_old_flat_allowlist():
+    from agent.materiality import DEFAULT_FILING_WEIGHTS
+    cfg = C.load(base())
+    assert cfg.materiality_filing_weights == DEFAULT_FILING_WEIGHTS
+    assert cfg.materiality_policy.filing_weights == DEFAULT_FILING_WEIGHTS
+
+
+def test_materiality_filing_weights_can_be_overridden_per_form_item():
+    weights = base()["materiality_filing_weights"] | {"8-K:4.02": 3.0}
+    cfg = C.load(base(materiality_filing_weights=weights))
+    assert cfg.materiality_filing_weights["8-K:4.02"] == 3.0
+    assert cfg.materiality_policy.filing_weights["8-K:4.02"] == 3.0
+
+
+def test_materiality_filing_weights_rejects_a_negative_weight():
+    weights = base()["materiality_filing_weights"] | {"8-K:4.02": -1.0}
+    with pytest.raises(C.ConfigError, match="materiality_filing_weights.*cannot be negative"):
+        C.load(base(materiality_filing_weights=weights))
+
+
+# ------------------------------------------ materiality_min_peer_group_size
+# (review round 2): the peer-median substitute for `sector_ret` degenerates
+# below a real cross-sectional sample -- 3 is the smallest peer count where
+# "median" is a real middle value, not just one peer's own return or the
+# mean of two.
+
+def test_materiality_min_peer_group_size_defaults_to_three():
+    cfg = C.load(base())
+    assert cfg.materiality_min_peer_group_size == 3
+
+
+def test_materiality_min_peer_group_size_rejects_non_positive():
+    with pytest.raises(C.ConfigError, match="materiality_min_peer_group_size must be a positive integer"):
+        C.load(base(materiality_min_peer_group_size=0))
+    with pytest.raises(C.ConfigError, match="materiality_min_peer_group_size must be a positive integer"):
+        C.load(base(materiality_min_peer_group_size=-1))
+
+
+def test_materiality_min_peer_group_size_can_be_overridden():
+    cfg = C.load(base(materiality_min_peer_group_size=5))
+    assert cfg.materiality_min_peer_group_size == 5
+
+
+# ------------------------------------------------- edgar_document_max_bytes
+# (T4 prerequisite unit, 2026-07-31): caps agent.edgar.EdgarClient.
+# filing_document's fetch -- 5MB default, ~3.3x a confirmed real, routine
+# 10-K (scripts/fixtures/edgar/AAPL_10K_0000320193-25-000079.htm, 1,520,208
+# bytes).
+
+def test_edgar_document_max_bytes_defaults_to_5_000_000():
+    cfg = C.load(base())
+    assert cfg.edgar_document_max_bytes == 5_000_000
+
+
+def test_edgar_document_max_bytes_rejects_non_positive():
+    with pytest.raises(C.ConfigError, match="edgar_document_max_bytes must be positive"):
+        C.load(base(edgar_document_max_bytes=0))
+    with pytest.raises(C.ConfigError, match="edgar_document_max_bytes must be positive"):
+        C.load(base(edgar_document_max_bytes=-1))
+
+
+def test_edgar_document_max_bytes_can_be_overridden():
+    cfg = C.load(base(edgar_document_max_bytes=10_000_000))
+    assert cfg.edgar_document_max_bytes == 10_000_000
