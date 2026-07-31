@@ -91,6 +91,63 @@ def test_opening_balance_round_trips(tmp_path):
     assert opening == 500.0
 
 
+# ---------------------- opening_balance_established_at (Commit 1, 2026-07-31:
+# see agent/cash_event_quarantine.py's own module docstring for the incident
+# that needed this: a pre-baseline cash event nearly admitted a second time).
+
+def test_opening_balance_established_at_is_none_before_seeding(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    assert s.opening_balance_established_at() is None
+
+
+def test_opening_balance_established_at_reflects_write_opening_balance(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    assert s.opening_balance_established_at() == T0
+
+
+def test_opening_balance_established_at_reflects_seed_from_broker(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.seed_opening_balance_from_broker(Decimal("500.0"), now=T0)
+    assert s.opening_balance_established_at() == T0
+
+
+def test_opening_balance_established_at_survives_a_reload(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    store(path).write_opening_balance(500.0, at=T0)
+    reloaded = store(path)
+    assert reloaded.opening_balance_established_at() == T0
+
+
+def test_opening_balance_established_at_unchanged_by_an_identical_reseed(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_opening_balance(500.0, at=T0)   # safe replay
+    assert s.opening_balance_established_at() == T0
+
+
+def test_read_opening_balance_established_at_matches_the_instance_accessor(tmp_path):
+    from agent.ledger_store import read_opening_balance_established_at
+    path = tmp_path / "ledger.jsonl"
+    store(path).write_opening_balance(500.0, at=T0)
+    assert read_opening_balance_established_at(path) == T0
+
+
+def test_read_opening_balance_established_at_returns_none_for_a_missing_file(tmp_path):
+    from agent.ledger_store import read_opening_balance_established_at
+    assert read_opening_balance_established_at(tmp_path / "never-written.jsonl") is None
+
+
+def test_read_opening_balance_established_at_returns_none_when_never_seeded(tmp_path):
+    """A file can exist (e.g. a cash adjustment was written, which needs no
+    opening balance first) with no opening_balance row at all yet."""
+    from agent.ledger_store import read_opening_balance_established_at
+    path = tmp_path / "ledger.jsonl"
+    s = store(path)
+    s.write_cash_adjustment(cash_adjustment())
+    assert read_opening_balance_established_at(path) is None
+
+
 # ---------------------------------------------------------- lot selection policy
 
 def test_lot_selection_policy_defaults_to_alpaca_and_threads_into_to_ledger(tmp_path):

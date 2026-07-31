@@ -230,3 +230,15 @@ def test_broker_http_max_retries_of_zero_is_allowed():
     conservative choice, not an error."""
     cfg = C.load(base(broker_http_max_retries=0))
     assert cfg.broker_http_max_retries == 0
+
+
+def test_cat_fee_auto_admit_ceiling_defaults_and_round_trips():
+    cfg = C.load(base())
+    assert cfg.cat_fee_auto_admit_ceiling == 0.05
+
+
+def test_cat_fee_auto_admit_ceiling_must_be_positive():
+    with pytest.raises(C.ConfigError, match="cat_fee_auto_admit_ceiling must be positive"):
+        C.load(base(cat_fee_auto_admit_ceiling=0))
+    with pytest.raises(C.ConfigError, match="cat_fee_auto_admit_ceiling must be positive"):
+        C.load(base(cat_fee_auto_admit_ceiling=-0.01))

@@ -10,7 +10,7 @@ store is the same "quarantine, not a halt, not a guess" answer
 unresolvable execution, applied to an unresolvable CASH movement instead."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -19,20 +19,25 @@ from agent.accounts import CrossAccountError
 from agent.broker.base import AccountActivity
 from agent.cash_event_quarantine import (ADMITTED, PENDING, REJECTED,
                                          CashEventQuarantineError,
-                                         CashEventQuarantineStore)
+                                         CashEventQuarantineStore,
+                                         refuse_admission_reason)
 
 ACCT = "acct-taxable"
 T0 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+# The real CAT fee's own created_at (scripts/fixtures/activities.json):
+# posted overnight, a full day after its own economic `date`.
+CREATED_AT = datetime(2026, 7, 29, 0, 7, 16, tzinfo=timezone.utc)
 
 
 def activity(activity_id="a1", account_id=ACCT, activity_type="FEE",
             activity_sub_type="CAT", net_amount="-0.01",
-            effective_date=date(2026, 7, 28), symbol=None,
+            effective_date=date(2026, 7, 28), created_at=CREATED_AT, symbol=None,
             description="CAT fee for proceed of 1 trades on 2026-07-28 by PA3XZX944LRR"):
     return AccountActivity(activity_id=activity_id, account_id=account_id,
                            activity_type=activity_type,
                            activity_sub_type=activity_sub_type,
                            net_amount=Decimal(net_amount), date=effective_date,
+                           created_at=created_at,
                            symbol=symbol, description=description)
 
 
@@ -152,3 +157,42 @@ def test_store_is_append_only(tmp_path):
         s.update()
     with pytest.raises(CashEventQuarantineError):
         s.delete()
+
+
+# --------------------------------------------------------- refuse_admission_reason
+
+def test_refuse_admission_reason_allows_when_no_baseline_established():
+    assert refuse_admission_reason(
+        activity_id="a1", created_at=CREATED_AT,
+        opening_balance_established_at=None,
+    ) is None
+
+
+def test_refuse_admission_reason_allows_when_created_at_after_baseline():
+    established = CREATED_AT - timedelta(seconds=1)
+    assert refuse_admission_reason(
+        activity_id="a1", created_at=CREATED_AT,
+        opening_balance_established_at=established,
+    ) is None
+
+
+def test_refuse_admission_reason_refuses_when_created_at_before_baseline():
+    established = CREATED_AT + timedelta(seconds=1)
+    reason = refuse_admission_reason(
+        activity_id="a1", created_at=CREATED_AT,
+        opening_balance_established_at=established,
+    )
+    assert reason is not None
+    assert "a1" in reason
+    assert "double-count" in reason
+
+
+def test_refuse_admission_reason_refuses_on_exact_equality():
+    """The real incident: the JNLC deposit's own created_at coincided
+    exactly with the instant the opening balance was read from the same
+    broker call. At-or-before, not strictly-before."""
+    reason = refuse_admission_reason(
+        activity_id="a1", created_at=CREATED_AT,
+        opening_balance_established_at=CREATED_AT,
+    )
+    assert reason is not None

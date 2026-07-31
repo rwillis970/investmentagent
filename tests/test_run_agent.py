@@ -21,6 +21,7 @@ from agent.cash_event_quarantine import REJECTED as CASH_REJECTED
 from agent.cash_event_quarantine import CashEventQuarantineStore
 from agent.holding import HoldingPolicyRegistry
 from agent.execution_quarantine import ADMITTED, REJECTED, ExecutionQuarantineStore
+from agent.ledger_store import LedgerStore
 from agent.mode_store import ModeStore
 from agent.secrets_provider import InMemorySecretsProvider
 from scripts.run_agent import build_account_runtime, main
@@ -50,6 +51,7 @@ def test_build_account_runtime_derives_the_holding_policy_from_config(tmp_path):
     assert pol.minimum_holding_period == cfg.minimum_hold
     assert pol.cooldown_period == cfg.cooldown
     assert acct.max_day_trades_per_5_sessions == cfg.max_day_trades_per_5_sessions
+    assert acct.cat_fee_auto_admit_ceiling == __import__("decimal").Decimal("0.05")
 
 
 def test_main_returns_nonzero_and_logs_when_the_loop_raises(tmp_path, caplog):
@@ -670,10 +672,11 @@ def test_admitting_a_buy_without_holding_policy_version_is_refused(tmp_path):
 # See agent/cash_event_quarantine.py's own module docstring.
 
 def _cash_event_argv(*, account_id, cash_quarantine_path, audit_path, activity_id,
-                     reject=False):
+                     ledger_store_path=None, reject=False):
     argv = [
         "--account-id", account_id,
         "--cash-quarantine-store-path", str(cash_quarantine_path),
+        "--ledger-store-path", str(ledger_store_path or "/unused/ledger.jsonl"),
         "--mode-store-path", "/unused/mode.jsonl",   # not required for this path
         "--audit-log-path", str(audit_path),
     ]
@@ -684,7 +687,13 @@ def _cash_event_argv(*, account_id, cash_quarantine_path, audit_path, activity_i
     return argv
 
 
-def _quarantine_a_cash_event(path, *, account_id="acct-a", activity_id="a1"):
+# The real CAT fee's own created_at (scripts/fixtures/activities.json):
+# posted overnight, a full day after its own economic `date`.
+_CAT_FEE_CREATED_AT = datetime(2026, 7, 29, 0, 7, 16, tzinfo=timezone.utc)
+
+
+def _quarantine_a_cash_event(path, *, account_id="acct-a", activity_id="a1",
+                             created_at=_CAT_FEE_CREATED_AT):
     from datetime import date, datetime, timezone
     from agent.broker.base import AccountActivity
     store = CashEventQuarantineStore(path, account_id=account_id)
@@ -692,7 +701,7 @@ def _quarantine_a_cash_event(path, *, account_id="acct-a", activity_id="a1"):
         AccountActivity(activity_id=activity_id, account_id=account_id,
                         activity_type="FEE", activity_sub_type="CAT",
                         net_amount=__import__("decimal").Decimal("-0.01"),
-                        date=date(2026, 7, 28), symbol=None,
+                        date=date(2026, 7, 28), created_at=created_at, symbol=None,
                         description="CAT fee for proceed of 1 trades on "
                         "2026-07-28 by PA3XZX944LRR"),
         reason="unexplained cash movement: FEE/CAT",
@@ -783,6 +792,87 @@ def test_admitting_something_never_quarantined_is_refused(tmp_path):
         audit_path=audit_path, activity_id="ghost",
     ))
     assert code == 1
+
+
+def test_admit_cash_event_refuses_when_it_predates_the_opening_balance(tmp_path):
+    """The real incident (2026-07-31): the $500 JNLC deposit that seeded
+    this pilot account's own opening balance was independently reported
+    again by non_fill_activities() and nearly admitted a second time. Set
+    up a ledger baseline established AFTER the quarantined event's own
+    created_at -- --admit-cash-event must refuse outright, before any
+    resolution is recorded, and never write a CashAdjustment."""
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    ledger_store_path = tmp_path / "ledger.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    event_created_at = datetime(2026, 7, 27, 13, 0, tzinfo=timezone.utc)
+    baseline_established_at = datetime(2026, 7, 27, 18, 22, 41, tzinfo=timezone.utc)
+    _quarantine_a_cash_event(cash_quarantine_path, created_at=event_created_at)
+    LedgerStore(ledger_store_path, account_id="acct-a",
+               policy_registry=HoldingPolicyRegistry()).write_opening_balance(
+        __import__("decimal").Decimal("500"), at=baseline_established_at)
+
+    code = main(_cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1",
+        ledger_store_path=ledger_store_path,
+    ))
+    assert code == 1
+
+    store = CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")
+    assert store.status("a1") == "PENDING"   # never resolved -- still admissible via reject
+    assert store.resolution_for("a1") is None
+
+    log = AuditLog(path=audit_path)
+    assert [e for e in log.events if e.action == "cash_event_admitted"] == []
+
+
+def test_admit_cash_event_succeeds_when_it_postdates_the_opening_balance(tmp_path):
+    """Sanity check: the new baseline check must not block a legitimate
+    admission -- an event created strictly AFTER the baseline was
+    established is unaffected."""
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    ledger_store_path = tmp_path / "ledger.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    event_created_at = datetime(2026, 7, 29, 0, 7, 16, tzinfo=timezone.utc)
+    baseline_established_at = datetime(2026, 7, 27, 18, 22, 41, tzinfo=timezone.utc)
+    _quarantine_a_cash_event(cash_quarantine_path, created_at=event_created_at)
+    LedgerStore(ledger_store_path, account_id="acct-a",
+               policy_registry=HoldingPolicyRegistry()).write_opening_balance(
+        __import__("decimal").Decimal("500"), at=baseline_established_at)
+
+    code = main(_cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1",
+        ledger_store_path=ledger_store_path,
+    ))
+    assert code == 0
+
+    store = CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")
+    assert store.status("a1") == CASH_ADMITTED
+
+
+def test_reject_cash_event_is_unaffected_by_the_baseline_check(tmp_path):
+    """Rejecting a pre-baseline event is always the correct outcome --
+    never gated by the same check --admit-cash-event is."""
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    ledger_store_path = tmp_path / "ledger.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    event_created_at = datetime(2026, 7, 27, 13, 0, tzinfo=timezone.utc)
+    baseline_established_at = datetime(2026, 7, 27, 18, 22, 41, tzinfo=timezone.utc)
+    _quarantine_a_cash_event(cash_quarantine_path, created_at=event_created_at)
+    LedgerStore(ledger_store_path, account_id="acct-a",
+               policy_registry=HoldingPolicyRegistry()).write_opening_balance(
+        __import__("decimal").Decimal("500"), at=baseline_established_at)
+
+    code = main(_cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1",
+        ledger_store_path=ledger_store_path, reject=True,
+    ))
+    assert code == 0
+
+    store = CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")
+    assert store.status("a1") == CASH_REJECTED
 
 
 def test_admit_and_reject_cash_event_are_mutually_exclusive(tmp_path):

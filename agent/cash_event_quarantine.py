@@ -85,7 +85,59 @@ hand-edited or corrupted row is refused at load time too.
 EXACTLY ONE RESOLUTION EVER WINS, same as `ExecutionQuarantineStore`: a
 cash event is resolved exactly once; `admit`/`reject` refuse to record a
 SECOND, DIFFERENT decision for the same `activity_id` (an identical
-replay is a safe no-op)."""
+replay is a safe no-op).
+
+A PRE-BASELINE CASH EVENT MUST NEVER BE ADMITTED (found real, 2026-07-31,
+running the loop against the real paper account to a clean reconcile).
+`sync_cash_events` quarantined not just the CAT fee this module's own
+docstring above already describes, but ALSO the $500 JNLC deposit that
+this very account's opening balance was itself seeded from. That $500 is
+already inside `LedgerStore`'s opening_settled_cash (the broker read used
+to seed it already reflected the deposit); admitting it as a SECOND,
+separate `CashAdjustment` would have put local settled cash at $980,
+double-counted. It was rejected only because the operator happened to
+recognise what the activity_id was -- exactly the "transcribe, not
+confirm" failure mode this store's own ADMISSION IS A CONFIRM section
+above already argues against. A quarantined cash event dated at or before
+the point its account's ledger baseline was established is not a judgment
+call an operator's domain knowledge could ever correctly override in the
+other direction -- it is ALWAYS already reflected in that baseline, full
+stop -- so `refuse_admission_reason` (module-level function, below) makes
+this refusal unconditional rather than a warning an operator could admit
+past.
+
+WHY THIS CHECK IS NOT INSIDE `admit()` ITSELF. `admit()`/`_load_into`'s
+replay of a durably-recorded ADMITTED row must stay self-contained and
+side-effect-free of any OTHER store's state -- `CashEventQuarantineStore`
+has never been, and does not become here, coupled to `agent.ledger_store.
+LedgerStore` (the "own file, own class" isolation `ModeStore`/
+`ExecutionQuarantineStore`/this store all already share). Reading a
+SEPARATE store's file just to replay an already-decided resolution would
+be a new, load-bearing cross-store dependency for no benefit: a decision
+already durably admitted was already checked once, at the actual moment
+of admission (`scripts/run_agent.py`'s `--admit-cash-event`, which DOES
+have both stores in hand). `refuse_admission_reason` is therefore a bare
+function taking only the two datetimes that matter (`created_at`,
+`opening_balance_established_at`) -- callable by that CLI layer before it
+ever calls `.admit()`, and, since it takes no store at all, equally
+reusable by `agent.cash_events.sync_cash_events`'s own narrower auto-admit
+path (Commit 2, same file) without either needing to know about the
+other.
+
+WHY `created_at`, NOT `date` (see agent/broker/base.py's own docstring's
+`created_at` section for the full argument). The broker's settled-cash
+figure at the instant the opening balance was read already reflects every
+activity the broker's books had POSTED by that instant -- governed by
+`created_at`, not by `date` (the CAT fee's own economically-attributed
+day, which can be, and in the one real case observed already IS, earlier
+than when the broker's batch job actually posted it). Comparing by `date`
+would have gotten that same CAT fee wrong in the unsafe direction: its
+`date` (2026-07-28) could equal a same-day opening-balance read taken
+before the fee posted (`created_at` 2026-07-29T00:07), wrongly refusing an
+admission that was actually still owed -- permanently starving local
+settled cash of an effect the broker's own figure does eventually apply,
+which would halt `reconcile_settled_cash`'s exact equality forever, not
+just once."""
 from __future__ import annotations
 
 import json
@@ -118,6 +170,7 @@ class QuarantinedCashEvent:
     activity_sub_type: str | None
     net_amount: Decimal
     date: date
+    created_at: datetime
     symbol: str | None
     description: str
     reason: str
@@ -172,6 +225,7 @@ class CashEventQuarantineStore:
             activity_type=activity.activity_type,
             activity_sub_type=activity.activity_sub_type,
             net_amount=to_decimal(activity.net_amount), date=activity.date,
+            created_at=activity.created_at,
             symbol=activity.symbol, description=activity.description,
             reason=reason, quarantined_at=at,
         )
@@ -309,6 +363,7 @@ def _encode_quarantined(record: QuarantinedCashEvent) -> dict:
     # agent/execution_quarantine.py's _encode_quarantined already follow.
     d["net_amount"] = str(record.net_amount)
     d["date"] = record.date.isoformat()
+    d["created_at"] = record.created_at.isoformat()
     d["quarantined_at"] = record.quarantined_at.isoformat()
     return d
 
@@ -319,8 +374,45 @@ def _decode_activity(row: dict) -> AccountActivity:
         activity_type=row["activity_type"],
         activity_sub_type=row.get("activity_sub_type"),
         net_amount=to_decimal(row["net_amount"]), date=date.fromisoformat(row["date"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
         symbol=row.get("symbol"), description=row["description"],
     )
+
+
+def refuse_admission_reason(*, activity_id: str, created_at: datetime,
+                            opening_balance_established_at: datetime | None) -> str | None:
+    """Returns a human-readable refusal reason if a cash event dated
+    `created_at` is already reflected in the ledger's own opening balance
+    (established at `opening_balance_established_at`) -- i.e. admitting it
+    would double-count it -- or `None` if admission may proceed. See this
+    module's own docstring's "A PRE-BASELINE CASH EVENT MUST NEVER BE
+    ADMITTED" and "WHY `created_at`, NOT `date`" sections for the full
+    reasoning and the real incident this was found from.
+
+    `opening_balance_established_at=None` means this account's ledger has
+    never been seeded yet (`agent.ledger_store.LedgerStore.
+    opening_balance_established_at`/`read_opening_balance_established_at`
+    both use this same "never seeded" meaning) -- there is no baseline yet
+    for anything to predate, so this always returns `None` (admission may
+    proceed; nothing here overrides `Ledger.record_cash_adjustment`'s own,
+    separate validation).
+
+    Deliberately a bare function, not a `CashEventQuarantineStore` method --
+    see module docstring's "WHY THIS CHECK IS NOT INSIDE admit() ITSELF"
+    for why, and for why this is reused by BOTH `scripts.run_agent`'s
+    `--admit-cash-event` (Commit 1) and `agent.cash_events.sync_cash_events`'s
+    own auto-admit path (Commit 2) rather than checked in either store."""
+    if opening_balance_established_at is None:
+        return None
+    if created_at <= opening_balance_established_at:
+        return (
+            f"cash event {activity_id!r} (created_at={created_at.isoformat()}) is "
+            f"at or before the opening balance's own establishment instant "
+            f"({opening_balance_established_at.isoformat()}) -- its cash effect is "
+            "already reflected in the seeded baseline; admitting it would "
+            "double-count it. Reject it instead."
+        )
+    return None
 
 
 def _encode_resolution(resolution: CashEventResolution) -> dict:

@@ -687,6 +687,11 @@ def test_non_fill_activities_maps_the_real_cat_fee_shape():
     assert activity.activity_sub_type == "CAT"
     assert activity.net_amount == Decimal("-0.01")
     assert activity.date == date(2026, 7, 28)
+    # created_at (added 2026-07-31): the broker's own posting instant --
+    # a full day after `date` above for this real CAT fee, exactly the
+    # gap agent/broker/base.py's own docstring documents.
+    assert activity.created_at == datetime(2026, 7, 29, 0, 7, 16, 323361,
+                                           tzinfo=timezone.utc)
     assert activity.symbol is None
     assert activity.description == (
         "CAT fee for proceed of 1 trades on 2026-07-28 by PA3XZX944LRR"

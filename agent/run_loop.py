@@ -187,6 +187,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from decimal import Decimal
+
 from . import market_calendar
 from .accounts import BrokerCredentials, CrossAccountError
 from .account_wiring import build_account_reconciliation
@@ -220,6 +222,7 @@ class AccountRuntime:
     cash_quarantine_store_path: str | Path
     policy_registry: HoldingPolicyRegistry
     max_day_trades_per_5_sessions: int
+    cat_fee_auto_admit_ceiling: Decimal
     t_plus: int = 1
 
 
@@ -377,9 +380,10 @@ def run_cycle(*, accounts: list[AccountRuntime],
         # cycle must be reflected in local_settled_cash before
         # reconcile_settled_cash's own exact-equality check runs against
         # it (agent/cash_events.py's own module docstring).
-        cash_adjustments = sync_cash_events(adapter, store, now=now,
-                                           quarantine=cash_quarantine,
-                                           audit_log=audit_log)
+        cash_adjustments = sync_cash_events(
+            adapter, store, now=now, quarantine=cash_quarantine, audit_log=audit_log,
+            cat_fee_auto_admit_ceiling=acct.cat_fee_auto_admit_ceiling,
+        )
         new_cash_adjustments[acct.account_id] = cash_adjustments
 
         recon = build_account_reconciliation(

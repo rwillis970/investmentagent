@@ -3,3 +3,4 @@
 {"seq": 3, "mode": "PAUSED", "changed_at": "2026-07-28T15:15:18.129280+00:00", "reason": "account 98b34e82-04fc-4e19-ab3b-99ee312c8478: local positions {} do not match broker-reported positions {'SPY': 0.027087234}", "paused_from": "PAPER"}
 {"seq": 4, "mode": "PAPER", "changed_at": "2026-07-28T17:09:50.111993+00:00", "reason": null, "paused_from": null}
 {"seq": 5, "mode": "PAUSED", "changed_at": "2026-07-29T13:30:00.108665+00:00", "reason": "account 98b34e82-04fc-4e19-ab3b-99ee312c8478: broker reports settled cash Decimal('480'), local figure is Decimal('480.01'). Settled-cash reconciliation is exact-equality, not tolerance-based -- see agent/reconciliation.py.", "paused_from": "PAPER"}
+{"seq": 6, "mode": "PAPER", "changed_at": "2026-07-31T15:20:58.664199+00:00", "reason": null, "paused_from": null}

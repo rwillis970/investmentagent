@@ -21,6 +21,7 @@ shortcut."""
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -57,13 +58,15 @@ def credentials(account_id=ACCT):
     return BrokerCredentials(account_id=account_id, key_id="k", secret_ref="ref")
 
 
-def account_runtime(tmp_path, account_id=ACCT, max_day_trades=3):
+def account_runtime(tmp_path, account_id=ACCT, max_day_trades=3,
+                    cat_fee_auto_admit_ceiling=Decimal("0.05")):
     return AccountRuntime(
         account_id=account_id, credentials=credentials(account_id),
         ledger_store_path=tmp_path / f"{account_id}.jsonl",
         quarantine_store_path=tmp_path / f"{account_id}.quarantine.jsonl",
         cash_quarantine_store_path=tmp_path / f"{account_id}.cash_quarantine.jsonl",
         policy_registry=registry(), max_day_trades_per_5_sessions=max_day_trades,
+        cat_fee_auto_admit_ceiling=cat_fee_auto_admit_ceiling,
     )
 
 

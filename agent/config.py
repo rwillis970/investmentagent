@@ -175,6 +175,26 @@ class Config:
     broker_http_timeout_seconds: float = 10.0
     broker_http_max_retries: int = 2
 
+    # CAT-fee narrow auto-admit ceiling (agent/cash_events.py, Commit 2,
+    # 2026-07-31) -- real, required number, added in the same commit that
+    # reads it (§9.1). The ONE pattern eligible: activity_type=FEE,
+    # activity_sub_type=CAT, net_amount negative, |net_amount| <= this
+    # ceiling -- see agent/cash_events.py's own module docstring for the
+    # full eligibility check and for why auto-admission is scoped this
+    # narrowly. 0.05 is NOT a broker-documented number -- the only real
+    # data point this pilot has is the one observed CAT fee, $0.01
+    # (scripts/fixtures/activities.json) -- 0.05 is a 5x margin over that
+    # single observation, chosen to tolerate ordinary CAT-fee variation
+    # across different trade notionals without opening the door to
+    # something structurally different (a CAT fee is priced per trade at a
+    # small fraction of a cent per side; $0.05 is still two orders of
+    # magnitude below what a real, wrongly-signed or wrongly-typed cash
+    # movement would look like at this account's $500 scale). Same
+    # "uncalibrated, revisit once more real cycles exist" posture as
+    # materiality_w1-w6/materiality_threshold above -- not a documented
+    # broker rate, a conservative placeholder pending more observed fees.
+    cat_fee_auto_admit_ceiling: float = 0.05
+
     trade_capabilities: dict = field(default_factory=dict)
     sides: dict = field(default_factory=dict)
     funding: dict = field(default_factory=dict)
@@ -385,6 +405,9 @@ def validate(cfg: Config) -> None:
         err.append("broker_http_timeout_seconds must be positive")
     if cfg.broker_http_max_retries < 0:
         err.append("broker_http_max_retries cannot be negative")
+
+    if cfg.cat_fee_auto_admit_ceiling <= 0:
+        err.append("cat_fee_auto_admit_ceiling must be positive")
 
     caps = cfg.capability_policy
     # Every dimension must be populated. TradeCapabilityPolicy default-denies,

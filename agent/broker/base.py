@@ -175,8 +175,29 @@ class AccountActivity:
     `date`: the broker's own activity `date` field -- deliberately NOT
     `created_at`/`transaction_time` (when the broker's batch job happened
     to post it; the real CAT fee above posted at 2026-07-29T00:07 for a
-    trade dated 2026-07-28). `date` is the economically relevant day; using
-    `created_at` instead would misrepresent when this actually occurred.
+    trade dated 2026-07-28) FOR `agent.ledger.CashAdjustment.effective_date`
+    -- `date` is the economically relevant day; using `created_at` there
+    would misrepresent when this actually occurred.
+
+    `created_at`: ADDED 2026-07-31, a real, narrower need than the one
+    `date` already covers above -- NOT a reversal of that reasoning. Found
+    while fixing a real near-double-count: the $500 JNLC deposit that
+    seeded this pilot account's own opening balance was independently
+    reported again by `non_fill_activities()` (a broker cash movement with
+    no local counterpart, same as the CAT fee) and was one operator
+    judgment call away from being admitted a second time. The broker's
+    settled-cash figure at any read instant T already reflects every
+    activity the broker's OWN books had POSTED by T -- which is governed
+    by `created_at` (when the broker actually applied it), not by `date`
+    (the label the broker chose for which day it's economically
+    attributed to; the CAT fee's own `date` is 2026-07-28 but it posted,
+    per `created_at`, at 2026-07-29T00:07 -- a full day later). Comparing
+    an activity's `date` against the instant an opening balance was
+    established would get the CAT fee's own case wrong in the unsafe
+    direction (see agent/cash_event_quarantine.py's `refuse_admission_reason`
+    for where this is actually used, and why `created_at`, not `date`, is
+    the correct comparison basis for "is this already reflected in the
+    baseline").
 
     `symbol`: nullable -- most cash-only activities (fees, interest,
     journals) are account-level, not tied to one symbol; a per-symbol
@@ -193,6 +214,7 @@ class AccountActivity:
     activity_sub_type: str | None
     net_amount: Decimal
     date: date
+    created_at: datetime
     symbol: str | None
     description: str
 

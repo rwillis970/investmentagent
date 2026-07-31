@@ -163,7 +163,44 @@ JSON-native -- `json.dumps` raises on one directly. `_encode_fill`/
 `write_opening_balance` therefore write them as `str(...)` (exact --
 `Decimal(str(d)) == d` for any `Decimal`), and `_decode_fill`/`_load_into`
 parse them back via `agent.money.to_decimal`, never a bare `float(...)`.
-"""
+
+OPENING BALANCE ESTABLISHMENT INSTANT, EXPOSED (found real, 2026-07-31,
+fixing a near-double-count -- see agent/cash_event_quarantine.py's own
+module docstring for the incident). `write_opening_balance`/
+`seed_opening_balance_from_broker` both already receive a tz-aware
+`at`/`now` datetime and already persist it verbatim as the `"at"` field
+on the `"opening_balance"` row -- this was previously write-only,
+discarded on load (`_load_into` only ever read `row["amount"]` back out).
+`opening_balance_established_at()` (instance) and
+`read_opening_balance_established_at()` (module-level, standalone) now
+also expose it, because a caller deciding whether to ADMIT a quarantined
+cash event needs to know whether that event's own `created_at` is already
+covered by this store's baseline (see agent/cash_event_quarantine.py's
+`refuse_admission_reason`).
+
+BOTH SEEDING PATHS SHARE THE SAME "ESTABLISHED AT" MEANING, DESPITE
+COMPUTING A DIFFERENT `amount`. `write_opening_balance`'s `amount` is the
+broker's raw settled-cash read, taken at `at`. `seed_opening_balance_from_
+broker`'s `backdated` amount is that SAME raw read, taken at `now`, minus
+this store's already-known fills' combined effect -- a different NUMBER,
+but computed from a broker read taken at the exact same kind of instant:
+`now`. Either way, the broker figure the opening balance derives from was
+read at one specific instant, and already reflects every activity
+(fill or non-fill) the broker's own books had posted by then -- so a
+single `_opening_established_at`, set from whichever of `at`/`now` was
+actually used, correctly describes both paths' baseline coverage with no
+separate tracking needed for the bootstrap case.
+
+`read_opening_balance_established_at()` DELIBERATELY DOES NOT CONSTRUCT A
+`LedgerStore`. Building one needs a `HoldingPolicyRegistry` (to replay
+fills/order records for validation -- see `__init__`) that the one caller
+motivating this function (`scripts.run_agent`'s `--admit-cash-event`, no
+adapter, no config, no registry available) has no way to supply. The
+`"at"` field on an `"opening_balance"` row carries no lot/holding-policy
+dependency at all, so this is a narrow, standalone read of that one field
+-- not a second, duplicate implementation of `_load_into`'s replay (it
+does not replay fills/order records/cash adjustments at all, and could not
+answer any question this store answers about THOSE)."""
 from __future__ import annotations
 
 import json
@@ -204,6 +241,7 @@ class LedgerStore:
         self._t_plus = t_plus
         self._lot_selection_policy = lot_selection_policy
         self._opening: Decimal | None = None
+        self._opening_established_at: datetime | None = None
         # The validating Ledger's own opening_settled_cash is a PLACEHOLDER
         # -- never read, never exposed. It exists purely so record_fill/
         # record_order_status's existing validation logic can be reused
@@ -250,6 +288,7 @@ class LedgerStore:
         self._append_row({"kind": "opening_balance", "amount": str(amount),
                          "at": at.isoformat()})
         self._opening = amount
+        self._opening_established_at = at
 
     def seed_opening_balance_from_broker(self, broker_settled_cash: Decimal, *,
                                          now: datetime) -> None:
@@ -307,6 +346,7 @@ class LedgerStore:
         self._append_row({"kind": "opening_balance", "amount": str(backdated),
                          "at": now.isoformat()})
         self._opening = backdated
+        self._opening_established_at = now
 
     def write_fill(self, fill: Fill) -> None:
         """Validated through the internal `Ledger` BEFORE a single byte
@@ -343,6 +383,14 @@ class LedgerStore:
 
     def load(self) -> tuple[Decimal | None, tuple[Fill, ...], tuple[OrderRecord, ...]]:
         return self._opening, self._ledger.fills, self._ledger.order_records
+
+    def opening_balance_established_at(self) -> datetime | None:
+        """The instant `write_opening_balance`/`seed_opening_balance_from_
+        broker` actually read the broker's settled cash from -- `None` if
+        this store has never been seeded yet, same meaning as `load()`'s
+        own `None` opening balance. See module docstring's OPENING BALANCE
+        ESTABLISHMENT INSTANT section for what this is used for."""
+        return self._opening_established_at
 
     def known_cash_adjustment_ids(self) -> frozenset[str]:
         """Delegates to the internal validating `Ledger`'s own
@@ -416,6 +464,7 @@ class LedgerStore:
             kind = row.get("kind")
             if kind == "opening_balance":
                 self._opening = to_decimal(row["amount"])
+                self._opening_established_at = datetime.fromisoformat(row["at"])
             elif kind == "fill":
                 ledger.record_fill(_decode_fill(row))
             elif kind == "order_record":
@@ -427,6 +476,36 @@ class LedgerStore:
                     f"unrecognised ledger store row kind {kind!r} -- refusing to "
                     "silently skip a row this version does not understand"
                 )
+
+
+def read_opening_balance_established_at(path: str | Path) -> datetime | None:
+    """A narrow, standalone read of the `"opening_balance"` row's own
+    `"at"` field -- deliberately NOT a full `LedgerStore` construction. See
+    module docstring's OPENING BALANCE ESTABLISHMENT INSTANT section for
+    why: a `LedgerStore` needs a `HoldingPolicyRegistry` to replay fills/
+    order records for validation, a dependency this function's own reason
+    for existing (`scripts.run_agent --admit-cash-event`, no config/
+    registry available) has no way to supply, and this value carries no
+    such dependency at all.
+
+    Returns `None` if the file doesn't exist yet, or exists but has no
+    `"opening_balance"` row -- "never seeded", the same meaning
+    `LedgerStore.load()`/`.opening_balance_established_at()`'s own `None`
+    already carries. Does NOT validate the rest of the file (no replay,
+    no cross-check against fills/order records/cash adjustments) -- it
+    answers exactly one question, nothing broader."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    with p.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if row.get("kind") == "opening_balance":
+                return datetime.fromisoformat(row["at"])
+    return None
 
 
 def _encode_fill(f: Fill) -> dict:

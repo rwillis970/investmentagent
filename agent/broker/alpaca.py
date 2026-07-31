@@ -554,6 +554,14 @@ class AlpacaPaperAdapter(BrokerAdapter):
             activity_type=a["activity_type"],
             activity_sub_type=a.get("activity_sub_type"),
             net_amount=_dec(a["net_amount"]), date=date.fromisoformat(a["date"]),
+            # created_at: required, not .get(...) -- every real Account
+            # Activities row carries it (confirmed directly,
+            # scripts/fixtures/activities.json); a row missing it would be
+            # an Alpaca schema change worth surfacing as a KeyError, not
+            # silently treated as "unknown, treat as now" (see
+            # agent/broker/base.py's own docstring for why created_at
+            # matters -- it is the baseline-coverage comparison basis).
+            created_at=_parse_ts(a["created_at"]),
             symbol=a.get("symbol"), description=a.get("description", ""),
         )
 

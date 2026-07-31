@@ -145,6 +145,19 @@ not a fill-in-the-blank. Neither flag validates anything against
 contents id, is refused there, exactly as any other caller's would be);
 this command only records the decision.
 
+ADDED 2026-07-31: `--admit-cash-event` ALSO refuses outright, before
+`CashEventQuarantineStore.admit` is ever called and with no audit row
+written, if the event's own `created_at` is already covered by this
+account's ledger baseline (`agent.ledger_store.
+read_opening_balance_established_at`) -- see agent/cash_event_
+quarantine.py's own module docstring for the real incident (a $500 JNLC
+account-funding deposit, already inside the seeded opening balance,
+independently reported again by `non_fill_activities()` and one operator
+judgment call away from being admitted a SECOND time, double-counting
+it). This is why `--admit-cash-event` requires `--ledger-store-path` too,
+not just `--cash-quarantine-store-path`; `--reject-cash-event` requires it
+for a uniform flag set but never actually reads it.
+
 WHAT THIS SCRIPT DOES NOT SOLVE (see agent/run_loop.py's own docstring for
 the full reasoning on each):
 
@@ -187,10 +200,14 @@ from agent.approval import ApprovalService
 from agent.audit import AuditLog
 from agent.broker.alpaca import AlpacaPaperAdapter
 from agent.broker.base import BrokerAdapter
-from agent.cash_event_quarantine import CashEventQuarantineError, CashEventQuarantineStore
+from agent.cash_event_quarantine import (CashEventQuarantineError,
+                                         CashEventQuarantineStore,
+                                         refuse_admission_reason)
 from agent.execution_quarantine import ExecutionQuarantineError, ExecutionQuarantineStore
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+from agent.ledger_store import read_opening_balance_established_at
 from agent.mode_store import ModeStore
+from agent.money import to_decimal
 from agent.run_loop import AccountRuntime, run_loop as real_run_loop
 from agent.secrets_provider import KeychainSecretsProvider, SecretsProvider
 from agent.startup import _reconcile_mode_persistence
@@ -237,7 +254,12 @@ def build_account_runtime(cfg: config_module.Config, *, account_id: str,
     store_path` is the analogous durable file for
     `agent.cash_event_quarantine.CashEventQuarantineStore` -- what
     `--admit-cash-event`/`--reject-cash-event` (below) write into -- see
-    agent/cash_event_quarantine.py's own module docstring."""
+    agent/cash_event_quarantine.py's own module docstring. `cat_fee_auto_admit_
+    ceiling` is `cfg.cat_fee_auto_admit_ceiling` converted via `agent.money.
+    to_decimal` (never a bare `Decimal(a_float)` -- agent/money.py's own
+    docstring) -- what `agent.cash_events.sync_cash_events`'s narrow
+    CAT-fee auto-admit (Commit 2) checks a quarantined activity's
+    magnitude against."""
     registry = HoldingPolicyRegistry([
         HoldingPolicy(version="config", minimum_holding_period=cfg.minimum_hold,
                      cooldown_period=cfg.cooldown),
@@ -248,6 +270,7 @@ def build_account_runtime(cfg: config_module.Config, *, account_id: str,
         quarantine_store_path=quarantine_store_path,
         cash_quarantine_store_path=cash_quarantine_store_path, policy_registry=registry,
         max_day_trades_per_5_sessions=cfg.max_day_trades_per_5_sessions,
+        cat_fee_auto_admit_ceiling=to_decimal(cfg.cat_fee_auto_admit_ceiling),
     )
 
 
@@ -463,6 +486,7 @@ def _run_admit_or_reject(*, decision: str, execution_id: str, account_id: str,
 
 def _run_admit_or_reject_cash_event(*, decision: str, activity_id: str, account_id: str,
                                     cash_quarantine_store_path: str | Path,
+                                    ledger_store_path: str | Path,
                                     audit_log_path: str | Path,
                                     now_fn: Callable[[], datetime],
                                     log: logging.Logger) -> int:
@@ -480,7 +504,20 @@ def _run_admit_or_reject_cash_event(*, decision: str, activity_id: str, account_
     decision itself. The audit row is PRE-FILLED from the quarantined
     record (`store.pending()`), not from anything the operator typed --
     see agent/cash_event_quarantine.py's own module docstring for why this
-    is a confirm, not a fill-in-the-blank."""
+    is a confirm, not a fill-in-the-blank.
+
+    `ledger_store_path` (ADDED 2026-07-31, admit only): before ever calling
+    `store.admit`, checks `agent.cash_event_quarantine.
+    refuse_admission_reason` against `agent.ledger_store.
+    read_opening_balance_established_at(ledger_store_path)` -- refuses
+    outright, with no audit row, if this activity's own `created_at` is
+    already covered by this account's ledger baseline (see
+    agent/cash_event_quarantine.py's own module docstring for the real
+    incident this closes: the $500 JNLC deposit that seeded this pilot's
+    own opening balance was independently re-reported and nearly admitted
+    a second time). `--reject-cash-event` is never subject to this check --
+    rejecting a pre-baseline event is always the correct outcome, never a
+    mistake to guard against."""
     try:
         store = CashEventQuarantineStore(cash_quarantine_store_path, account_id=account_id)
         audit_log = AuditLog(path=audit_log_path)
@@ -491,6 +528,16 @@ def _run_admit_or_reject_cash_event(*, decision: str, activity_id: str, account_
         # store.admit/.reject below, which raises its own specific error --
         # this lookup exists only to pre-fill the audit row for a PENDING
         # one, not to gate the decision itself.
+
+        if decision == "admit" and record is not None:
+            established_at = read_opening_balance_established_at(ledger_store_path)
+            refusal = refuse_admission_reason(
+                activity_id=activity_id, created_at=record.created_at,
+                opening_balance_established_at=established_at,
+            )
+            if refusal is not None:
+                log.error("refusing --admit-cash-event %s: %s", activity_id, refusal)
+                return 1
 
         try:
             if decision == "admit":
@@ -540,7 +587,13 @@ def _parse_args(argv: list[str] | None):
                              "required unless --advance-mode-to is given")
     parser.add_argument("--ledger-store-path",
                         help="required unless --advance-mode-to/--admit-execution/"
-                             "--reject-execution is given")
+                             "--reject-execution is given. Also required, alongside "
+                             "--account-id and --cash-quarantine-store-path, for "
+                             "--admit-cash-event/--reject-cash-event -- --admit-cash-event "
+                             "reads this store's opening-balance establishment instant to "
+                             "refuse a pre-baseline admission (see module docstring's "
+                             "--ADMIT-CASH-EVENT section); --reject-cash-event never reads "
+                             "it, but must supply it too for a uniform requirement.")
     parser.add_argument("--quarantine-store-path",
                         help="durable ExecutionQuarantineStore file (agent/"
                              "execution_quarantine.py) -- survives a restart; required "
@@ -589,14 +642,19 @@ def _parse_args(argv: list[str] | None):
                              "--ADMIT-CASH-EVENT section. Unlike --admit-execution, no domain "
                              "flag is required: the broker's own activity record (amount, "
                              "type, sub_type, description) is already complete, so this is a "
-                             "confirm, not a fill-in-the-blank. Requires --account-id and "
-                             "--cash-quarantine-store-path; every other account/broker flag "
-                             "is ignored.")
+                             "confirm, not a fill-in-the-blank. Refused outright, before any "
+                             "resolution is recorded, if the event predates this account's "
+                             "ledger baseline (already reflected in opening_settled_cash) -- "
+                             "use --reject-cash-event for that case instead. Requires "
+                             "--account-id, --cash-quarantine-store-path and "
+                             "--ledger-store-path; every other account/broker flag is "
+                             "ignored.")
     parser.add_argument("--reject-cash-event", default=None, metavar="ACTIVITY_ID",
                         help="permanently exclude a quarantined cash event from ever "
                              "becoming a ledger CashAdjustment, then exit. Requires "
-                             "--account-id and --cash-quarantine-store-path; every other "
-                             "account/broker flag is ignored.")
+                             "--account-id, --cash-quarantine-store-path and "
+                             "--ledger-store-path; every other account/broker flag is "
+                             "ignored.")
     parser.add_argument("--confirmed", action="store_true",
                         help="required for the PAPER/PAUSED -> PRODUCTION_ACTIVE edges (§9.2); "
                              "irrelevant, and harmless, for PAPER")
@@ -620,6 +678,7 @@ def _parse_args(argv: list[str] | None):
         missing = [name for name, val in (
             ("--account-id", args.account_id),
             ("--cash-quarantine-store-path", args.cash_quarantine_store_path),
+            ("--ledger-store-path", args.ledger_store_path),
         ) if val is None]
         if missing:
             parser.error(
@@ -700,6 +759,7 @@ def main(argv: list[str] | None = None, *,
         return _run_admit_or_reject_cash_event(
             decision=decision, activity_id=activity_id, account_id=args.account_id,
             cash_quarantine_store_path=args.cash_quarantine_store_path,
+            ledger_store_path=args.ledger_store_path,
             audit_log_path=args.audit_log_path, now_fn=now_fn, log=log,
         )
 

@@ -35,6 +35,7 @@
   "budget_hard_stop_usd": 30,
   "broker_http_timeout_seconds": 10,
   "broker_http_max_retries": 2,
+  "cat_fee_auto_admit_ceiling": 0.05,
   "trade_capabilities": {
     "US_EQUITY": "PRODUCTION_ALLOWED",
     "ETF": "PRODUCTION_ALLOWED",
