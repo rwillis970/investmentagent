@@ -107,6 +107,29 @@ def test_a_second_call_on_the_same_instance_also_never_reseeds(tmp_path):
     assert s.load()[0] == 500.0
 
 
+# ---------------------- bootstrap: pre-existing fills, never seeded (2026-07-30)
+
+def test_a_store_with_pre_existing_fills_and_no_opening_balance_seeds_by_backdating(tmp_path):
+    """The bootstrap case this fix exists for: a fill already recorded
+    locally (as sync_fills would have written it, having run before this
+    function on a reused/pre-existing account) with NO opening balance
+    ever seeded. `write_opening_balance` alone would refuse this
+    permanently; this function must route it to `seed_opening_balance_
+    from_broker` instead, backdating from the broker's CURRENT (already-
+    debited) figure rather than seeding it verbatim."""
+    path = tmp_path / "l.jsonl"
+    s = store(path)
+    s.write_fill(Fill(fill_id="f1", account_id=ACCT, symbol="SPY", side="BUY",
+                      qty=to_decimal(1.0), price=to_decimal(100.0), filled_at=NOW, lot_id="l1",
+                      holding_policy_version="hp-v1"))
+    b = broker(cash=400.0)   # the broker's CURRENT cash already reflects the buy above
+    rec = build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
+                                       day_trade_guard=guard(), now=NOW)
+    assert s.load()[0] == 500.0          # backdated -- not the broker's current 400
+    assert rec.local_settled_cash == 400.0
+    assert rec.local_positions == {"SPY": 1.0}
+
+
 # --------------------------------------------------------- real field sourcing
 
 def test_all_seven_fields_come_from_the_real_adapter_and_ledger(tmp_path):

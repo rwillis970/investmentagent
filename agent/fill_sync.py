@@ -125,9 +125,9 @@ from datetime import datetime
 
 from .accounts import CrossAccountError
 from .audit import AuditLog
-from .broker.base import BrokerAdapter
+from .broker.base import TERMINAL_ORDER_STATUSES, BrokerAdapter
 from .execution_quarantine import ADMITTED, ExecutionQuarantineStore
-from .ledger import Fill
+from .ledger import Fill, OrderRecord
 from .ledger_store import LedgerStore
 
 
@@ -300,3 +300,54 @@ def sync_fills(adapter: BrokerAdapter, store: LedgerStore, *,
         new_fills.append(fill)
 
     return tuple(new_fills)
+
+
+def close_terminal_orders(adapter: BrokerAdapter, store: LedgerStore, *,
+                          now: datetime) -> tuple[OrderRecord, ...]:
+    """Closes the order-lifecycle record itself -- the separate half of
+    "keep this ledger in sync with the broker" that `sync_fills` never
+    covered (found while testing the process loop, 2026-07-30:
+    tests/test_run_loop.py had to hand-write the CLOSED `OrderRecord` for a
+    fully-filled order, because nothing in this codebase ever wrote one).
+    `sync_fills` turns Executions into Fills; this turns a broker-confirmed
+    TERMINAL order status into a CLOSED `OrderRecord` -- two different kinds
+    of broker-reported truth, not two halves of the same one.
+
+    For every `client_order_id` this store's own `open_order_ids()`
+    currently believes is OPEN, asks the broker directly
+    (`adapter.get_by_client_id`) and closes it iff the broker's own status
+    is one of `TERMINAL_ORDER_STATUSES` (agent/broker/base.py -- "filled",
+    "canceled", "rejected"; NOT "new"/"partially_filled", which can still
+    receive further fills). Never guesses: `get_by_client_id` returning
+    `None` (the broker no longer reports this order at all) leaves it
+    OPEN rather than assuming closed -- an unconfirmed state is not the
+    same as a confirmed terminal one, and Appendix E's fail-safe bias
+    applies here exactly as everywhere else in this codebase.
+
+    Idempotent by construction, the same way `sync_fills` is: a
+    `client_order_id` this store already believes is CLOSED is not in
+    `open_order_ids()` at all, so a second call after the first already
+    closed it makes zero further `get_by_client_id` calls and writes
+    nothing -- proven structurally in
+    tests/test_fill_sync.py::test_close_terminal_orders_only_checks_ids_this_store_believes_are_open,
+    not merely asserted by re-running.
+
+    Returns only the `OrderRecord`s newly written this call, mirroring
+    `sync_fills`'s own return-only-what's-new contract. Raises
+    `CrossAccountError` if the broker ever reports a different account_id
+    for an order this store asked about by client_order_id -- the same
+    defense-in-depth check `sync_fills` already applies per execution."""
+    closed: list[OrderRecord] = []
+    for client_order_id in sorted(store.open_order_ids()):
+        order = adapter.get_by_client_id(client_order_id)
+        if order is None:
+            continue   # broker no longer reports it -- unconfirmed, not closed
+        if order.account_id != store.account_id:
+            raise CrossAccountError(store.account_id, order.account_id,
+                                    "close_terminal_orders")
+        if order.status in TERMINAL_ORDER_STATUSES:
+            record = OrderRecord(client_order_id=client_order_id,
+                                 account_id=store.account_id, status="CLOSED", at=now)
+            store.write_order_record(record)
+            closed.append(record)
+    return tuple(closed)

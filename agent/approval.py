@@ -39,11 +39,22 @@ class TokenReissued(ApprovalError):
 
 
 def order_fingerprint(*, symbol: str, side: str, qty: float, order_type: str,
-                      time_in_force: str, limit_price: float | None = None) -> str:
+                      time_in_force: str, limit_price: float | None = None,
+                      lot_id: str | None = None) -> str:
+    """A human's approval token is bound to this hash. `lot_id` (Commit 3,
+    2026-07-30) closes a gap where a SELL's approval covered symbol/side/
+    qty/type/TIF/limit but not which lot it reduces -- even though lot
+    choice determines holding-period compliance and cost basis, and
+    `agent.pipeline._SIGNABLE_FIELDS` already treats lot_id as
+    signature-critical in the separate staging HMAC for the same reason.
+    Defaults to None so every existing BUY/CANCEL call site (which never
+    had a lot to bind) hashes identically to before this parameter
+    existed."""
     body = json.dumps({
         "symbol": symbol.upper(), "side": side.upper(), "qty": round(float(qty), 6),
         "order_type": order_type.upper(), "time_in_force": time_in_force.upper(),
         "limit_price": None if limit_price is None else round(float(limit_price), 4),
+        "lot_id": lot_id,
     }, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode()).hexdigest()[:32]
 

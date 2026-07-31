@@ -389,15 +389,28 @@ def test_advance_mode_to_paper_to_production_active_requires_confirmed(tmp_path)
     assert len(AuditLog(path=audit_path).events) == before_events   # nothing written
 
 
-def test_advance_mode_to_paper_to_production_active_succeeds_when_confirmed(tmp_path):
+def test_advance_mode_to_production_active_is_refused_even_when_confirmed(tmp_path, caplog):
+    """Commit 4 (2026-07-30): confirmation alone used to be enough to flip
+    persisted mode to PRODUCTION_ACTIVE -- but no adapter for that mode
+    exists anywhere in this codebase (only AlpacaPaperAdapter does, and it
+    is hardcoded PAPER-bound; see this module's own docstring's "DOES THE
+    SAME DEAD END EXIST FOR PAPER -> PRODUCTION_ACTIVE?" section). Persisting
+    that mode left every subsequent real cycle crashing at adapter
+    construction -- fail-safe, but a persisted-but-unrunnable mode should be
+    unreachable in the first place. --advance-mode-to must refuse this,
+    confirmed or not, and write nothing to either store."""
     mode_path = tmp_path / "mode.jsonl"
     audit_path = tmp_path / "audit.jsonl"
     main(_mode_argv(mode_path, audit_path, "RESEARCH"))
     main(_mode_argv(mode_path, audit_path, "PAPER"))
+    before_events = len(AuditLog(path=audit_path).events)
 
-    code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
-    assert code == 0
-    assert ModeStore(mode_path).current() == "PRODUCTION_ACTIVE"
+    with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+        code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
+    assert code == 1
+    assert ModeStore(mode_path).current() == "PAPER"   # unchanged
+    assert len(AuditLog(path=audit_path).events) == before_events   # nothing written
+    assert any("no adapter" in r.message for r in caplog.records)
 
 
 def test_advance_mode_to_the_current_mode_is_a_no_op_and_writes_nothing(tmp_path):
@@ -499,13 +512,24 @@ def test_advance_mode_bypass_via_paused_to_production_active_is_closed(tmp_path)
     assert ModeStore(mode_path).current() == "PAUSED"
 
 
-def test_advance_mode_resume_to_production_active_still_requires_confirmed(tmp_path):
+def test_advance_mode_resume_to_production_active_is_refused_even_confirmed(tmp_path):
+    """Commit 4 (2026-07-30): PRODUCTION_ACTIVE can no longer be reached via
+    --advance-mode-to at all (see test_advance_mode_to_production_active_is_
+    refused_even_when_confirmed above), so a "PAUSED, paused_from=
+    PRODUCTION_ACTIVE" state can no longer be produced through main() the
+    way this test used to set one up -- it is seeded directly on the store
+    instead, standing in for a state inherited from before this fix (or,
+    once a live adapter eventually exists, from a real halt). Confirmation
+    is still independently checked first (refused for its own reason when
+    missing); the adapter-constructibility refusal is what stops it even
+    when confirmed."""
     mode_path = tmp_path / "mode.jsonl"
     audit_path = tmp_path / "audit.jsonl"
-    main(_mode_argv(mode_path, audit_path, "RESEARCH"))
-    main(_mode_argv(mode_path, audit_path, "PAPER"))
-    main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
-    main(_mode_argv(mode_path, audit_path, "PAUSED"))
+    seed_t0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    store = ModeStore(mode_path)
+    store.write("PAPER", changed_at=seed_t0, reason="seeded for this test")
+    store.write("PAUSED", changed_at=seed_t0 + timedelta(seconds=1),
+               reason="seeded for this test", paused_from="PRODUCTION_ACTIVE")
     assert ModeStore(mode_path).paused_from() == "PRODUCTION_ACTIVE"
 
     code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=False))
@@ -513,8 +537,8 @@ def test_advance_mode_resume_to_production_active_still_requires_confirmed(tmp_p
     assert ModeStore(mode_path).current() == "PAUSED"
 
     code = main(_mode_argv(mode_path, audit_path, "PRODUCTION_ACTIVE", confirmed=True))
-    assert code == 0
-    assert ModeStore(mode_path).current() == "PRODUCTION_ACTIVE"
+    assert code == 1
+    assert ModeStore(mode_path).current() == "PAUSED"
 
 
 # ------------------------------------------ --admit-execution / --reject-execution

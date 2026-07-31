@@ -1,4 +1,25 @@
 {
-  "body": [],
+  "body": [
+    {
+      "asset_class": "us_equity",
+      "asset_id": "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+      "asset_marginable": true,
+      "avg_entry_price": "737.986",
+      "change_today": "0.0185",
+      "cost_basis": "19.989999",
+      "current_price": "742.9585",
+      "exchange": "ARCA",
+      "lastday_price": "729.46",
+      "market_value": "20.124691",
+      "qty": "0.027087234",
+      "qty_available": "0.027087234",
+      "side": "long",
+      "symbol": "SPY",
+      "unrealized_intraday_pl": "0.365637",
+      "unrealized_intraday_plpc": "0.0185",
+      "unrealized_pl": "0.134692",
+      "unrealized_plpc": "0.00674"
+    }
+  ],
   "status": 200
 }

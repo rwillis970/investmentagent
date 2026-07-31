@@ -140,22 +140,36 @@ audit persistence (mirroring `LedgerStore`'s or `ModeStore`'s own
 append-only-file pattern) is a unit of its own size, not a line item inside
 this one, and this unit's brief did not ask for it.
 
-KNOWN GAP -- NOTHING EVER CLOSES AN OrderRecord (found while testing this
-unit). `sync_fills` records Fills; it never writes a new `OrderRecord`
-transitioning `status` from `"OPEN"` to `"CLOSED"` -- that was never part of
-its scope (see agent/fill_sync.py). Nothing else in this codebase does
-either. So once an order is staged (an `OrderRecord` with `status="OPEN"`
-gets durably written at staging time) and later fully fills or is
-cancelled, `Ledger.open_order_ids()` -- and with it `AccountReconciliation.
-local_open_order_ids` / `agent.reconciliation.reconcile_open_orders` -- keeps
-reporting it OPEN forever, because nothing ever tells the ledger otherwise.
-Tests here that exercise a filled order across two cycles have to write the
-CLOSED `OrderRecord` by hand, standing in for order-lifecycle machinery that
-does not exist yet (see tests/test_run_loop.py's own comment at the point
-this was discovered). This is a real, load-bearing gap for any account with
-order history beyond a single still-open order -- not fixed here; deciding
-where this belongs (extending `sync_fills`, or a separate order-status
-poller) is its own design question, not a line item inside this loop.
+FIXED -- NOTHING EVER CLOSED AN OrderRecord (found while testing this unit,
+2026-07-29; fixed 2026-07-30). `sync_fills` records Fills; it never wrote a
+new `OrderRecord` transitioning `status` from `"OPEN"` to `"CLOSED"` -- that
+was never part of its scope (see agent/fill_sync.py), and nothing else in
+this codebase did either. So once an order was staged (an `OrderRecord`
+with `status="OPEN"` durably written at staging time) and later fully
+filled or was cancelled, `Ledger.open_order_ids()` -- and with it
+`AccountReconciliation.local_open_order_ids` / `agent.reconciliation.
+reconcile_open_orders` -- kept reporting it OPEN forever, with nothing ever
+telling the ledger otherwise. Tests here that exercised a filled order
+across two cycles used to have to write the CLOSED `OrderRecord` by hand,
+standing in for order-lifecycle machinery that did not exist yet.
+
+Fixed by `agent.fill_sync.close_terminal_orders` (own module, own
+docstring for the full reasoning): for every `client_order_id` this
+cycle's `LedgerStore.open_order_ids()` believes is OPEN, it asks the
+broker directly (`adapter.get_by_client_id`) and closes it iff the
+broker's own status is one of `agent.broker.base.TERMINAL_ORDER_STATUSES`
+("filled", "canceled", "rejected" -- reconciled directly against
+`agent.broker.alpaca.STATUS_MAP`'s five canonical values; NOT "new" or
+"partially_filled", which can still receive further fills). Called here,
+in `run_cycle`, immediately after `sync_fills` and before
+`build_account_reconciliation` -- same ordering reasoning as `sync_fills`
+itself: a terminal status this cycle's own fill just confirmed should
+close in the SAME cycle, not lag a cycle behind and produce a transient,
+avoidable `reconcile_open_orders` mismatch. `LedgerStore.open_order_ids()`
+needed its own small addition to make this callable before this store's
+`opening_settled_cash` has ever been seeded (`to_ledger()` still refuses
+until then) -- order records carry no cash effect at all, so this was safe
+to add without touching the seeding invariant.
 
 NOT BUILT HERE: an OS-level power assertion / run-lease mechanism. docs/
 architecture.md §8.1 says "Power assertion held while a run lease is active"
@@ -181,7 +195,7 @@ from .audit import AuditLog
 from .broker.base import BrokerAdapter
 from .daytrade import DayTradeGuard
 from .execution_quarantine import ExecutionQuarantineStore
-from .fill_sync import sync_fills
+from .fill_sync import close_terminal_orders, sync_fills
 from .holding import HoldingPolicyRegistry
 from .ledger import Fill
 from .ledger_store import LedgerStore
@@ -331,6 +345,14 @@ def run_cycle(*, accounts: list[AccountRuntime],
         fills = sync_fills(adapter, store, now=now, quarantine=quarantine,
                           audit_log=audit_log)
         new_fills[acct.account_id] = fills
+
+        # Closes the order-lifecycle record itself (agent/fill_sync.py's
+        # own docstring) -- AFTER sync_fills, same reasoning as sync_fills
+        # running before build_account_reconciliation: a terminal status
+        # this cycle's own fill just confirmed should close the same
+        # cycle, not lag a cycle behind. Fixes the "nothing ever closes an
+        # OrderRecord" gap named below and in fill_sync.py's own docstring.
+        close_terminal_orders(adapter, store, now=now)
 
         recon = build_account_reconciliation(
             account_id=acct.account_id, adapter=adapter, store=store,

@@ -167,6 +167,20 @@ class BrokerOrder:
     filled_at: datetime | None = None
 
 
+# The three of `BrokerOrder.status`'s five canonical values (see the field
+# comment above) that will never change again -- reconciled directly against
+# `agent.broker.alpaca.STATUS_MAP`, which collapses every raw Alpaca order
+# status into exactly these five, and against `SimulatorBroker.open_orders`'s
+# own existing membership test (`status in ("new", "partially_filled")`,
+# agent/broker/simulator.py), which is this same terminal/non-terminal split
+# stated the other way around -- not a new concept, a name for one that
+# already existed in two places with no shared constant (found while fixing
+# the "nothing ever closes an OrderRecord" gap, 2026-07-30). "new" and
+# "partially_filled" are the two NOT here: a partially-filled order can still
+# receive further fills, so it is still genuinely open.
+TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "rejected"})
+
+
 def detect_posture(acct: AccountSnapshot) -> AccountPosture:
     if acct.multiplier <= 1.0:
         return AccountPosture.CASH
@@ -364,7 +378,7 @@ class BrokerAdapter(ABC):
                 fingerprint=order_fingerprint(
                     symbol=staged.symbol, side=staged.side, qty=staged.authorized_qty,
                     order_type=staged.order_type, time_in_force=staged.time_in_force,
-                    limit_price=staged.limit_price),
+                    limit_price=staged.limit_price, lot_id=staged.lot_id),
                 price=price, now=self.clock(),
             )
 

@@ -82,15 +82,21 @@ this codebase (agent/broker/alpaca.py's own docstring: "only the PAPER half
 same `AlpacaPaperAdapter`-refuses-a-mismatched-secrets_provider crash, for
 an even more fundamental reason: there is currently no adapter implementation
 capable of ever operating in PRODUCTION_ACTIVE at all, not just a
-wrongly-bound one. `--advance-mode-to PRODUCTION_ACTIVE --confirmed` WILL
-still succeed at flipping the persisted mode (it constructs no adapter, so
-the missing live adapter is not in its way) -- but every subsequent attempt
-to actually run the real loop in that mode will immediately fail at adapter
-construction, every cycle, until a live adapter exists. This is safe (no
-live trading can occur) but operationally confusing (mode claims
-PRODUCTION_ACTIVE while nothing can ever run under it), and is a genuine,
-separate gap this flag does not close -- building `AlpacaLiveAdapter` is
-Day 10 scope, not attempted here.
+wrongly-bound one. Before Commit 4 (2026-07-30), `--advance-mode-to
+PRODUCTION_ACTIVE --confirmed` would still succeed at flipping the persisted
+mode (it constructs no adapter itself, so the missing live adapter was not
+in ITS way) -- but every subsequent attempt to actually run the real loop in
+that mode would immediately fail at adapter construction, every cycle,
+until a live adapter exists. That was safe (no live trading could occur)
+but operationally confusing (mode claims PRODUCTION_ACTIVE while nothing
+can ever run under it), and left a persisted-but-unrunnable mode reachable
+when it should not have been. Fixed (Commit 4): `_run_advance_mode` now
+refuses to advance into any mode that `agent.market_calendar.
+exercises_calendar` says needs a real adapter (PAPER, PRODUCTION_ACTIVE)
+unless that mode is also in `_ADAPTER_CONSTRUCTIBLE_MODES` -- today, only
+PAPER is. PRODUCTION_ACTIVE is therefore unreachable via this flag,
+confirmed or not, until a live adapter exists and is added to that set --
+building `AlpacaLiveAdapter` remains Day 10 scope, not attempted here.
 
 --ADMIT-EXECUTION / --REJECT-EXECUTION: THE OPERATOR PATH FOR A QUARANTINED
 EXECUTION (found running the loop against the real paper account, §11: a
@@ -150,6 +156,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent import config as config_module
 from agent import failure_sentinel
+from agent import market_calendar
 from agent import mode as mode_fsm
 from agent.accounts import BrokerCredentials
 from agent.approval import ApprovalService
@@ -229,6 +236,23 @@ def _real_adapter_factory(secrets_provider: SecretsProvider,
     return factory
 
 
+# Modes with a real, constructible adapter implementation TODAY -- not a
+# statement about which modes are legal on the FSM (agent/mode.py already
+# owns that), only about which ones `_real_adapter_factory` can actually
+# build something for. Only PAPER: `AlpacaPaperAdapter` is hardcoded
+# PAPER-bound (refuses any other secrets_provider at construction -- see
+# this module's own docstring's "DOES THE SAME DEAD END EXIST FOR PAPER ->
+# PRODUCTION_ACTIVE?" section) and no AlpacaLiveAdapter exists anywhere in
+# this codebase (Day 10 scope, not attempted here). DISABLED/RESEARCH/PAUSED
+# are deliberately absent from this set but never checked against it either
+# (see _run_advance_mode below) -- they never exercise the calendar
+# (agent.market_calendar.exercises_calendar), so run_startup never hands
+# them a real account or adapter in the first place (agent.startup.
+# AccountsNotExpectedForMode); requiring a constructible adapter for them
+# would refuse a case that was never a problem.
+_ADAPTER_CONSTRUCTIBLE_MODES = frozenset({"PAPER"})
+
+
 def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
                       audit_log_path: str | Path, confirmed: bool,
                       now_fn: Callable[[], datetime], log: logging.Logger) -> int:
@@ -273,6 +297,27 @@ def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
     `agent.startup.run_startup` resolves it, from the same store method --
     one implementation of "what mode was this paused from," not two.
 
+    REFUSING A PERSISTED-BUT-UNRUNNABLE MODE (Commit 4, 2026-07-30, found
+    running the loop for the first time). `assert_legal_startup` above only
+    answers "is this edge legal on the FSM" -- it says nothing about
+    whether anything could ever actually RUN in the target mode, so
+    `--advance-mode-to PRODUCTION_ACTIVE --confirmed` used to succeed at
+    writing that mode into the store even though no adapter for it exists
+    (see module docstring's "DOES THE SAME DEAD END EXIST FOR PAPER ->
+    PRODUCTION_ACTIVE?" section) -- fail-safe (no live trading can occur),
+    but operationally wrong: a persisted-but-unrunnable mode should be
+    unreachable, not merely harmless. Checked here, after the FSM/
+    confirmation gate above and before any write: if `target_mode` is one
+    `agent.market_calendar.exercises_calendar` says actually needs a real
+    account/adapter (PAPER, PRODUCTION_ACTIVE) and it is not in
+    `_ADAPTER_CONSTRUCTIBLE_MODES`, the advance is refused exactly like an
+    illegal FSM step -- nothing written to either store. DISABLED/RESEARCH/
+    PAUSED never reach this check's refusal branch because `exercises_
+    calendar` is already False for them (see `_ADAPTER_CONSTRUCTIBLE_MODES`'s
+    own comment). This makes PRODUCTION_ACTIVE unreachable via this flag
+    UNTIL a live adapter exists and is added to that set -- building one is
+    Day 10 scope and deliberately not attempted here.
+
     Any unexpected exception (e.g. `mode_store_path`'s parent directory
     does not exist) is caught and logged, matching this script's own
     never-raises, always-0-or-1 contract -- but deliberately does NOT touch
@@ -295,6 +340,17 @@ def _run_advance_mode(*, target_mode: str, mode_store_path: str | Path,
                                           paused_from=paused_from)
         except mode_fsm.ModeTransitionError as exc:
             log.error("refusing --advance-mode-to %s: %s", target_mode, exc)
+            return 1
+
+        if (market_calendar.exercises_calendar(target_mode)
+                and target_mode not in _ADAPTER_CONSTRUCTIBLE_MODES):
+            log.error(
+                "refusing --advance-mode-to %s: no adapter implementation "
+                "exists for this mode yet (only %s does) -- persisting it "
+                "would leave every subsequent real cycle crashing at "
+                "adapter construction instead of failing here",
+                target_mode, sorted(_ADAPTER_CONSTRUCTIBLE_MODES),
+            )
             return 1
 
         if target_mode == persisted:

@@ -23,21 +23,49 @@ unbuilt).
 
 FIRST-EVER STARTUP VS. EVERY SUBSEQUENT ONE -- THE ONE MOMENT RE-SEEDING IS
 CORRECT. `LedgerStore.load()` returns `opening=None` only for a store that
-has never had `write_opening_balance` called on it -- the fresh-install
-case, per that store's own documented contract. This function treats that,
-and only that, as "seed now, from the broker's own reported settled cash,
-before any fill exists" -- exactly what `opening_settled_cash` is supposed
-to mean (agent/ledger.py's own DECISION 2: seeded once, at the account's
-very first reconciliation, before any local fill exists). Every subsequent
-call sees `opening is not None` and skips straight to `to_ledger()` --
-never re-seeding, never re-deriving `opening_settled_cash` from a fresh
-broker read on top of history that already exists. Re-seeding on a store
-that already has fills is exactly the double-count bug the previous
-commit's `LedgerStore.write_opening_balance` fix now refuses outright; this
-function's `opening is None` check is the ordinary-path reason that refusal
-is never actually hit in real operation, not a second copy of the check
-itself (see `agent/ledger_store.py`'s own docstring for why the refusal
-belongs solely in the store).
+has never had `write_opening_balance`/`seed_opening_balance_from_broker`
+called on it -- the fresh-install case, per that store's own documented
+contract. This function treats that, and only that, as "seed now, from the
+broker's own reported settled cash" -- exactly what `opening_settled_cash`
+is supposed to mean (agent/ledger.py's own DECISION 2: seeded once, at the
+account's very first reconciliation). Every subsequent call sees `opening
+is not None` and skips straight to `to_ledger()` -- never re-seeding, never
+re-deriving `opening_settled_cash` from a fresh broker read on top of
+history that already exists.
+
+TWO SHAPES OF "FIRST EVER," NOT ONE (bootstrap gap fixed 2026-07-30). "No
+opening balance yet" splits into two genuinely different cases, and this
+function now checks `store.load()`'s own `fills` to tell them apart:
+
+  * NO local fills either -- the ordinary fresh-install path. Seeded via
+    the plain `write_opening_balance(broker_account.settled_cash, ...)`,
+    unchanged from before.
+  * Local fills ALREADY exist -- the account's broker had fill history
+    from before this account's very first cycle ever ran (a reused paper
+    account, or a deleted/never-created ledger file), so `sync_fills`
+    (which always runs before this function, per agent/run_loop.py's own
+    ordering) already wrote them here. Seeding with the current broker
+    figure VERBATIM would double-count those fills -- exactly the bug
+    `LedgerStore.write_opening_balance`'s own refusal exists to prevent,
+    and that refusal is UNCHANGED, still hit if this function's own check
+    below is ever bypassed. Seeded instead via
+    `store.seed_opening_balance_from_broker(...)`, which backdates the
+    correct value from the fills the store already has (see
+    `agent/ledger_store.py`'s own docstring for the arithmetic). Before
+    this fix, this case had no recovery path at all: `write_opening_
+    balance` refused every call, forever, and the account's ledger could
+    never be seeded through this loop (see this fix's own delivery
+    report and the test this replaced,
+    `tests/test_run_loop.py::test_a_pre_existing_broker_fill_before_the_
+    very_first_cycle_now_seeds_correctly`).
+
+Re-seeding on a store that already has fills is still exactly the
+double-count bug `LedgerStore.write_opening_balance`'s refusal exists to
+prevent; this function's `fills` check is what routes that case to the
+method built specifically to handle it correctly, not a second copy of
+either check itself (see `agent/ledger_store.py`'s own docstring for why
+the refusal, and its narrower bootstrap counterpart, both belong solely in
+the store).
 
 CROSS-ACCOUNT DISCIPLINE. `adapter`, `store` and `day_trade_guard` are each
 already bound to their own `account_id` at their own construction (the same
@@ -103,15 +131,27 @@ def build_account_reconciliation(*, account_id: str, adapter: BrokerAdapter,
 
     broker_account = adapter.account()
 
-    opening, _, _ = store.load()
+    opening, fills, _ = store.load()
     if opening is None:
-        # First-ever startup only (see module docstring) -- every
-        # subsequent call sees `opening is not None` here and skips this
-        # entirely. `write_opening_balance` itself refuses this seed if any
-        # fill already exists (agent/ledger_store.py's own fix), so this is
-        # not the thing making that impossible -- it is just the ordinary
-        # path that means the refusal is never actually hit.
-        store.write_opening_balance(broker_account.settled_cash, at=now)
+        if fills:
+            # BOOTSTRAP CASE (fixed 2026-07-30): a broker with fill history
+            # from BEFORE this account's very first cycle -- sync_fills
+            # necessarily ran before this seeding step got a chance to run
+            # (agent/run_loop.py's own required ordering), so those fills
+            # are already recorded here. write_opening_balance would
+            # refuse this outright (correctly -- see its own docstring);
+            # seed_opening_balance_from_broker is the narrower path built
+            # specifically for this case, backdating the correct opening
+            # value from the fills this store already has rather than
+            # seeding the current broker figure verbatim (which would
+            # double-count them). See agent/ledger_store.py's own
+            # docstring for the full reasoning.
+            store.seed_opening_balance_from_broker(broker_account.settled_cash, now=now)
+        else:
+            # The ordinary first-ever startup path (see module docstring)
+            # -- every subsequent call sees `opening is not None` here and
+            # skips this entirely.
+            store.write_opening_balance(broker_account.settled_cash, at=now)
 
     ledger = store.to_ledger()
 

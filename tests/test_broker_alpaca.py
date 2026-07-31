@@ -19,8 +19,8 @@ import pytest
 from agent.accounts import BrokerCredentials, CrossAccountError
 from agent.broker.alpaca import (STATUS_MAP, AlpacaError, AlpacaPaperAdapter,
                                  AmbiguousOrderState, UnsupportedOrderShape)
-from agent.broker.base import (AccountSnapshot, BrokerOrder, Execution, Position,
-                               StagingKeyUnset)
+from agent.broker.base import (TERMINAL_ORDER_STATUSES, AccountSnapshot, BrokerOrder,
+                               Execution, Position, StagingKeyUnset)
 from agent.broker.transport import ScriptedTransport, TransportError, TransportTimeout
 from agent.pipeline import Gatekeeper
 from agent.risk import PortfolioState
@@ -650,3 +650,17 @@ def test_fills_stops_paging_on_an_empty_page():
     fills = adapter(t).fills()
     assert fills == []
     assert len(t.calls) == 1
+
+
+# ------------------- TERMINAL_ORDER_STATUSES reconciled against STATUS_MAP
+# (2026-07-30, "nothing ever closes an OrderRecord" fix). Not a new
+# vocabulary -- STATUS_MAP already collapses every raw Alpaca status into
+# exactly BrokerOrder's five canonical values; TERMINAL_ORDER_STATUSES names
+# the three of those five that will never change again.
+
+def test_terminal_order_statuses_is_exactly_three_of_status_maps_five_canonical_values():
+    canonical = set(STATUS_MAP.values())
+    assert canonical == {"new", "partially_filled", "filled", "canceled", "rejected"}
+    assert TERMINAL_ORDER_STATUSES == {"filled", "canceled", "rejected"}
+    assert TERMINAL_ORDER_STATUSES < canonical
+    assert canonical - TERMINAL_ORDER_STATUSES == {"new", "partially_filled"}

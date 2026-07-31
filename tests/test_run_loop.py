@@ -245,15 +245,12 @@ def test_a_fill_staged_between_cycles_reconciles_clean_on_the_next_cycle(tmp_pat
                                                  status="OPEN", at=IN_SESSION,
                                                  holding_policy_version="hp-v1"))
     # SimulatorBroker fills synchronously and completely (no partial fills),
-    # so "c1" is no longer broker-open. NOTHING in this codebase today
-    # transitions an OrderRecord from OPEN to CLOSED on its own -- sync_fills
-    # only ever records Fills (see agent/fill_sync.py's own scope); closing
-    # the order-lifecycle record is a separate, not-yet-built responsibility
-    # (see this unit's own report). Standing in for it explicitly here, the
-    # same way staging itself is stood in for above.
-    interim_store.write_order_record(OrderRecord(client_order_id="c1", account_id=ACCT,
-                                                 status="CLOSED", at=IN_SESSION,
-                                                 holding_policy_version="hp-v1"))
+    # so "c1" is no longer broker-open. Nothing is written here to close it
+    # by hand -- run_cycle's own close_terminal_orders call (agent/
+    # fill_sync.py, wired in 2026-07-30) is what has to do that, in the
+    # very same cycle that observes the fill, for the assertions below to
+    # hold: local_open_order_ids must no longer contain "c1" or
+    # reconcile_open_orders would halt on a phantom still-open mismatch.
 
     later = IN_SESSION + timedelta(minutes=5)
     second = run_cycle(
@@ -265,27 +262,27 @@ def test_a_fill_staged_between_cycles_reconciles_clean_on_the_next_cycle(tmp_pat
     assert second.result.reconciled_accounts == (ACCT,)
     assert len(second.new_fills[ACCT]) == 1
     assert second.reconciliations[0].local_positions == {"SPY": 1.0}
+    assert second.reconciliations[0].local_open_order_ids == frozenset()
 
 
-def test_a_pre_existing_broker_fill_before_the_very_first_cycle_cannot_be_seeded(tmp_path):
-    """NEWLY-DISCOVERED BOOTSTRAPPING GAP (found while testing this unit, not
-    assumed): if the broker ALREADY has fill history before this loop's
+def test_a_pre_existing_broker_fill_before_the_very_first_cycle_now_seeds_correctly(tmp_path):
+    """BOOTSTRAPPING GAP (found while testing an earlier unit; fixed
+    2026-07-30): the broker ALREADY has fill history before this loop's
     very first cycle for an account ever runs -- e.g. a paper account
     reused from an earlier manual test, or a deleted/never-created ledger
-    file -- sync_fills (correctly, per this unit's required ordering)
-    writes that fill BEFORE build_account_reconciliation gets a chance to
-    seed opening_settled_cash. LedgerStore.write_opening_balance then
-    correctly refuses (a fill already exists with no opening ever
-    recorded) -- which is its own, prior unit's fix working as designed,
-    but the PRACTICAL consequence is that this account's ledger can never
-    be seeded through this loop at all. Not fixed here: the fix belongs in
-    either agent/ledger_store.py's refusal condition or agent/
-    account_wiring.py's seeding order, both established, deliberately-
-    reasoned modules from earlier units -- not something to loosen inside
-    this one. See this module's own report."""
+    file. sync_fills (correctly, per this loop's required ordering) writes
+    that fill BEFORE build_account_reconciliation gets a chance to seed
+    opening_settled_cash. This used to make LedgerStore.write_opening_
+    balance refuse permanently (a fill already exists with no opening ever
+    recorded) -- correct behaviour for that method, but with no recovery
+    path anywhere in this loop. Fixed by agent.account_wiring.
+    build_account_reconciliation routing this exact case to
+    LedgerStore.seed_opening_balance_from_broker instead, which backdates
+    the correct opening value from the fill(s) already recorded rather
+    than seeding the broker's current (already-debited) figure verbatim.
+    See agent/ledger_store.py's own docstring for the arithmetic."""
     from agent.ledger import OrderRecord
     from agent.ledger_store import LedgerStore
-    from agent.ledger_store import LedgerStoreError
 
     b = SimulatorBroker(account_id=ACCT, cash=500.0, now=IN_SESSION)
     key = b"k" * 32
@@ -301,6 +298,7 @@ def test_a_pre_existing_broker_fill_before_the_very_first_cycle_cannot_be_seeded
     )
     staged = StagedOrder(**fields, signature=sign_staged_order(fields, key))
     b.submit(staged)   # the broker already has this fill before any cycle ran
+                       # -- SimulatorBroker's own cash is now 500 - 100 = 400
 
     acct = account_runtime(tmp_path)
     pre_store = LedgerStore(acct.ledger_store_path, account_id=ACCT, policy_registry=registry())
@@ -308,13 +306,21 @@ def test_a_pre_existing_broker_fill_before_the_very_first_cycle_cannot_be_seeded
                                              status="OPEN", at=IN_SESSION,
                                              holding_policy_version="hp-v1"))
 
-    with pytest.raises(LedgerStoreError, match="refusing to seed opening_settled_cash"):
-        run_cycle(
-            accounts=[acct], adapter_factory=lambda a: b,
-            mode_store=mode_store_at("PAPER", now=IN_SESSION),
-            audit_log=agreeing_log("PAPER", now=IN_SESSION),
-            approval_service=approval_service(), target_mode="PAPER", now=IN_SESSION,
-        )
+    result = run_cycle(
+        accounts=[acct], adapter_factory=lambda a: b,
+        mode_store=mode_store_at("PAPER", now=IN_SESSION),
+        audit_log=agreeing_log("PAPER", now=IN_SESSION),
+        approval_service=approval_service(), target_mode="PAPER", now=IN_SESSION,
+    )
+    assert result.result.reconciled_accounts == (ACCT,)
+    assert len(result.new_fills[ACCT]) == 1
+    assert result.reconciliations[0].local_positions == {"SPY": 1.0}
+    # The backdated opening balance itself: durably 500, NOT the broker's
+    # current (already-debited) 400 -- proving no double-count, the exact
+    # value this fix exists to get right.
+    opening, _, _ = LedgerStore(acct.ledger_store_path, account_id=ACCT,
+                                policy_registry=registry()).load()
+    assert opening == 500.0
 
 
 def test_a_halt_from_run_startup_propagates_uncaught(tmp_path):

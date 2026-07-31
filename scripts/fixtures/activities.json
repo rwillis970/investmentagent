@@ -1,4 +1,40 @@
 {
-  "body": [],
+  "body": [
+    {
+      "activity_type": "FILL",
+      "cum_qty": "0.027087234",
+      "id": "20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346",
+      "leaves_qty": "0",
+      "order_id": "91dcb2f4-315c-4c39-8211-1f71ed7d49a9",
+      "order_status": "filled",
+      "price": "737.986",
+      "qty": "0.027087234",
+      "side": "buy",
+      "symbol": "SPY",
+      "transaction_time": "2026-07-28T14:42:51.412408Z",
+      "type": "fill"
+    },
+    {
+      "activity_sub_type": "CAT",
+      "activity_type": "FEE",
+      "created_at": "2026-07-29T00:07:16.323361Z",
+      "currency": "USD",
+      "date": "2026-07-28",
+      "description": "CAT fee for proceed of 1 trades on 2026-07-28 by PA3XZX944LRR",
+      "id": "20260728000000000::de3745eb-7d16-4bf3-9514-234693d9f84e",
+      "net_amount": "-0.01",
+      "status": "executed"
+    },
+    {
+      "activity_type": "JNLC",
+      "created_at": "2026-07-27T13:00:50.193924Z",
+      "currency": "USD",
+      "date": "2026-07-27",
+      "description": "",
+      "id": "20260727000000000::3763e621-82d0-438f-bd1e-cefb92703ef3",
+      "net_amount": "500",
+      "status": "executed"
+    }
+  ],
   "status": 200
 }

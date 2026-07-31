@@ -18,10 +18,10 @@ from agent.money import to_decimal
 
 from agent.accounts import CrossAccountError
 from agent.audit import AuditLog
-from agent.broker.base import (AccountSnapshot, BrokerAdapter, BrokerOrder,
-                               Execution, Position)
+from agent.broker.base import (TERMINAL_ORDER_STATUSES, AccountSnapshot, BrokerAdapter,
+                               BrokerOrder, Execution, Position)
 from agent.execution_quarantine import ADMITTED, PENDING, REJECTED, ExecutionQuarantineStore
-from agent.fill_sync import SyncFillsError, sync_fills
+from agent.fill_sync import SyncFillsError, close_terminal_orders, sync_fills
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger import OrderRecord
 from agent.ledger_store import LedgerStore
@@ -37,17 +37,31 @@ class FakeBroker(BrokerAdapter):
     sequence across several partial-fill increments of one order."""
     is_live = False
     name = "fake"
-    _extra_public_methods = frozenset({"add_execution", "set_executions"})
+    _extra_public_methods = frozenset({"add_execution", "set_executions", "set_order_status"})
 
     def __init__(self, account_id=ACCT):
         super().__init__(account_id)
         self._executions: list[Execution] = []
+        self._orders: dict[str, BrokerOrder] = {}
 
     def add_execution(self, execution: Execution) -> None:
         self._executions.append(execution)
 
     def set_executions(self, executions: list[Execution]) -> None:
         self._executions = list(executions)
+
+    def set_order_status(self, client_order_id: str, status: str, *,
+                         account_id: str | None = None) -> None:
+        """Scripts what `get_by_client_id` returns for `close_terminal_
+        orders` (agent/fill_sync.py) -- only the fields that function
+        actually reads (`account_id`, `status`) are meaningful here; the
+        rest are placeholders satisfying `BrokerOrder`'s required fields."""
+        self._orders[client_order_id] = BrokerOrder(
+            account_id=account_id or self.account_id, client_order_id=client_order_id,
+            broker_order_id="b-" + client_order_id, symbol="SPY", side="BUY",
+            qty=to_decimal(1), order_type="LIMIT", time_in_force="DAY", limit_price=None,
+            status=status, filled_qty=to_decimal(1), avg_fill_price=None,
+        )
 
     def fills(self) -> list[Execution]:
         return list(self._executions)
@@ -63,7 +77,7 @@ class FakeBroker(BrokerAdapter):
         raise NotImplementedError
 
     def get_by_client_id(self, client_order_id: str):
-        raise NotImplementedError
+        return self._orders.get(client_order_id)
 
     def sessions(self, through: date, count: int = 5) -> list[date]:
         raise NotImplementedError
@@ -361,3 +375,87 @@ def test_a_naive_now_is_refused(tmp_path):
     with pytest.raises(SyncFillsError, match="timezone"):
         sync_fills(b, s, now=datetime(2026, 7, 20, 15, 0),
                   quarantine=quarantine_store(tmp_path), audit_log=AuditLog())
+
+
+# --------------------------------- close_terminal_orders (2026-07-30 fix)
+# "Nothing ever closes an OrderRecord" (run_loop.py's own KNOWN GAP,
+# tests/test_run_loop.py's own hand-stood-in CLOSED record): sync_fills
+# only ever writes Fills. This is the separate function that closes the
+# order-lifecycle record itself, once the broker reports one of
+# TERMINAL_ORDER_STATUSES for a client_order_id this store still believes
+# is OPEN.
+
+def test_close_terminal_orders_closes_a_filled_order(tmp_path):
+    s = store(tmp_path)
+    s.write_order_record(order_record("c1", holding_policy_version="hp-v1"))
+    b = FakeBroker()
+    b.set_order_status("c1", "filled")
+    closed = close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
+    assert len(closed) == 1
+    assert closed[0].client_order_id == "c1"
+    assert closed[0].status == "CLOSED"
+    assert s.open_order_ids() == frozenset()
+
+
+@pytest.mark.parametrize("status", sorted(TERMINAL_ORDER_STATUSES))
+def test_close_terminal_orders_closes_every_terminal_status(tmp_path, status):
+    s = store(tmp_path)
+    s.write_order_record(order_record("c1", holding_policy_version="hp-v1"))
+    b = FakeBroker()
+    b.set_order_status("c1", status)
+    closed = close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
+    assert [r.client_order_id for r in closed] == ["c1"]
+
+
+@pytest.mark.parametrize("status", ["new", "partially_filled"])
+def test_close_terminal_orders_leaves_a_genuinely_open_order_alone(tmp_path, status):
+    s = store(tmp_path)
+    s.write_order_record(order_record("c1", holding_policy_version="hp-v1"))
+    b = FakeBroker()
+    b.set_order_status("c1", status)
+    closed = close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
+    assert closed == ()
+    assert s.open_order_ids() == frozenset({"c1"})
+
+
+def test_close_terminal_orders_is_a_no_op_on_a_second_call(tmp_path):
+    s = store(tmp_path)
+    s.write_order_record(order_record("c1", holding_policy_version="hp-v1"))
+    b = FakeBroker()
+    b.set_order_status("c1", "filled")
+    close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
+    again = close_terminal_orders(b, s, now=T0 + timedelta(minutes=2))
+    assert again == ()
+
+
+def test_close_terminal_orders_skips_an_order_the_broker_no_longer_reports(tmp_path):
+    """`get_by_client_id` returning None means "cannot confirm" -- left
+    OPEN, not assumed closed. No `Fill` intent gap this is filling in for;
+    a genuinely missing order is its own, separate, unconfirmed state."""
+    s = store(tmp_path)
+    s.write_order_record(order_record("c1", holding_policy_version="hp-v1"))
+    b = FakeBroker()   # no set_order_status call -- get_by_client_id returns None
+    closed = close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
+    assert closed == ()
+    assert s.open_order_ids() == frozenset({"c1"})
+
+
+def test_close_terminal_orders_raises_cross_account_error_on_a_mismatched_order(tmp_path):
+    s = store(tmp_path, account_id=ACCT)
+    b = FakeBroker(account_id=ACCT)
+    s.write_order_record(order_record("c1", holding_policy_version="hp-v1"))
+    b.set_order_status("c1", "filled", account_id="acct-other")
+    with pytest.raises(CrossAccountError):
+        close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
+
+
+def test_close_terminal_orders_only_checks_ids_this_store_believes_are_open(tmp_path):
+    """No stray `get_by_client_id` calls for ids this store has no opinion
+    about -- proven structurally, not just by absence of a crash."""
+    s = store(tmp_path)
+    b = FakeBroker()
+    checked = []
+    original = b.get_by_client_id
+    b.get_by_client_id = lambda cid: (checked.append(cid), original(cid))[1]
+    close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
+    assert checked == []

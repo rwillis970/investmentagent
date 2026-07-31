@@ -107,3 +107,25 @@ def test_fingerprint_is_stable_and_sensitive():
     assert order_fingerprint(**ORDER) == order_fingerprint(**ORDER)
     assert order_fingerprint(**ORDER) != order_fingerprint(**(ORDER | {"side": "SELL"}))
     assert order_fingerprint(**ORDER) == order_fingerprint(**(ORDER | {"symbol": "spy"}))
+
+
+def test_fingerprint_lot_id_defaults_to_none_and_is_backward_compatible():
+    """Commit 3 (2026-07-30): adding lot_id must not change the fingerprint
+    for any caller that never mentions it -- every pre-existing call site in
+    this codebase (a BUY, or a CANCEL) has no lot_id and must keep hashing
+    exactly as it did before this parameter existed."""
+    assert order_fingerprint(**ORDER) == order_fingerprint(**ORDER, lot_id=None)
+
+
+def test_fingerprint_is_sensitive_to_lot_id():
+    """Commit 3: `agent.pipeline._SIGNABLE_FIELDS` already covers lot_id for
+    the staging HMAC -- a human approving a SELL must be committing to which
+    lot it reduces too, since lot choice determines holding-period
+    compliance and cost basis. Two otherwise-identical SELLs against
+    different lots must now fingerprint differently, and a lot-bound SELL
+    must differ from the same order with no lot bound at all."""
+    sell = ORDER | {"side": "SELL"}
+    assert (order_fingerprint(**sell, lot_id="l1")
+            != order_fingerprint(**sell, lot_id="l2"))
+    assert (order_fingerprint(**sell, lot_id="l1")
+            != order_fingerprint(**sell, lot_id=None))

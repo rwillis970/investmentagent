@@ -251,6 +251,63 @@ class LedgerStore:
                          "at": at.isoformat()})
         self._opening = amount
 
+    def seed_opening_balance_from_broker(self, broker_settled_cash: Decimal, *,
+                                         now: datetime) -> None:
+        """Bootstrap seeding for the case `write_opening_balance` above
+        deliberately refuses: a broker with fill history from BEFORE this
+        store's very first cycle for this account. `sync_fills` always
+        runs before this store is ever seeded (agent/run_loop.py's own
+        ordering), so those fills are already recorded here by the time
+        seeding is attempted -- `write_opening_balance` correctly refuses
+        that (its own docstring), and this method does NOT weaken that
+        refusal; it is a separate, narrower path for the one case that
+        refusal was never meant to make permanently impossible to recover
+        from.
+
+        `broker_settled_cash` is a CURRENT broker read -- it already
+        reflects every fill this store has already recorded. The correct
+        `opening_settled_cash` is therefore that figure MINUS those
+        fills' own combined cash effect, not the figure itself (which
+        would double-count them the next time `settled_cash()` replays).
+        That effect is not re-derived here: `self._ledger` (this store's
+        own internal validating Ledger, permanently seeded with a
+        placeholder opening of `Decimal("0")`, never exposed as real
+        cash -- see `__init__`) has already replayed every fill this
+        store knows about, so `self._ledger.settled_cash(now=now)` IS
+        exactly that combined effect, computed by the SAME formula
+        `agent.ledger.Ledger.settled_cash` always uses -- no second
+        implementation, no invented number, the ledger's own equation
+        solved for its own unknown.
+
+        When no fill exists yet, this reduces to an ordinary first-ever
+        seed (the fills' effect is `Decimal("0")`), so a caller may use
+        this method unconditionally for "never seeded" without needing to
+        check whether fills already exist first -- though
+        `agent.account_wiring.build_account_reconciliation` still checks,
+        so `write_opening_balance`'s own, simpler, unmodified contract
+        keeps covering the ordinary case exactly as before.
+
+        Idempotent the same way `write_opening_balance` is: a second call
+        that recomputes to the SAME opening value is a safe no-op: a
+        second call that recomputes to a DIFFERENT one is a hard error."""
+        if now.tzinfo is None:
+            raise LedgerStoreError("now must be a timezone-aware datetime")
+        broker_settled_cash = to_decimal(broker_settled_cash)
+        backdated = broker_settled_cash - self._ledger.settled_cash(now=now)
+        if self._opening is not None:
+            if self._opening == backdated:
+                return   # identical re-seed attempt -- safe, idempotent no-op
+            raise LedgerStoreError(
+                f"opening_settled_cash is already durably set to {self._opening!r}; "
+                f"refusing to overwrite with the recomputed {backdated!r} (from "
+                f"broker_settled_cash={broker_settled_cash!r}) -- it is written "
+                "exactly once, never re-derived from a later broker read (see "
+                "module docstring)"
+            )
+        self._append_row({"kind": "opening_balance", "amount": str(backdated),
+                         "at": now.isoformat()})
+        self._opening = backdated
+
     def write_fill(self, fill: Fill) -> None:
         """Validated through the internal `Ledger` BEFORE a single byte
         reaches disk -- a rejection raises exactly what a bare `Ledger`
@@ -270,6 +327,16 @@ class LedgerStore:
 
     def load(self) -> tuple[Decimal | None, tuple[Fill, ...], tuple[OrderRecord, ...]]:
         return self._opening, self._ledger.fills, self._ledger.order_records
+
+    def open_order_ids(self) -> frozenset[str]:
+        """Delegates to the internal validating `Ledger`'s own
+        `open_order_ids()` -- unlike `to_ledger()`, this needs no
+        `opening_settled_cash` to have been seeded yet: order records carry
+        no cash effect at all, only `self._opening`/`settled_cash()` do.
+        Added 2026-07-30 so a caller can close a terminal order in the same
+        cycle that first seeds this store's opening balance (see
+        `agent.fill_sync.close_terminal_orders`)."""
+        return self._ledger.open_order_ids()
 
     def to_ledger(self) -> Ledger:
         """Reconstruct a fresh, correctly-seeded `Ledger` from this store

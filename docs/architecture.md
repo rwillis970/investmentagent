@@ -393,6 +393,36 @@ fill, both the lot our strategy intended and the lot the broker's actual disposa
 would consume first, so any divergence between the two is visible rather than silently
 invisible.
 
+**A partially-filled BUY diverges from Alpaca's own lot count too — strictly more
+conservative, not a correctness gap (found reviewing the deferred defect list, 2026-07-30;
+see `agent/fill_sync.py`'s own "WHY EACH BUY-FILL INCREMENT BECOMES ITS OWN LOT" section).**
+The disposal-order finding above already named the general shape of this gap ("our own `Lot`
+is one lot per BUY fill... it does not replicate Alpaca's same-day weighted-average
+compression across multiple same-day buys") for the *pyramiding* case — several separate
+same-day BUY orders into one symbol — and judged it unlikely to bind for this pilot's shape.
+The narrower case here is more ordinary and does not require pyramiding at all: a *single*
+BUY order that fills in several partial executions (a routine limit-order outcome, not an
+edge case) becomes N independent `Lot` rows in this ledger, one per fill increment, each with
+its own `holding_policy` clock starting at that increment's own `filled_at` (§4.1's own
+formula above, `agent/ledger.py`'s `record_fill`) — while Alpaca compresses the same
+same-day fills into a single weighted-average lot for its own accounting (cited above:
+["Position Average Entry Price
+Calculation"](https://docs.alpaca.markets/us/docs/position-average-entry-price-calculation),
+no new claim added here). Strategy-side and broker-side lot counts genuinely diverge for
+every multi-execution fill.
+
+This is a fail-safe divergence, not a correctness gap. `sellable_qty` walks lots in disposal
+order and sums only the maximal leading run that has individually cleared its own hold
+(above) — the *whole* filled quantity is never eligible any earlier under N clocks than it
+would be under one clock anchored to the same (earliest) fill, because every later
+increment's own clock is an *additional* condition on top of, never a replacement for, the
+earlier ones. N clocks can only withhold quantity a single compressed clock would have
+already released (the later increments' own tail), never release quantity a single clock
+would still be withholding — the same "strictly stricter, never looser" direction as the
+Decimal-precision and disposal-order findings elsewhere in this section. No code change
+follows from this: it is a documented, accepted divergence between strategy-lot and
+broker-lot counts, not a defect.
+
 **Externally-originated fills — quarantine, not a guess or a halt (found running the loop
 against the real paper account, 2026-07-28).** `agent.fill_sync.sync_fills` recovers a BUY's
 intended `holding_policy_version` and a SELL's intended `lot_id` from an `OrderRecord`

@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -166,6 +167,71 @@ def test_seeding_before_any_fill_still_works(tmp_path):
     assert s.load()[0] == 500.0
 
 
+# ------------------- seed_opening_balance_from_broker (2026-07-30 fix)
+# The bootstrap gap: a broker with fill history from BEFORE this store's
+# very first cycle (sync_fills necessarily runs first every cycle -- see
+# agent/run_loop.py's own "sync_fills MUST RUN BEFORE
+# build_account_reconciliation" reasoning) writes those fills locally
+# before this store is ever seeded, and write_opening_balance's own
+# double-count refusal above then blocks seeding forever. This method does
+# NOT weaken that refusal -- write_opening_balance still refuses exactly
+# as before (see test_seeding_the_opening_balance_after_a_fill_already_
+# exists_is_refused, unmodified, still passing). It computes the ONE
+# value that keeps the double-count invariant true GIVEN those fills: the
+# store's own internal validating Ledger (permanently opening=0) already
+# replayed them, so `self._ledger.settled_cash(now=now)` IS their combined
+# cash effect -- no new arithmetic, no invented number, the ledger's own
+# formula solved for its own unknown.
+
+def test_seed_opening_balance_from_broker_with_no_existing_fills_behaves_like_a_plain_seed(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.seed_opening_balance_from_broker(Decimal("500.00"), now=T0)
+    assert s.load()[0] == Decimal("500.00")
+
+
+def test_seed_opening_balance_from_broker_backdates_correctly_given_a_pre_existing_fill(tmp_path):
+    """The actual bootstrap scenario: a BUY (qty=2 @ 100 => -200 effect)
+    already exists locally (sync_fills wrote it before any seed could
+    happen), and the broker's CURRENT settled cash (300) already reflects
+    that debit. The correct opening balance is 500 -- NOT 300 (which would
+    double-count the fill on the next settled_cash() replay)."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_fill(fill(fill_id="f1", qty=2.0, price=100.0))   # -200 effect, unseeded
+    s.seed_opening_balance_from_broker(Decimal("300"), now=T0)
+    assert s.load()[0] == Decimal("500")
+    # And the resulting ledger reconciles exactly against the broker figure
+    # that was actually supplied -- proving no double-count, not just
+    # asserting the intermediate arithmetic.
+    ledger = s.to_ledger()
+    assert ledger.settled_cash(now=T0) == Decimal("300")
+
+
+def test_seed_opening_balance_from_broker_is_idempotent_on_a_matching_reseed(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_fill(fill(fill_id="f1", qty=2.0, price=100.0))
+    s.seed_opening_balance_from_broker(Decimal("300"), now=T0)
+    s.seed_opening_balance_from_broker(Decimal("300"), now=T0)   # safe replay
+    assert s.load()[0] == Decimal("500")
+
+
+def test_seed_opening_balance_from_broker_refuses_a_conflicting_reseed(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_fill(fill(fill_id="f1", qty=2.0, price=100.0))
+    s.seed_opening_balance_from_broker(Decimal("300"), now=T0)
+    with pytest.raises(LedgerStoreError):
+        s.seed_opening_balance_from_broker(Decimal("999"), now=T0)
+
+
+def test_write_opening_balances_own_refusal_is_not_weakened_by_the_new_method_existing(tmp_path):
+    """Regression proof: write_opening_balance itself must still refuse
+    once a fill exists, exactly as before -- the new bootstrap path is a
+    SEPARATE method, not a loosening of this one."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))
+    with pytest.raises(LedgerStoreError, match="fill"):
+        s.write_opening_balance(500.0, at=T0)
+
+
 # ------------------------------------------------------------- fills/orders
 
 def test_a_written_fill_is_immediately_reflected_in_load(tmp_path):
@@ -180,6 +246,23 @@ def test_a_written_order_record_is_immediately_reflected_in_load(tmp_path):
     s.write_order_record(order_record())
     _, _, orders = s.load()
     assert orders == (order_record(),)
+
+
+def test_open_order_ids_reflects_the_last_recorded_status_with_no_opening_balance_needed(tmp_path):
+    """`open_order_ids()` (2026-07-30, "nothing ever closes an OrderRecord"
+    fix) must be usable BEFORE `write_opening_balance` has ever been called
+    -- a bootstrap-ordering requirement, not an incidental nicety: closing a
+    terminal order has to be possible in the same cycle that first seeds
+    opening_settled_cash, and `to_ledger()` refuses to run until that
+    seeding has happened. Delegates to the store's own internal validating
+    Ledger (permanently opening=0 placeholder, never exposed as cash) --
+    order records never touch cash at all, so this is safe with no seed."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_order_record(order_record(cid="c1", status="OPEN"))
+    s.write_order_record(order_record(cid="c2", status="OPEN"))
+    assert s.open_order_ids() == frozenset({"c1", "c2"})
+    s.write_order_record(order_record(cid="c1", status="CLOSED"))
+    assert s.open_order_ids() == frozenset({"c2"})
 
 
 def test_an_order_records_lot_id_and_holding_policy_version_round_trip(tmp_path):

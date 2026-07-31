@@ -322,6 +322,49 @@ def test_live_order_diverging_from_the_approved_size_is_refused():
         b.submit(s, approval_token=tok)
 
 
+def test_live_sell_approved_for_a_different_lot_is_refused():
+    """Commit 3 (2026-07-30): before this fix, order_fingerprint did not
+    cover lot_id at all, so a token approved against lot "l1" would also
+    silently authorize a SELL against any other lot sharing the same
+    symbol/side/qty/type/TIF/limit -- even though lot choice determines
+    holding-period compliance and cost basis (agent/pipeline.py's own
+    _SIGNABLE_FIELDS already treats lot_id as signature-critical for
+    exactly this reason). This must now be refused at submit()'s own
+    consume() call, the same as a diverging qty already was."""
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    approved_fp = order_fingerprint(symbol="SPY", side="SELL", qty=1.0,
+                                    order_type="LIMIT", time_in_force="DAY",
+                                    limit_price=100.0, lot_id="l1")
+    tok = svc.approve(token_id="t1", request_id="r1", fingerprint=approved_fp,
+                      price_at_analysis=100.0,
+                      shown_at=T0 - timedelta(seconds=15), now=T0)
+    s = make_staged(gk.signing_key, side="SELL", lot_id="l2")   # approved for l1, not l2
+    with pytest.raises(OrderMismatch):
+        b.submit(s, approval_token=tok)
+
+
+def test_live_sell_approved_for_the_correct_lot_still_consumes():
+    """The positive case for the fix above: when the approved fingerprint's
+    lot_id genuinely matches the staged order's, submit() must still thread
+    staged.lot_id into its own recomputed fingerprint and consume cleanly --
+    proving the fix is real wiring, not just a fingerprint that now always
+    mismatches once a lot_id is involved."""
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    approved_fp = order_fingerprint(symbol="SPY", side="SELL", qty=1.0,
+                                    order_type="LIMIT", time_in_force="DAY",
+                                    limit_price=100.0, lot_id="l1")
+    tok = svc.approve(token_id="t1", request_id="r1", fingerprint=approved_fp,
+                      price_at_analysis=100.0,
+                      shown_at=T0 - timedelta(seconds=15), now=T0)
+    s = make_staged(gk.signing_key, side="SELL", lot_id="l1")   # matches what was approved
+    b.submit(s, approval_token=tok)
+    assert tok.consumed_at == T0
+
+
 # ----------------------------------------------------------------- audit
 
 def test_audit_chain_verifies():
