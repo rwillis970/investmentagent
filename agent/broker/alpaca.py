@@ -163,8 +163,8 @@ from ..pipeline import StagedOrder
 from ..policy import TradeCapabilityPolicy
 from .. import market_calendar
 from ..secrets_provider import SecretsProvider
-from .base import (AccountSnapshot, AdapterError, BrokerAdapter, BrokerOrder,
-                   Execution, Position)
+from .base import (AccountActivity, AccountSnapshot, AdapterError, BrokerAdapter,
+                   BrokerOrder, Execution, Position)
 from .transport import Transport, TransportError, UrllibTransport
 
 _EXPECTED_SECRETS_MODE = "PAPER"
@@ -503,6 +503,59 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 client_order_ids[order_id] = client_order_id
             executions.append(self._to_execution(a, client_order_id))
         return executions
+
+    def non_fill_activities(self) -> list[AccountActivity]:
+        """Every non-FILL Account Activity this account has -- fees,
+        journals, dividends, interest, and everything else the endpoint
+        returns. Found real, not hypothetical (cash-event quarantine unit,
+        2026-07-30): a Consolidated Audit Trail (CAT) regulatory fee posted
+        overnight against a real Alpaca paper account
+        (`scripts/fixtures/activities_since.json`), charged per trade, so
+        this is the normal case, not an edge case.
+
+        HITS THE GENERAL ENDPOINT, NO `activity_types` FILTER -- same
+        no-allowlist choice `scripts/alpaca_probe.py`'s own
+        `_fetch_all_activities_since` already makes, for the same reason:
+        an allowlist of the ~35 documented activity types is exactly the
+        kind of guess Appendix E's fail-safe bias argues against (a type
+        added to Alpaca's API after this list was written would silently
+        never be reported). `fills()` already covers `FILL` via the
+        type-specific `/v2/account/activities/FILL` endpoint; this method
+        excludes `FILL` rows locally rather than asking the general
+        endpoint to do it, since Alpaca's own API has no "exclude type"
+        parameter, only an inclusion list.
+
+        PAGINATION: identical shape to `fills()` -- `direction=asc`,
+        `page_token` from the last-seen activity's own `id`, stops on a
+        page shorter than `page_size`. One paginated read, not two
+        separate polling mechanisms."""
+        activities: list[dict] = []
+        page_token: str | None = None
+        page_size = 100
+        while True:
+            params: dict = {"direction": "asc", "page_size": str(page_size)}
+            if page_token is not None:
+                params["page_token"] = page_token
+            _, data = self._request(
+                "GET", "/v2/account/activities", params=params, retryable=True)
+            if not data:
+                break
+            activities.extend(data)
+            if len(data) < page_size:
+                break
+            page_token = data[-1]["id"]
+
+        return [self._to_account_activity(a) for a in activities
+               if a.get("activity_type") != "FILL"]
+
+    def _to_account_activity(self, a: dict) -> AccountActivity:
+        return AccountActivity(
+            activity_id=a["id"], account_id=self.account_id,
+            activity_type=a["activity_type"],
+            activity_sub_type=a.get("activity_sub_type"),
+            net_amount=_dec(a["net_amount"]), date=date.fromisoformat(a["date"]),
+            symbol=a.get("symbol"), description=a.get("description", ""),
+        )
 
     def _client_order_id_for(self, broker_order_id: str) -> str:
         """Resolve an Alpaca broker-side order id to the `client_order_id`

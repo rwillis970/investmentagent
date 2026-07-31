@@ -22,7 +22,8 @@ from agent import market_calendar as mc
 from agent.accounts import CrossAccountError
 from agent.holding import (HoldingPolicy, HoldingPolicyRegistry, HoldingViolation,
                            open_lots, sellable_qty)
-from agent.ledger import (DuplicateFillError, Fill, Ledger, LedgerError,
+from agent.ledger import (CashAdjustment, DuplicateCashAdjustmentError,
+                          DuplicateFillError, Fill, Ledger, LedgerError,
                           LotOverdrawnError, OrderRecord, UnknownLotError)
 from agent.lot_selection import (ALPACA_DEFAULT_POLICY, LotSelectionMethod,
                                  LotSelectionPolicy)
@@ -477,6 +478,88 @@ def test_disposal_records_only_cover_sells_for_this_symbol():
     [rec] = l.disposal_records()
     assert rec.symbol == "SPY"
     assert rec.broker_lot_id == "spy1"    # not qqq1, despite being older
+
+
+def cash_adjustment(adjustment_id="a1", account_id=ACCT, amount="-0.01",
+                    activity_type="FEE", description="CAT fee for proceed "
+                    "of 1 trades on 2026-07-28 by PA3XZX944LRR",
+                    effective_date=None, symbol=None):
+    from datetime import date as _date
+    return CashAdjustment(
+        adjustment_id=adjustment_id, account_id=account_id,
+        amount=to_decimal(amount), activity_type=activity_type,
+        description=description,
+        effective_date=effective_date or _date(2026, 7, 28), symbol=symbol,
+    )
+
+
+# ------------------------------------------ cash adjustments (Commit 2, real
+# CAT fee found 2026-07-30: scripts/fixtures/activities_since.json)
+
+def test_a_cash_adjustment_is_visible_to_settled_cash_immediately():
+    """No settlement delay -- see agent/ledger.py's own docstring for why:
+    the real CAT fee this exists for (`scripts/fixtures/activities_
+    since.json`) is only ever discovered already `status: "executed"`,
+    with `date` == the trade's own date and no observable pending phase."""
+    l = ledger(opening=500.0)
+    l.record_cash_adjustment(cash_adjustment(amount="-0.01"))
+    assert l.settled_cash(now=FRI) == Decimal("499.99")
+
+
+def test_a_cash_adjustment_does_not_disturb_lot_accounting():
+    l = ledger()
+    l.record_fill(buy(qty=2.0, price=100.0, at=FRI))
+    l.record_cash_adjustment(cash_adjustment(amount="-0.01"))
+    assert l.positions() == {"SPY": 2.0}
+    assert l.disposal_records() == []
+
+
+def test_a_positive_cash_adjustment_credits_settled_cash():
+    l = ledger(opening=500.0)
+    l.record_cash_adjustment(cash_adjustment(adjustment_id="div1", amount="1.23",
+                                             activity_type="DIV", symbol="SPY"))
+    assert l.settled_cash(now=FRI) == Decimal("501.23")
+
+
+def test_cash_adjustments_for_the_wrong_account_halt():
+    l = ledger(account_id=ACCT)
+    with pytest.raises(CrossAccountError):
+        l.record_cash_adjustment(cash_adjustment(account_id=ACCT_B))
+
+
+def test_recording_the_identical_cash_adjustment_twice_is_a_no_op():
+    l = ledger(opening=500.0)
+    adj = cash_adjustment(amount="-0.01")
+    l.record_cash_adjustment(adj)
+    l.record_cash_adjustment(adj)
+    assert l.settled_cash(now=FRI) == Decimal("499.99")
+
+
+def test_recording_a_different_cash_adjustment_under_the_same_id_is_an_error():
+    l = ledger()
+    l.record_cash_adjustment(cash_adjustment(adjustment_id="a1", amount="-0.01"))
+    with pytest.raises(DuplicateCashAdjustmentError):
+        l.record_cash_adjustment(cash_adjustment(adjustment_id="a1", amount="-0.02"))
+
+
+def test_cash_adjustments_are_a_read_only_tuple():
+    l = ledger()
+    l.record_cash_adjustment(cash_adjustment())
+    assert isinstance(l.cash_adjustments, tuple)
+    assert l.cash_adjustments[0].activity_type == "FEE"
+
+
+def test_ledger_reconstructible_from_its_record_includes_cash_adjustments():
+    l1 = ledger(opening=500.0)
+    l1.record_fill(buy(lot_id="l1", qty=1.0, price=100.0, at=FRI))
+    l1.record_cash_adjustment(cash_adjustment(amount="-0.01"))
+
+    l2 = Ledger.from_records(
+        account_id=ACCT, opening_settled_cash=Decimal("500.0"), policy_registry=registry(),
+        fills=l1.fills, order_records=l1.order_records,
+        cash_adjustments=l1.cash_adjustments,
+    )
+    assert l2.settled_cash(now=FRI) == l1.settled_cash(now=FRI) == Decimal("399.99")
 
 
 def test_an_unsupported_lot_selection_policy_is_refused_not_approximated():

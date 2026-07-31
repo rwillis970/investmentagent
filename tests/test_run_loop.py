@@ -62,6 +62,7 @@ def account_runtime(tmp_path, account_id=ACCT, max_day_trades=3):
         account_id=account_id, credentials=credentials(account_id),
         ledger_store_path=tmp_path / f"{account_id}.jsonl",
         quarantine_store_path=tmp_path / f"{account_id}.quarantine.jsonl",
+        cash_quarantine_store_path=tmp_path / f"{account_id}.cash_quarantine.jsonl",
         policy_registry=registry(), max_day_trades_per_5_sessions=max_day_trades,
     )
 

@@ -173,7 +173,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .holding import HoldingPolicyRegistry
-from .ledger import Fill, Ledger, OrderRecord
+from .ledger import CashAdjustment, Fill, Ledger, OrderRecord
 from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy
 from .money import to_decimal
 
@@ -325,8 +325,31 @@ class LedgerStore:
         self._ledger.record_order_status(record)   # raises before anything is persisted
         self._append_row(dict(kind="order_record", **_encode_order_record(record)))
 
+    def write_cash_adjustment(self, adjustment: CashAdjustment) -> None:
+        """Same validate-then-persist discipline as `write_fill` (Commit 2,
+        2026-07-30) -- a rejection (`CrossAccountError`,
+        `DuplicateCashAdjustmentError`) raises exactly what a bare `Ledger.
+        record_cash_adjustment` would and leaves the file untouched. Like
+        `open_order_ids()`, this needs no `opening_settled_cash` to have
+        been seeded yet: this store's internal validating `Ledger` accepts
+        a cash adjustment unconditionally on its own account-id check, the
+        same as a fill would."""
+        already_known = any(a.adjustment_id == adjustment.adjustment_id
+                            for a in self._ledger.cash_adjustments)
+        self._ledger.record_cash_adjustment(adjustment)   # raises before anything is persisted
+        if already_known:
+            return   # byte-identical replay -- Ledger already no-op'd it
+        self._append_row(dict(kind="cash_adjustment", **_encode_cash_adjustment(adjustment)))
+
     def load(self) -> tuple[Decimal | None, tuple[Fill, ...], tuple[OrderRecord, ...]]:
         return self._opening, self._ledger.fills, self._ledger.order_records
+
+    def known_cash_adjustment_ids(self) -> frozenset[str]:
+        """Delegates to the internal validating `Ledger`'s own
+        `cash_adjustments` -- what `agent.cash_events.sync_cash_events`
+        checks to decide whether a broker-reported activity is already
+        durably recorded (mirrors `open_order_ids()`'s own delegation)."""
+        return frozenset(a.adjustment_id for a in self._ledger.cash_adjustments)
 
     def open_order_ids(self) -> frozenset[str]:
         """Delegates to the internal validating `Ledger`'s own
@@ -359,6 +382,7 @@ class LedgerStore:
             policy_registry=self._policy_registry, t_plus=self._t_plus,
             lot_selection_policy=self._lot_selection_policy,
             fills=self._ledger.fills, order_records=self._ledger.order_records,
+            cash_adjustments=self._ledger.cash_adjustments,
         )
 
     def update(self, *a, **k):
@@ -396,6 +420,8 @@ class LedgerStore:
                 ledger.record_fill(_decode_fill(row))
             elif kind == "order_record":
                 ledger.record_order_status(_decode_order_record(row))
+            elif kind == "cash_adjustment":
+                ledger.record_cash_adjustment(_decode_cash_adjustment(row))
             else:
                 raise LedgerStoreError(
                     f"unrecognised ledger store row kind {kind!r} -- refusing to "
@@ -433,3 +459,23 @@ def _decode_order_record(d: dict) -> OrderRecord:
                        status=d["status"], at=datetime.fromisoformat(d["at"]),
                        lot_id=d.get("lot_id"),
                        holding_policy_version=d.get("holding_policy_version"))
+
+
+def _encode_cash_adjustment(a: CashAdjustment) -> dict:
+    d = asdict(a)
+    # Decimal/date are not JSON-native -- str()/isoformat() round-trip
+    # exactly, same discipline as _encode_fill above.
+    d["amount"] = str(a.amount)
+    d["effective_date"] = a.effective_date.isoformat()
+    return d
+
+
+def _decode_cash_adjustment(d: dict) -> CashAdjustment:
+    from datetime import date as _date
+    return CashAdjustment(
+        adjustment_id=d["adjustment_id"], account_id=d["account_id"],
+        amount=to_decimal(d["amount"]), activity_type=d["activity_type"],
+        description=d["description"],
+        effective_date=_date.fromisoformat(d["effective_date"]),
+        symbol=d.get("symbol"),
+    )

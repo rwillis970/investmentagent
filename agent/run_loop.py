@@ -193,11 +193,13 @@ from .account_wiring import build_account_reconciliation
 from .approval import ApprovalService
 from .audit import AuditLog
 from .broker.base import BrokerAdapter
+from .cash_event_quarantine import CashEventQuarantineStore
+from .cash_events import sync_cash_events
 from .daytrade import DayTradeGuard
 from .execution_quarantine import ExecutionQuarantineStore
 from .fill_sync import close_terminal_orders, sync_fills
 from .holding import HoldingPolicyRegistry
-from .ledger import Fill
+from .ledger import CashAdjustment, Fill
 from .ledger_store import LedgerStore
 from .mode_store import ModeStore
 from .startup import AccountReconciliation, StartupResult, run_startup
@@ -215,6 +217,7 @@ class AccountRuntime:
     credentials: BrokerCredentials
     ledger_store_path: str | Path
     quarantine_store_path: str | Path
+    cash_quarantine_store_path: str | Path
     policy_registry: HoldingPolicyRegistry
     max_day_trades_per_5_sessions: int
     t_plus: int = 1
@@ -228,6 +231,7 @@ class CycleReport:
     return type."""
     now: datetime
     new_fills: dict[str, tuple[Fill, ...]]
+    new_cash_adjustments: dict[str, tuple[CashAdjustment, ...]]
     reconciliations: tuple[AccountReconciliation, ...]
     result: StartupResult
 
@@ -263,6 +267,7 @@ def seconds_until_next_session_open(now: datetime) -> float:
 
 def _log_cycle(log: logging.Logger, *, now: datetime,
                new_fills: dict[str, tuple[Fill, ...]],
+               new_cash_adjustments: dict[str, tuple[CashAdjustment, ...]],
                reconciliations: tuple[AccountReconciliation, ...],
                result: StartupResult) -> None:
     """One human-readable line per account, meant to be read by a person a
@@ -279,14 +284,20 @@ def _log_cycle(log: logging.Logger, *, now: datetime,
             f"{f.side} {f.qty}@{f.price} {f.symbol} (fill_id={f.fill_id})"
             for f in fills
         ) or "none"
+        adjustments = new_cash_adjustments.get(recon.account_id, ())
+        adjustment_summary = "; ".join(
+            f"{a.amount} {a.activity_type} (adjustment_id={a.adjustment_id})"
+            for a in adjustments
+        ) or "none"
         as_of = market_calendar.session_for_instant(now)
         log.info(
-            "  account=%s new_fills=%d [%s] "
+            "  account=%s new_fills=%d [%s] new_cash_adjustments=%d [%s] "
             "positions local=%s broker=%s "
             "settled_cash local=%s broker=%s "
             "open_orders local=%s broker=%s "
             "day_trades local=%d broker=%s",
             recon.account_id, len(fills), fill_summary,
+            len(adjustments), adjustment_summary,
             recon.local_positions,
             {p.symbol: p.qty for p in recon.broker_positions},
             recon.local_settled_cash, recon.broker_account.settled_cash,
@@ -313,6 +324,7 @@ def run_cycle(*, accounts: list[AccountRuntime],
     wider than only a StartupHalted."""
     log = logger or logging.getLogger(LOGGER_NAME)
     new_fills: dict[str, tuple[Fill, ...]] = {}
+    new_cash_adjustments: dict[str, tuple[CashAdjustment, ...]] = {}
     reconciliations: list[AccountReconciliation] = []
 
     for acct in accounts:
@@ -336,6 +348,12 @@ def run_cycle(*, accounts: list[AccountRuntime],
         # here).
         quarantine = ExecutionQuarantineStore(acct.quarantine_store_path,
                                               account_id=acct.account_id)
+        # Reconstructed fresh every cycle for the same reason `quarantine`
+        # above is -- an operator's --admit-cash-event/--reject-cash-event
+        # (run out-of-process, between cycles) must take effect on the very
+        # next cycle with no stale in-memory PENDING view left over.
+        cash_quarantine = CashEventQuarantineStore(acct.cash_quarantine_store_path,
+                                                   account_id=acct.account_id)
 
         # sync_fills BEFORE build_account_reconciliation -- see module
         # docstring for why this order is load-bearing, not incidental.
@@ -354,6 +372,16 @@ def run_cycle(*, accounts: list[AccountRuntime],
         # OrderRecord" gap named below and in fill_sync.py's own docstring.
         close_terminal_orders(adapter, store, now=now)
 
+        # Also BEFORE build_account_reconciliation, same load-bearing
+        # reasoning as sync_fills: an admitted cash adjustment applied this
+        # cycle must be reflected in local_settled_cash before
+        # reconcile_settled_cash's own exact-equality check runs against
+        # it (agent/cash_events.py's own module docstring).
+        cash_adjustments = sync_cash_events(adapter, store, now=now,
+                                           quarantine=cash_quarantine,
+                                           audit_log=audit_log)
+        new_cash_adjustments[acct.account_id] = cash_adjustments
+
         recon = build_account_reconciliation(
             account_id=acct.account_id, adapter=adapter, store=store,
             day_trade_guard=guard, now=now,
@@ -367,9 +395,11 @@ def run_cycle(*, accounts: list[AccountRuntime],
     )
 
     _log_cycle(log, now=now, new_fills=new_fills,
+              new_cash_adjustments=new_cash_adjustments,
               reconciliations=tuple(reconciliations), result=result)
 
     return CycleReport(now=now, new_fills=new_fills,
+                       new_cash_adjustments=new_cash_adjustments,
                        reconciliations=tuple(reconciliations), result=result)
 
 

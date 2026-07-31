@@ -16,6 +16,9 @@ from agent import config as config_module
 from agent import mode as mode_fsm
 from agent.accounts import BrokerCredentials
 from agent.audit import AuditLog
+from agent.cash_event_quarantine import ADMITTED as CASH_ADMITTED
+from agent.cash_event_quarantine import REJECTED as CASH_REJECTED
+from agent.cash_event_quarantine import CashEventQuarantineStore
 from agent.holding import HoldingPolicyRegistry
 from agent.execution_quarantine import ADMITTED, REJECTED, ExecutionQuarantineStore
 from agent.mode_store import ModeStore
@@ -38,6 +41,7 @@ def test_build_account_runtime_derives_the_holding_policy_from_config(tmp_path):
         cfg, account_id="acct-a", credentials=creds,
         ledger_store_path=tmp_path / "l.jsonl",
         quarantine_store_path=tmp_path / "q.jsonl",
+        cash_quarantine_store_path=tmp_path / "cq.jsonl",
     )
     assert acct.account_id == "acct-a"
     assert acct.credentials == creds
@@ -60,6 +64,7 @@ def test_main_returns_nonzero_and_logs_when_the_loop_raises(tmp_path, caplog):
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
+        "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -87,6 +92,7 @@ def test_main_calls_run_loop_with_the_configured_cadence_and_mode(tmp_path):
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
+        "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -127,6 +133,7 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
+        "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]
@@ -155,6 +162,7 @@ def _argv(tmp_path, config_path):
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
+        "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -266,6 +274,7 @@ def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
+        "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]
@@ -649,6 +658,145 @@ def test_admitting_a_buy_without_holding_policy_version_is_refused(tmp_path):
     assert code == 1
     store = ExecutionQuarantineStore(quarantine_path, account_id="acct-a")
     assert store.status("e1") == "PENDING"
+
+
+# --------------------------------------- --admit-cash-event / --reject-cash-event
+#
+# Commit 4 of the cash-event quarantine unit (2026-07-30): mirrors --admit-
+# execution/--reject-execution's shape, but admission requires no operator-
+# supplied domain field -- the broker's own activity record (amount, type,
+# sub_type, description) is already complete; the operator confirms or
+# rejects a fully system-proposed cash adjustment, never fills in a blank.
+# See agent/cash_event_quarantine.py's own module docstring.
+
+def _cash_event_argv(*, account_id, cash_quarantine_path, audit_path, activity_id,
+                     reject=False):
+    argv = [
+        "--account-id", account_id,
+        "--cash-quarantine-store-path", str(cash_quarantine_path),
+        "--mode-store-path", "/unused/mode.jsonl",   # not required for this path
+        "--audit-log-path", str(audit_path),
+    ]
+    if reject:
+        argv += ["--reject-cash-event", activity_id]
+    else:
+        argv += ["--admit-cash-event", activity_id]
+    return argv
+
+
+def _quarantine_a_cash_event(path, *, account_id="acct-a", activity_id="a1"):
+    from datetime import date, datetime, timezone
+    from agent.broker.base import AccountActivity
+    store = CashEventQuarantineStore(path, account_id=account_id)
+    store.quarantine(
+        AccountActivity(activity_id=activity_id, account_id=account_id,
+                        activity_type="FEE", activity_sub_type="CAT",
+                        net_amount=__import__("decimal").Decimal("-0.01"),
+                        date=date(2026, 7, 28), symbol=None,
+                        description="CAT fee for proceed of 1 trades on "
+                        "2026-07-28 by PA3XZX944LRR"),
+        reason="unexplained cash movement: FEE/CAT",
+        at=datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc),
+    )
+    return store
+
+
+def test_admit_cash_event_requires_account_id_and_cash_quarantine_store_path(tmp_path):
+    import pytest
+    argv = ["--admit-cash-event", "a1", "--mode-store-path", str(tmp_path / "m.jsonl"),
+           "--audit-log-path", str(tmp_path / "a.jsonl")]
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_admit_cash_event_requires_no_operator_supplied_field(tmp_path):
+    """The whole point: unlike --admit-execution, there is no --admit-...
+    flag for a domain value here at all -- admission is a bare confirm."""
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_cash_event(cash_quarantine_path)
+
+    code = main(_cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1",
+    ))
+    assert code == 0
+
+    store = CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")
+    assert store.status("a1") == CASH_ADMITTED
+    resolution = store.resolution_for("a1")
+    assert resolution.decided_by == "operator"
+
+
+def test_admit_cash_event_writes_an_audit_row_pre_filled_with_the_broker_data(tmp_path):
+    """The system pre-fills amount/type/reason into the audit row -- the
+    operator's decision is confirm-or-reject, never transcribe-a-number."""
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_cash_event(cash_quarantine_path)
+
+    code = main(_cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1",
+    ))
+    assert code == 0
+
+    log = AuditLog(path=audit_path)
+    admitted = [e for e in log.events if e.action == "cash_event_admitted"]
+    assert len(admitted) == 1
+    assert admitted[0].object_id == "a1"
+    assert admitted[0].actor == "operator"
+    assert admitted[0].after["net_amount"] == "-0.01"
+    assert admitted[0].after["activity_type"] == "FEE"
+    assert admitted[0].after["activity_sub_type"] == "CAT"
+    assert "CAT fee" in admitted[0].after["description"]
+
+
+def test_reject_cash_event_writes_resolution_and_audit_row(tmp_path):
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_cash_event(cash_quarantine_path)
+
+    code = main(_cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1", reject=True,
+    ))
+    assert code == 0
+
+    store = CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")
+    assert store.status("a1") == CASH_REJECTED
+
+    log = AuditLog(path=audit_path)
+    rejected = [e for e in log.events if e.action == "cash_event_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].object_id == "a1"
+
+
+def test_admitting_something_never_quarantined_is_refused(tmp_path):
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")   # empty store
+
+    code = main(_cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="ghost",
+    ))
+    assert code == 1
+
+
+def test_admit_and_reject_cash_event_are_mutually_exclusive(tmp_path):
+    import pytest
+    argv = [
+        "--account-id", "acct-a",
+        "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
+        "--mode-store-path", "/unused/mode.jsonl",
+        "--audit-log-path", str(tmp_path / "a.jsonl"),
+        "--admit-cash-event", "a1", "--reject-cash-event", "a1",
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
 
 
 def test_admit_and_reject_are_mutually_exclusive(tmp_path):

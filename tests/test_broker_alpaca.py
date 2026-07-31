@@ -652,6 +652,88 @@ def test_fills_stops_paging_on_an_empty_page():
     assert len(t.calls) == 1
 
 
+# --------------------------------------------- non_fill_activities (Commit 3,
+# cash-event quarantine unit). Real shape confirmed 2026-07-30 against a real
+# Alpaca paper account: scripts/fixtures/activities_since.json -- a CAT
+# regulatory fee, dated the day of a fractional SPY buy, posted overnight.
+
+def cat_fee_json(**over):
+    base = dict(id="20260728000000000::de3745eb-7d16-4bf3-9514-234693d9f84e",
+               activity_type="FEE", activity_sub_type="CAT",
+               created_at="2026-07-29T00:07:16.323361Z", currency="USD",
+               date="2026-07-28",
+               description="CAT fee for proceed of 1 trades on 2026-07-28 by PA3XZX944LRR",
+               net_amount="-0.01", status="executed")
+    base.update(over)
+    return base
+
+
+def test_non_fill_activities_hits_the_general_endpoint_not_fill():
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    adapter(t).non_fill_activities()
+    call = t.calls[0]
+    assert call["path"] == "https://paper-api.alpaca.markets/v2/account/activities"
+    assert call["params"]["direction"] == "asc"
+
+
+def test_non_fill_activities_maps_the_real_cat_fee_shape():
+    t = ScriptedTransport()
+    t.enqueue(200, [cat_fee_json()])
+    [activity] = adapter(t).non_fill_activities()
+    assert activity.activity_id == "20260728000000000::de3745eb-7d16-4bf3-9514-234693d9f84e"
+    assert activity.account_id == ACCT
+    assert activity.activity_type == "FEE"
+    assert activity.activity_sub_type == "CAT"
+    assert activity.net_amount == Decimal("-0.01")
+    assert activity.date == date(2026, 7, 28)
+    assert activity.symbol is None
+    assert activity.description == (
+        "CAT fee for proceed of 1 trades on 2026-07-28 by PA3XZX944LRR"
+    )
+
+
+def test_non_fill_activities_excludes_fill_type_rows():
+    """FILL is already covered by fills() -- non_fill_activities must not
+    double-report it, even though the general endpoint (no activity_types
+    filter, matching scripts/alpaca_probe.py's own no-allowlist choice)
+    returns it right alongside everything else."""
+    t = ScriptedTransport()
+    t.enqueue(200, [cat_fee_json(), activity_json()])
+    activities = adapter(t).non_fill_activities()
+    assert [a.activity_type for a in activities] == ["FEE"]
+
+
+def test_non_fill_activities_carries_a_symbol_when_the_broker_reports_one():
+    t = ScriptedTransport()
+    t.enqueue(200, [cat_fee_json(id="d1", activity_type="DIV", activity_sub_type=None,
+                                symbol="SPY", net_amount="1.23",
+                                description="dividend")])
+    [activity] = adapter(t).non_fill_activities()
+    assert activity.symbol == "SPY"
+    assert activity.activity_sub_type is None
+
+
+def test_non_fill_activities_pages_forward_until_a_short_page_is_returned():
+    t = ScriptedTransport()
+    full_page = [cat_fee_json(id=f"d{i}") for i in range(100)]
+    t.enqueue(200, full_page)
+    t.enqueue(200, [cat_fee_json(id="d100")])
+    activities = adapter(t).non_fill_activities()
+    assert len(activities) == 101
+    first_page_call, second_page_call = t.calls
+    assert "page_token" not in first_page_call["params"]
+    assert second_page_call["params"]["page_token"] == "d99"
+
+
+def test_non_fill_activities_stops_paging_on_an_empty_page():
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    activities = adapter(t).non_fill_activities()
+    assert activities == []
+    assert len(t.calls) == 1
+
+
 # ------------------- TERMINAL_ORDER_STATUSES reconciled against STATUS_MAP
 # (2026-07-30, "nothing ever closes an OrderRecord" fix). Not a new
 # vocabulary -- STATUS_MAP already collapses every raw Alpaca status into

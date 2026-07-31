@@ -28,7 +28,8 @@ import pytest
 
 from agent.accounts import CrossAccountError
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry, HoldingViolation
-from agent.ledger import (DuplicateFillError, Fill, LotOverdrawnError,
+from agent.ledger import (CashAdjustment, DuplicateCashAdjustmentError,
+                          DuplicateFillError, Fill, LotOverdrawnError,
                           OrderRecord, UnknownLotError)
 from agent.ledger_store import LedgerStore, LedgerStoreError
 from agent.lot_selection import (ALPACA_DEFAULT_POLICY, LotSelectionMethod,
@@ -58,6 +59,17 @@ def fill(fill_id="f1", account_id=ACCT, side="BUY", lot_id="l1", qty=1.0, price=
 
 def order_record(cid="c1", account_id=ACCT, status="OPEN", at=T0):
     return OrderRecord(client_order_id=cid, account_id=account_id, status=status, at=at)
+
+
+def cash_adjustment(adjustment_id="a1", account_id=ACCT, amount="-0.01",
+                    activity_type="FEE", description="CAT fee", effective_date=None,
+                    symbol=None):
+    from datetime import date as _date
+    return CashAdjustment(adjustment_id=adjustment_id, account_id=account_id,
+                          amount=to_decimal(amount), activity_type=activity_type,
+                          description=description,
+                          effective_date=effective_date or _date(2026, 7, 28),
+                          symbol=symbol)
 
 
 # -------------------------------------------------------------- fresh store
@@ -481,3 +493,58 @@ def test_writes_reach_disk_only_after_validation_not_before():
 
         with pytest.raises(UnknownLotError):
             s.write_fill(fill(fill_id="s1", side="SELL", lot_id="never-bought", qty=1.0))
+
+
+# ------------------------------------------------- cash adjustments (Commit 2)
+
+def test_write_cash_adjustment_is_visible_via_known_cash_adjustment_ids(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    assert s.known_cash_adjustment_ids() == frozenset()
+    s.write_cash_adjustment(cash_adjustment(adjustment_id="a1"))
+    assert s.known_cash_adjustment_ids() == frozenset({"a1"})
+
+
+def test_write_cash_adjustment_needs_no_opening_balance_seeded_yet(tmp_path):
+    """Like `open_order_ids()` (2026-07-30): a cash adjustment carries no
+    opening-balance dependency of its own, so it must be writable before
+    `write_opening_balance`/`seed_opening_balance_from_broker` ever runs."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_cash_adjustment(cash_adjustment(adjustment_id="a1"))   # must not raise
+    assert s.known_cash_adjustment_ids() == frozenset({"a1"})
+
+
+def test_write_cash_adjustment_for_the_wrong_account_halts(tmp_path):
+    s = store(tmp_path / "ledger.jsonl", account_id=ACCT)
+    with pytest.raises(CrossAccountError):
+        s.write_cash_adjustment(cash_adjustment(account_id=ACCT_B))
+
+
+def test_a_different_cash_adjustment_under_the_same_id_is_rejected_before_disk(tmp_path):
+    with tempfile.TemporaryDirectory() as d:
+        s = store(Path(d) / "ledger.jsonl")
+        s.write_cash_adjustment(cash_adjustment(adjustment_id="a1", amount="-0.01"))
+
+        def _boom(*a, **k):
+            raise AssertionError("_append_row must not be called for a rejected write")
+        s._append_row = _boom   # noqa: SLF001 -- deliberate white-box check
+        with pytest.raises(DuplicateCashAdjustmentError):
+            s.write_cash_adjustment(cash_adjustment(adjustment_id="a1", amount="-0.02"))
+
+
+def test_cash_adjustment_reflected_in_settled_cash_after_seeding(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    s = store(path)
+    s.write_opening_balance(Decimal("500.0"), at=T0)
+    s.write_cash_adjustment(cash_adjustment(amount="-0.01"))
+    assert s.to_ledger().settled_cash(now=T0) == Decimal("499.99")
+
+
+def test_cash_adjustment_survives_a_reload(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    s = store(path)
+    s.write_opening_balance(Decimal("500.0"), at=T0)
+    s.write_cash_adjustment(cash_adjustment(adjustment_id="a1", amount="-0.01"))
+
+    reloaded = store(path)
+    assert reloaded.known_cash_adjustment_ids() == frozenset({"a1"})
+    assert reloaded.to_ledger().settled_cash(now=T0) == Decimal("499.99")

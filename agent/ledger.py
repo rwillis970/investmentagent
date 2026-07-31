@@ -133,6 +133,61 @@ rows to durable storage, the way `agent.mode_store.ModeStore` does for mode
 changes). This module's job ends at "correct, reconstructible in-memory
 state from a record already handed to it."
 
+CASH ADJUSTMENTS -- DECISION 3's OWN PREDICTION, BUILT (Commit 2, 2026-07-30;
+real-account finding: a Consolidated Audit Trail (CAT) regulatory fee, $0.01,
+posted overnight against a real Alpaca paper account the day after a
+fractional SPY buy -- `scripts/fixtures/activities_since.json`). DECISION 3
+above named the shape this would need before any real instance existed: "a
+signed amount that either lands in settled cash immediately or becomes
+settled at a later, computed instant... a second, parallel event list...
+folded into the same settled_cash sum with no change to _settlement_instant
+or to how BUY/SELL fills are processed." `record_cash_adjustment`/
+`CashAdjustment` is exactly that, now that a real instance exists to build
+it against, not a guess.
+
+APPLIES IMMEDIATELY -- NO SETTLEMENT INSTANT, UNLIKE A SELL'S PROCEEDS. The
+real CAT fee this exists for is only ever OBSERVED already `status:
+"executed"`, `date` equal to the trade's own date, already fully reflected
+in the broker's `cash` figure by the very next read -- there is no pending/
+unsettled phase for this event type anywhere in Alpaca's own Account
+Activities schema (contrast `FILL`, which explicitly tracks `qty`/
+`leaves_qty` as a position fills incrementally). Inventing a settlement
+delay with no observed pending state to justify it would be exactly the
+"invented numeric value" this codebase's own discipline forbids. `amount`
+is therefore summed into `settled_cash` unconditionally, with no `now`
+gate -- see `settled_cash`'s own loop below.
+
+MUST NOT DISTURB LOT ACCOUNTING (asked for explicitly). `record_cash_
+adjustment` appends to `self._cash_adjustments`, a list `lots()`/
+`positions()`/`disposal_records()` never read -- those three methods still
+derive exclusively from `self._fills`, unchanged. A cash adjustment carries
+no `lot_id` and creates no lot; it is a pure cash-only fact, structurally
+incapable of participating in lot bookkeeping even by accident.
+
+APPEND-ONLY, SAME DISCIPLINE AS `record_fill` (asked for explicitly): a
+repeated `adjustment_id` with IDENTICAL contents is a safe no-op (an
+operator's admission being replayed, or a re-poll of the same broker
+activity); a repeated `adjustment_id` with DIFFERENT contents is a hard
+`DuplicateCashAdjustmentError`, mirroring `DuplicateFillError`'s own
+"two different facts sharing one id is a bug in the caller" reasoning.
+`adjustment_id` is the broker's own Account Activities `id` (see
+`agent.broker.base.AccountActivity`), never a fabricated one -- the same
+"reuse the broker's own stable id" choice `Fill.fill_id`/`Execution.
+execution_id` already make.
+
+WHY A PLAIN `date`, NOT A `datetime`, FOR `effective_date` -- THE ONE
+DELIBERATE DEVIATION FROM THIS MODULE'S OWN "EVERY TIMESTAMP IS A TZ-AWARE
+DATETIME" CONVENTION. Alpaca's own Account Activities record carries a
+`date` field (a calendar day, e.g. "2026-07-28") and a SEPARATE `created_at`
+(a full datetime, e.g. the CAT fee's own "2026-07-29T00:07:16Z" -- when the
+broker's overnight batch job happened to post it, not when the fee is
+economically attributed). Fabricating a time-of-day for `effective_date`
+(midnight UTC, say) would assert a precision neither this system nor the
+broker actually has. Since no settlement math is done on this field (see
+above -- adjustments apply immediately), there is no computation that
+needs a datetime here; keeping it a `date` is the more honest choice, not
+a shortcut.
+
 DECIMAL, NOT FLOAT (real-account finding, 2026-07-28): `opening_settled_
 cash`, `Fill.qty`/`.price`, and every value this module derives from them
 (`settled_cash`, `unsettled_cash`, `positions()`'s qty totals, `lots()`'s
@@ -152,7 +207,7 @@ never accumulates the rounding error that guard existed to forgive.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_EVEN
 
 from . import market_calendar
@@ -200,6 +255,13 @@ class DuplicateFillError(LedgerError):
     prefer one version of."""
 
 
+class DuplicateCashAdjustmentError(LedgerError):
+    """The same adjustment_id was recorded twice with DIFFERENT contents --
+    the `CashAdjustment` analogue of `DuplicateFillError`, same reasoning:
+    an identical replay is a safe no-op, two different facts sharing an id
+    is a bug in the caller."""
+
+
 @dataclass(frozen=True)
 class Fill:
     """One executed trade. Append-only input to `Ledger` -- never mutated,
@@ -223,6 +285,36 @@ class Fill:
     filled_at: datetime                    # tz-aware; the FILL time, never order submit
     lot_id: str
     holding_policy_version: str | None = None
+
+
+@dataclass(frozen=True)
+class CashAdjustment:
+    """A signed cash-only movement that is not a Fill -- a broker-charged
+    fee, a journal, a dividend, interest, or similar. Append-only input to
+    `Ledger`, same discipline as `Fill` -- never mutated, safe to replay
+    (see `Ledger.record_cash_adjustment`/`Ledger.from_records`). See the
+    module docstring's CASH ADJUSTMENTS section for why this exists, why it
+    applies immediately (no settlement instant), and why `effective_date`
+    is a plain `date`, not a `datetime`.
+
+    `adjustment_id`: the broker's own Account Activities `id` (see
+    `agent.broker.base.AccountActivity`) -- never a fabricated one, the
+    same "reuse the broker's own stable id" choice `Fill.fill_id` makes.
+    `amount`: signed `Decimal`, the broker's own sign convention (negative
+    = a debit, e.g. a fee).
+    `activity_type`/`description`: the broker's own classification and
+    human-readable reason, carried through unchanged -- see
+    `agent/cash_event_quarantine.py` for why an operator confirms a fully
+    specified proposal rather than a bare number.
+    `symbol`: nullable -- most cash-only activities (fees, interest,
+    journals) are account-level, not tied to one symbol."""
+    adjustment_id: str
+    account_id: str
+    amount: Decimal
+    activity_type: str
+    description: str
+    effective_date: date
+    symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -302,21 +394,24 @@ class Ledger:
         self._fills: list[Fill] = []
         self._order_records: list[OrderRecord] = []
         self._fill_ids: dict[str, Fill] = {}
+        self._cash_adjustments: list[CashAdjustment] = []
+        self._cash_adjustment_ids: dict[str, CashAdjustment] = {}
 
     @classmethod
     def from_records(cls, *, account_id: str, opening_settled_cash: Decimal,
                      policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
                      lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY,
-                     fills=(), order_records=()) -> "Ledger":
+                     fills=(), order_records=(), cash_adjustments=()) -> "Ledger":
         """Reconstruct a ledger from a previously-recorded (fills,
-        order_records) pair alone -- the directly testable form of "this
-        module's state is reconstructible from the record," not just an
-        architectural claim. See `Ledger.fills`/`Ledger.order_records` for
-        the read side of this round trip. Durable persistence of that
-        record now exists (`agent.ledger_store.LedgerStore`, its own
-        module) -- `LedgerStore.to_ledger(...)` is the actual restart path
-        that calls this constructor; `Ledger` itself still has no I/O and
-        no knowledge of that store, by design."""
+        order_records, cash_adjustments) triple alone -- the directly
+        testable form of "this module's state is reconstructible from the
+        record," not just an architectural claim. See `Ledger.fills`/
+        `Ledger.order_records`/`Ledger.cash_adjustments` for the read side
+        of this round trip. Durable persistence of that record now exists
+        (`agent.ledger_store.LedgerStore`, its own module) --
+        `LedgerStore.to_ledger(...)` is the actual restart path that calls
+        this constructor; `Ledger` itself still has no I/O and no
+        knowledge of that store, by design."""
         ledger = cls(account_id=account_id, opening_settled_cash=opening_settled_cash,
                     policy_registry=policy_registry, t_plus=t_plus,
                     lot_selection_policy=lot_selection_policy)
@@ -324,6 +419,8 @@ class Ledger:
             ledger.record_fill(f)
         for r in order_records:
             ledger.record_order_status(r)
+        for a in cash_adjustments:
+            ledger.record_cash_adjustment(a)
         return ledger
 
     # -- read-only views of the append-only record -------------------------
@@ -335,7 +432,33 @@ class Ledger:
     def order_records(self) -> tuple[OrderRecord, ...]:
         return tuple(self._order_records)
 
+    @property
+    def cash_adjustments(self) -> tuple[CashAdjustment, ...]:
+        return tuple(self._cash_adjustments)
+
     # -- write (append-only) -------------------------------------------------
+    def record_cash_adjustment(self, adjustment: CashAdjustment) -> None:
+        """Append-only, same replay discipline as `record_fill` (see module
+        docstring's CASH ADJUSTMENTS section): an identical replay of an
+        already-known `adjustment_id` is a safe no-op; a DIFFERENT one
+        under the same id is `DuplicateCashAdjustmentError`. Never touches
+        `self._fills` -- see module docstring for why this cannot disturb
+        lot accounting even by accident."""
+        if adjustment.account_id != self.account_id:
+            raise CrossAccountError(self.account_id, adjustment.account_id,
+                                    "Ledger.record_cash_adjustment")
+        existing = self._cash_adjustment_ids.get(adjustment.adjustment_id)
+        if existing is not None:
+            if existing != adjustment:
+                raise DuplicateCashAdjustmentError(
+                    f"adjustment_id {adjustment.adjustment_id!r} was already recorded "
+                    "with different contents -- append-only replay requires the "
+                    "identical record"
+                )
+            return   # idempotent replay of the exact same adjustment
+        self._cash_adjustments.append(adjustment)
+        self._cash_adjustment_ids[adjustment.adjustment_id] = adjustment
+
     def record_fill(self, fill: Fill) -> None:
         if fill.account_id != self.account_id:
             raise CrossAccountError(self.account_id, fill.account_id, "Ledger.record_fill")
@@ -548,6 +671,11 @@ class Ledger:
             else:
                 if now >= self._settlement_instant(f.filled_at):
                     total += notional
+        # Applies immediately, no settlement gate -- see module docstring's
+        # CASH ADJUSTMENTS section for why this deliberately does not
+        # mirror the SELL branch above.
+        for a in self._cash_adjustments:
+            total += a.amount
         return total
 
     def unsettled_cash(self, *, now: datetime) -> Decimal:

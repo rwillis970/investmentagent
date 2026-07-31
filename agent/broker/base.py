@@ -150,6 +150,54 @@ class Execution:
 
 
 @dataclass(frozen=True)
+class AccountActivity:
+    """One non-FILL broker account activity -- a fee, journal, dividend,
+    interest payment, or similar cash-only event. NOT a fill increment
+    (that's `Execution`/`fills()`). What `non_fill_activities()` returns
+    and what `agent.cash_events.sync_cash_events` turns into a
+    `QuarantinedCashEvent` pending an operator decision
+    (`agent/cash_event_quarantine.py`) -- found real, not hypothetical: a
+    Consolidated Audit Trail (CAT) regulatory fee posted overnight against
+    a real Alpaca paper account (`scripts/fixtures/activities_since.json`,
+    captured 2026-07-30), charged per trade, so this recurs on every fill,
+    not just once.
+
+    `activity_id` must be STABLE and per-activity -- the same "the
+    broker's own id, not a fabricated one" choice `Execution.execution_id`
+    already makes: a re-poll of an already-seen activity must report the
+    same id so `sync_cash_events` can no-op on it (Alpaca's own Account
+    Activities `id` is documented as a stable "timestamp::uuid").
+
+    `net_amount`: the broker's own SIGNED cash effect (negative = a debit,
+    e.g. "-0.01" for a fee) -- carried through as `Decimal`, never `float`
+    (agent/money.py).
+
+    `date`: the broker's own activity `date` field -- deliberately NOT
+    `created_at`/`transaction_time` (when the broker's batch job happened
+    to post it; the real CAT fee above posted at 2026-07-29T00:07 for a
+    trade dated 2026-07-28). `date` is the economically relevant day; using
+    `created_at` instead would misrepresent when this actually occurred.
+
+    `symbol`: nullable -- most cash-only activities (fees, interest,
+    journals) are account-level, not tied to one symbol; a per-symbol
+    event (e.g. a dividend) carries it.
+
+    `description`: the broker's own human-readable explanation, carried
+    through UNCHANGED so an operator confirms or rejects a fully specified
+    proposal rather than a bare number -- see
+    `agent/cash_event_quarantine.py`'s own module docstring for why the
+    reason matters."""
+    activity_id: str
+    account_id: str
+    activity_type: str
+    activity_sub_type: str | None
+    net_amount: Decimal
+    date: date
+    symbol: str | None
+    description: str
+
+
+@dataclass(frozen=True)
 class BrokerOrder:
     account_id: str
     client_order_id: str
@@ -208,7 +256,7 @@ class BrokerAdapter(ABC):
     _known_public_surface: frozenset[str] = frozenset({
         "account", "positions", "open_orders", "get_by_client_id", "sessions",
         "submit", "cancel", "clock", "posture", "supported_matrix", "fills",
-        "attach_capability_policy", "attach_staging_key",
+        "non_fill_activities", "attach_capability_policy", "attach_staging_key",
     })
 
     def __init_subclass__(cls, **kwargs) -> None:
@@ -338,6 +386,25 @@ class BrokerAdapter(ABC):
         cumulative/averaged one where the broker's API offers it (see
         `AlpacaPaperAdapter.fills`, which uses Account Activities rather
         than `/v2/orders`, for exactly this reason)."""
+
+    def non_fill_activities(self) -> list[AccountActivity]:
+        """Every broker-reported non-FILL account activity this adapter can
+        currently see -- fees, journals, dividends, interest, and similar
+        cash-only movements. Not deduplicated, not filtered to "new since
+        last call", same contract as `fills()`; `agent.cash_events.
+        sync_cash_events` is what turns this into a quarantined cash event,
+        deciding what's new by `activity_id`.
+
+        CONCRETE, NOT ABSTRACT -- default `[]`. Making this abstract would
+        force every existing concrete subclass (`SimulatorBroker`, and any
+        test double built directly on `BrokerAdapter`) to grow an
+        implementation it has no real data for. `SimulatorBroker` legitimately
+        HAS no non-FILL activities to report -- it does not model broker
+        fees, dividends or journals, and `[]` is the honest answer, not a
+        stub standing in for unbuilt behaviour. Override where a real
+        source exists (`AlpacaPaperAdapter.non_fill_activities`, Account
+        Activities minus the `FILL` type already covered by `fills()`)."""
+        return []
 
     # -- write --------------------------------------------------------------
     def submit(self, staged: StagedOrder, *,

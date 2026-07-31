@@ -153,6 +153,16 @@ def test_fills_returns_one_execution_per_filled_order_with_a_stable_id():
     assert b.fills() == execs
 
 
+def test_simulator_reports_no_non_fill_activities():
+    """SimulatorBroker does not model broker fees/dividends/journals --
+    `[]` is the honest default `BrokerAdapter.non_fill_activities` provides
+    (agent/broker/base.py), not a stub standing in for unbuilt behaviour.
+    See agent/broker/alpaca.py for the real, overriding implementation."""
+    b, gk = broker()
+    b.submit(staged(gk))
+    assert b.non_fill_activities() == []
+
+
 def test_fills_excludes_rejected_and_unfilled_orders():
     b, gk = broker(cash=50.0)
     b.submit(staged(gk, qty=1.0))   # rejected: insufficient settled cash

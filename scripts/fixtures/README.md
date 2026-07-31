@@ -56,3 +56,26 @@ present even when false. `AccountSnapshot` now models both as `bool | None`/
 `int | None` (`None` = unknown) instead of silently defaulting to
 `False`/`0` -- see `agent/broker/alpaca.py`'s `account()` and
 `agent/daytrade.py`'s `DayTradeGuard.reconcile`.
+
+## Second capture, 2026-07-30T22:57:57Z (`capture_manifest.json`, same file, updated)
+
+The account has now traded: a $500 JNLC deposit, a fractional SPY BUY
+(0.027087234 sh @ 737.986), and a CAT (Consolidated Audit Trail) regulatory
+FEE of -$0.01 against that fill, posted overnight. `account.json`,
+`positions.json`, `orders.json`, and `activities.json` are all refreshed to
+this state (no longer the brand-new-account `[]` captures above).
+`activities_since.json` is new: the output of `--activities-since
+2026-07-28 --direction asc` (paginated, all types, no `activity_types`
+filter).
+
+**`--activities-since` is looser than its name suggests.** Called with
+`--activities-since 2026-07-28`, `activities_since.json` still includes the
+JNLC deposit dated 2026-07-27 -- one day before the given cutoff. Alpaca's
+`after` query param on `/v2/account/activities` is evidently not a strict
+"activities on or after this date" filter in the way the flag name implies;
+the exact boundary semantics (transaction time vs. settlement date vs.
+something else) were not tracked down further, since chasing that isn't
+this capture's purpose. Noted here as a fixture-fidelity caveat only --
+`scripts/alpaca_probe.py` itself is unchanged; this is not a probe defect,
+just a documented mismatch between the flag's name and Alpaca's own filter
+behavior.
