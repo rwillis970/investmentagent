@@ -739,6 +739,51 @@ def test_non_fill_activities_stops_paging_on_an_empty_page():
     assert len(t.calls) == 1
 
 
+def test_non_fill_activities_against_the_real_committed_fixture():
+    """Found real, 2026-07-31: the first unattended launchd run crashed
+    with `KeyError: 'created_at'` -- the real FILL row in
+    scripts/fixtures/activities_since.json carries `transaction_time`, not
+    `created_at` (it wasn't in this file's fixture-driven suite at all,
+    every prior test built its own FILL dict by hand -- activity_json(),
+    used above, doesn't have created_at either, but that's still a
+    hand-built dict, not the actual committed evidence). Drives
+    non_fill_activities() against the REAL captured payload directly, not
+    a hand-built one, per the standing rule that the fixture exists so
+    real broker shapes are testable."""
+    import json
+    from pathlib import Path
+    raw = json.loads(
+        (Path(__file__).parent.parent / "scripts/fixtures/activities_since.json")
+        .read_text()
+    )["activities"]
+    assert raw[2]["activity_type"] == "FILL" and "created_at" not in raw[2]   # sanity on the fixture itself
+
+    t = ScriptedTransport()
+    t.enqueue(200, raw)
+    activities = adapter(t).non_fill_activities()
+
+    assert [a.activity_type for a in activities] == ["JNLC", "FEE"]
+    assert activities[0].created_at == datetime(2026, 7, 27, 13, 0, 50, 193924,
+                                                tzinfo=timezone.utc)
+    assert activities[1].created_at == datetime(2026, 7, 29, 0, 7, 16, 323361,
+                                                tzinfo=timezone.utc)
+
+
+def test_non_fill_activities_tolerates_a_missing_created_at_on_a_non_fill_row():
+    """Not real evidence -- the fixture only confirms created_at present
+    for JNLC and FEE, two of the ~35 documented activity types
+    (agent/cash_event_quarantine.py's own module docstring). A non-FILL
+    row missing created_at must not crash; it is reported as
+    created_at=None, never guessed at (e.g. defaulted to `now`)."""
+    row = cat_fee_json(activity_type="DIV", activity_sub_type=None,
+                       net_amount="1.23", description="dividend")
+    del row["created_at"]
+    t = ScriptedTransport()
+    t.enqueue(200, [row])
+    [activity] = adapter(t).non_fill_activities()
+    assert activity.created_at is None
+
+
 # ------------------- TERMINAL_ORDER_STATUSES reconciled against STATUS_MAP
 # (2026-07-30, "nothing ever closes an OrderRecord" fix). Not a new
 # vocabulary -- STATUS_MAP already collapses every raw Alpaca status into

@@ -199,6 +199,22 @@ class AccountActivity:
     the correct comparison basis for "is this already reflected in the
     baseline").
 
+    `created_at: datetime | None`, NOT REQUIRED (real defect, 2026-07-31:
+    the first unattended launchd run crashed with `KeyError: 'created_at'`
+    -- a real `FILL` row carries `transaction_time`, never `created_at`;
+    see `non_fill_activities()`'s own docstring for why a `FILL` row is
+    now filtered out BEFORE reaching this dataclass at all, not merely
+    afterward). `None` covers a second, still-open risk, not just the
+    `FILL` case: `scripts/fixtures/activities_since.json` confirms
+    `created_at` present on exactly TWO of the ~35 documented Account
+    Activities types (`JNLC`, `FEE`) -- this system has never observed
+    the other ~33, and assuming they all carry it too would be exactly
+    the kind of guess Appendix E's fail-safe bias argues against. A
+    caller that NEEDS `created_at` (the pre-baseline admission guard,
+    `agent.cash_event_quarantine.refuse_admission_reason`) must treat
+    `None` as "cannot verify" and refuse, never as "no constraint, admit
+    freely" -- see that function's own docstring.
+
     `symbol`: nullable -- most cash-only activities (fees, interest,
     journals) are account-level, not tied to one symbol; a per-symbol
     event (e.g. a dividend) carries it.
@@ -214,7 +230,7 @@ class AccountActivity:
     activity_sub_type: str | None
     net_amount: Decimal
     date: date
-    created_at: datetime
+    created_at: datetime | None
     symbol: str | None
     description: str
 

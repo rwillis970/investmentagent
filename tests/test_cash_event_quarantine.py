@@ -196,3 +196,26 @@ def test_refuse_admission_reason_refuses_on_exact_equality():
         opening_balance_established_at=CREATED_AT,
     )
     assert reason is not None
+
+
+def test_refuse_admission_reason_refuses_when_created_at_is_none_even_with_no_baseline(tmp_path):
+    """Real defect, 2026-07-31: a non-FILL activity type this system has
+    never observed might not carry created_at at all (the fixture only
+    confirms it for JNLC/FEE). Missing data must not silently fall
+    through to 'no baseline, so admit freely' -- the guard exists
+    specifically to catch a double-count, and cannot make that
+    determination without the one fact it needs."""
+    reason = refuse_admission_reason(
+        activity_id="a1", created_at=None,
+        opening_balance_established_at=None,
+    )
+    assert reason is not None
+    assert "a1" in reason
+
+
+def test_refuse_admission_reason_refuses_when_created_at_is_none_with_a_real_baseline():
+    reason = refuse_admission_reason(
+        activity_id="a1", created_at=None,
+        opening_balance_established_at=CREATED_AT,
+    )
+    assert reason is not None

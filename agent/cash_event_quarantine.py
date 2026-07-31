@@ -170,7 +170,7 @@ class QuarantinedCashEvent:
     activity_sub_type: str | None
     net_amount: Decimal
     date: date
-    created_at: datetime
+    created_at: datetime | None
     symbol: str | None
     description: str
     reason: str
@@ -363,45 +363,70 @@ def _encode_quarantined(record: QuarantinedCashEvent) -> dict:
     # agent/execution_quarantine.py's _encode_quarantined already follow.
     d["net_amount"] = str(record.net_amount)
     d["date"] = record.date.isoformat()
-    d["created_at"] = record.created_at.isoformat()
+    # created_at may be None (real defect, 2026-07-31 -- see
+    # agent/broker/base.py's own docstring) -- isoformat() only if present.
+    d["created_at"] = record.created_at.isoformat() if record.created_at else None
     d["quarantined_at"] = record.quarantined_at.isoformat()
     return d
 
 
 def _decode_activity(row: dict) -> AccountActivity:
+    raw_created_at = row.get("created_at")
     return AccountActivity(
         activity_id=row["activity_id"], account_id=row["account_id"],
         activity_type=row["activity_type"],
         activity_sub_type=row.get("activity_sub_type"),
         net_amount=to_decimal(row["net_amount"]), date=date.fromisoformat(row["date"]),
-        created_at=datetime.fromisoformat(row["created_at"]),
+        created_at=datetime.fromisoformat(raw_created_at) if raw_created_at else None,
         symbol=row.get("symbol"), description=row["description"],
     )
 
 
-def refuse_admission_reason(*, activity_id: str, created_at: datetime,
+def refuse_admission_reason(*, activity_id: str, created_at: datetime | None,
                             opening_balance_established_at: datetime | None) -> str | None:
-    """Returns a human-readable refusal reason if a cash event dated
-    `created_at` is already reflected in the ledger's own opening balance
-    (established at `opening_balance_established_at`) -- i.e. admitting it
-    would double-count it -- or `None` if admission may proceed. See this
-    module's own docstring's "A PRE-BASELINE CASH EVENT MUST NEVER BE
-    ADMITTED" and "WHY `created_at`, NOT `date`" sections for the full
-    reasoning and the real incident this was found from.
+    """Returns a human-readable refusal reason if admission must be
+    refused, or `None` if admission may proceed. Two independent reasons
+    to refuse:
+
+    1. `created_at is None` -- REAL DEFECT, 2026-07-31 (see agent/broker/
+       base.py's own `AccountActivity.created_at` docstring): this system
+       has confirmed `created_at` present for exactly two of the ~35
+       documented Account Activities types (JNLC, FEE); for any other type
+       that happens to omit it, the pre-baseline comparison below cannot
+       be made AT ALL, for lack of the one fact it needs. The guard exists
+       specifically to prevent a double-count -- silently treating
+       "cannot verify" as "no constraint, admit freely" would defeat the
+       entire purpose of the check for exactly the case it cannot see.
+       Refuses unconditionally, regardless of whether a baseline even
+       exists yet.
+
+    2. `created_at` is already reflected in the ledger's own opening
+       balance (established at `opening_balance_established_at`) -- i.e.
+       admitting it would double-count it. See this module's own
+       docstring's "A PRE-BASELINE CASH EVENT MUST NEVER BE ADMITTED" and
+       "WHY `created_at`, NOT `date`" sections for the full reasoning and
+       the real incident this was found from.
 
     `opening_balance_established_at=None` means this account's ledger has
     never been seeded yet (`agent.ledger_store.LedgerStore.
     opening_balance_established_at`/`read_opening_balance_established_at`
     both use this same "never seeded" meaning) -- there is no baseline yet
-    for anything to predate, so this always returns `None` (admission may
-    proceed; nothing here overrides `Ledger.record_cash_adjustment`'s own,
-    separate validation).
+    for anything to predate, so reason 2 never applies (admission may
+    proceed, subject to reason 1 above); nothing here overrides `Ledger.
+    record_cash_adjustment`'s own, separate validation.
 
     Deliberately a bare function, not a `CashEventQuarantineStore` method --
     see module docstring's "WHY THIS CHECK IS NOT INSIDE admit() ITSELF"
     for why, and for why this is reused by BOTH `scripts.run_agent`'s
     `--admit-cash-event` (Commit 1) and `agent.cash_events.sync_cash_events`'s
     own auto-admit path (Commit 2) rather than checked in either store."""
+    if created_at is None:
+        return (
+            f"cash event {activity_id!r} has no created_at reported by the broker -- "
+            "cannot verify whether its cash effect predates this account's ledger "
+            "baseline. Refusing to admit rather than risk a silent double-count. "
+            "Reject it instead."
+        )
     if opening_balance_established_at is None:
         return None
     if created_at <= opening_balance_established_at:
