@@ -31,6 +31,7 @@ CASES = [
     (E.CapabilityChangeRequest, "policy.capability_change_request"),
     (E.PlaybookCandidate, "agent.playbook_candidate"),
     (E.ModeChange, "policy.mode_state"),
+    (E.AnalysisResult, "agent.analysis_result"),
 ]
 
 

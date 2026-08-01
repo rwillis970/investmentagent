@@ -54,6 +54,77 @@ class OpportunityEvent:
 
 
 @dataclass(frozen=True)
+class AnalysisResult:
+    """One row per T4 analysis call (§3.3, Appendix C.3, T4 unit Commit 5) --
+    `agent.analysis.run_analysis`'s own `AnalysisRunResult` is the in-memory
+    shape this entity is meant to be built FROM (result_id assigned by
+    whatever eventually persists it, the same way `event_id`/`request_id`
+    are caller-assigned elsewhere in this file); nothing in this codebase
+    constructs or persists an `AnalysisResult` yet -- see this same
+    docstring's PERSISTENCE section below, and `OpportunityEvent`'s own
+    precedent ("not persisted anywhere: there is no OpportunityEvent store
+    in this codebase yet").
+
+    `event_id` LINKS TO THE `OpportunityEvent` THIS ANALYSIS WAS RUN FOR --
+    the materiality screen that decided this symbol/filing was worth a
+    model call. This is the field the user's own instruction meant by
+    "OpportunityEvent persistence": not persisting `OpportunityEvent`
+    itself (already built, T3 unit), but a NEW entity that references one.
+
+    `doc_sha256`/`cache_hit` mirror `agent.analysis_cache.CacheKey`'s own
+    fields (`doc_sha256` is the same post-truncation sha256 that keys the
+    in-memory extraction cache) -- recorded here so a later reader can tell
+    which document body produced this result and whether it cost anything.
+
+    `analysis` IS ONE JSONB BLOB, NOT THREE SEPARATE LIST FIELDS. It holds
+    the full structured output -- `{"bull_case": [...], "bear_case": [...],
+    "contradicting_evidence": [...]}`, each entry `{"text": ..., "citations":
+    [...]}` matching `agent.analysis_output.Claim`. CITATIONS ARE RECORDED
+    HERE, NESTED PER CLAIM, NOT HOISTED TO A SEPARATE FLAT FIELD: a flat
+    citations list would lose which claim each citation supports, which is
+    the entire point of a citation in this design. `confidence` is its own
+    column (not nested in `analysis`) because it is the one scalar a later
+    reader (e.g. a Day-11 Class A calibration pass) would want to query or
+    aggregate directly, the same reason `OpportunityEvent.materiality_score`
+    is its own column rather than folded into `score_components`.
+
+    PRE-EXISTING, STILL-UNUSED SCHEMA, NOT REUSED HERE (a finding, stated
+    plainly): `migrations/001_init.sql` already defines `agent.document`/
+    `agent.extraction` tables shaped almost exactly like `agent.
+    analysis_cache.CacheKey`/`ExtractionCache` (`doc_hash + prompt_version +
+    model_id + schema_version` primary key, `payload`/`tokens_in`/
+    `tokens_out`/`cost_usd`/`status` columns) -- from Day 1, before any of
+    T4 was built, and never wired to a Python entity or a parity test
+    (absent from this file's own `CASES` list before this commit). That
+    table is the right shape for a DURABLE version of the in-memory
+    `ExtractionCache` this unit's Commit 4 built -- persisting the
+    extraction cache itself is a future unit's job, not this one's, and is
+    NOT what this entity is for. `AnalysisResult` is a different concept:
+    an append-only, per-analysis-call RESULT record linked to the
+    `OpportunityEvent` that triggered it, not a doc-keyed, overwrite-by-key
+    CACHE row. Conflating the two here would have been a silent design
+    decision; naming both and building only the one asked for is not.
+
+    PERSISTENCE: no store class exists for this entity in this codebase,
+    same as `OpportunityEvent`'s own disclosed gap. Nothing in
+    `agent.analysis.run_analysis` constructs an `AnalysisResult` either --
+    that wiring is out of this commit's scope (no `run_loop` wiring, per
+    this unit's own instruction)."""
+    result_id: str
+    event_id: str
+    symbol: str
+    model_id: str
+    prompt_version: str
+    schema_version: str
+    doc_sha256: str
+    cache_hit: bool
+    cost_usd: float
+    confidence: float
+    analysis: dict
+    analyzed_at: datetime
+
+
+@dataclass(frozen=True)
 class ApprovalRequest:
     request_id: str
     run_id: str

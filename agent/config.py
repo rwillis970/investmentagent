@@ -285,6 +285,26 @@ class Config:
     # agent/filing_text.py's module docstring.
     edgar_document_max_bytes: int = 5_000_000
 
+    # T4 analysis-layer model config (agent/model_client.py, agent/analysis.py,
+    # T4 unit Commit 4, 2026-07-31, same-commit rule per §9.1). Pricing
+    # confirmed directly against platform.claude.com/docs/en/about-claude/
+    # pricing (fetched 2026-07-31): Claude Sonnet 5 is $2/MTok input, $10/MTok
+    # output THROUGH August 31, 2026 (standard $3/$15 pricing takes effect
+    # September 1, 2026) -- this pilot's 14-day window falls entirely within
+    # the $2/$10 promotional period, so that is the default recorded here,
+    # not the rate that applies afterward. A real, dated pricing-schedule
+    # fact, not an invented number -- revisit explicitly once September 2026
+    # arrives, not silently. `t4_max_output_tokens` (4000) is the worst-case
+    # output-token count `agent.analysis.run_analysis`'s pre-call estimate
+    # uses against `CostLedger.would_exceed_hard_stop` before a real call is
+    # made and the model's own reported usage is known -- generous enough for
+    # a bull/bear/contradicting-evidence analysis with citations, bounding
+    # the pre-call estimate's worst case without having made the call yet.
+    t4_model_id: str = "claude-sonnet-5"
+    t4_input_price_per_million_tokens: float = 2.0
+    t4_output_price_per_million_tokens: float = 10.0
+    t4_max_output_tokens: int = 4000
+
     # CAT-fee narrow auto-admit ceiling (agent/cash_events.py, Commit 2,
     # 2026-07-31) -- real, required number, added in the same commit that
     # reads it (§9.1). The ONE pattern eligible: activity_type=FEE,
@@ -622,6 +642,16 @@ def validate(cfg: Config) -> None:
         err.append("edgar_ticker_cik_refresh_interval_hours must be positive")
     if cfg.edgar_document_max_bytes <= 0:
         err.append("edgar_document_max_bytes must be positive")
+
+    if not cfg.t4_model_id:
+        err.append("t4_model_id must be set; agent.model_client.AnthropicModelClient "
+                   "has no default of its own to fall back to")
+    if cfg.t4_input_price_per_million_tokens < 0:
+        err.append("t4_input_price_per_million_tokens cannot be negative")
+    if cfg.t4_output_price_per_million_tokens < 0:
+        err.append("t4_output_price_per_million_tokens cannot be negative")
+    if cfg.t4_max_output_tokens <= 0:
+        err.append("t4_max_output_tokens must be positive")
 
     if cfg.cat_fee_auto_admit_ceiling <= 0:
         err.append("cat_fee_auto_admit_ceiling must be positive")

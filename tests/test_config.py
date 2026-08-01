@@ -332,3 +332,48 @@ def test_edgar_document_max_bytes_rejects_non_positive():
 def test_edgar_document_max_bytes_can_be_overridden():
     cfg = C.load(base(edgar_document_max_bytes=10_000_000))
     assert cfg.edgar_document_max_bytes == 10_000_000
+
+
+# --------------------------------------------------------------- T4 model config
+# (T4 unit, Commit 4, 2026-07-31): agent.model_client.AnthropicModelClient's
+# model_id and per-token pricing, and agent.analysis's pre-call budget
+# estimate's worst-case output-token count. Pricing confirmed directly
+# against platform.claude.com/docs/en/about-claude/pricing (fetched
+# 2026-07-31): Claude Sonnet 5 is $2/MTok input, $10/MTok output THROUGH
+# August 31, 2026 (standard $3/$15 pricing takes effect September 1, 2026)
+# -- this pilot's 14-day window falls entirely within the $2/$10 period, so
+# that is the default recorded here, not the standard rate that will apply
+# later. Not a config typo to "fix" once September arrives; a real
+# pricing-schedule change that will need its own future commit.
+
+def test_t4_model_id_defaults_to_claude_sonnet_5():
+    cfg = C.load(base())
+    assert cfg.t4_model_id == "claude-sonnet-5"
+
+
+def test_t4_pricing_defaults_match_the_confirmed_promotional_rate():
+    cfg = C.load(base())
+    assert cfg.t4_input_price_per_million_tokens == 2.0
+    assert cfg.t4_output_price_per_million_tokens == 10.0
+
+
+def test_t4_max_output_tokens_defaults_to_4000():
+    cfg = C.load(base())
+    assert cfg.t4_max_output_tokens == 4000
+
+
+def test_t4_model_id_cannot_be_blank():
+    with pytest.raises(C.ConfigError, match="t4_model_id must be set"):
+        C.load(base(t4_model_id=""))
+
+
+def test_t4_pricing_cannot_be_negative():
+    with pytest.raises(C.ConfigError, match="t4_input_price_per_million_tokens"):
+        C.load(base(t4_input_price_per_million_tokens=-1))
+    with pytest.raises(C.ConfigError, match="t4_output_price_per_million_tokens"):
+        C.load(base(t4_output_price_per_million_tokens=-1))
+
+
+def test_t4_max_output_tokens_must_be_positive():
+    with pytest.raises(C.ConfigError, match="t4_max_output_tokens must be positive"):
+        C.load(base(t4_max_output_tokens=0))

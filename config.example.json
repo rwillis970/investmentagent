@@ -55,6 +55,10 @@
   "symbol_universe": {},
   "materiality_min_peer_group_size": 3,
   "edgar_document_max_bytes": 5000000,
+  "t4_model_id": "claude-sonnet-5",
+  "t4_input_price_per_million_tokens": 2.0,
+  "t4_output_price_per_million_tokens": 10.0,
+  "t4_max_output_tokens": 4000,
   "cat_fee_auto_admit_ceiling": 0.05,
   "trade_capabilities": {
     "US_EQUITY": "PRODUCTION_ALLOWED",

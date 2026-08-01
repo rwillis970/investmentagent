@@ -55,6 +55,30 @@ class CostLedger:
     def may_analyse(self, on: date | None = None) -> bool:
         return self.state(on) is not BudgetState.HARD_STOP
 
+    def would_exceed_hard_stop(self, estimated_cost: float, on: date | None = None) -> bool:
+        """Checked BEFORE a call is made, against the PRE-CALL estimate --
+        `state`/`may_analyse` above only report where spend already stands,
+        which is not the same question as "would spending this much more
+        push it over" (T4 unit, Commit 4: 'a call that would exceed the
+        monthly hard stop must not be made'). Records nothing; a pure
+        check."""
+        return self.month_to_date(on) + estimated_cost >= self.hard_stop_at
+
+    def analyses_today(self, on: date | None = None) -> int:
+        """A real count of today's T4 analyses that actually spent money --
+        cache hits excluded (T4 unit, Commit 4): `agent.materiality.
+        compute_score`'s w6 budget brake takes `analyses_today` as a plain
+        caller-supplied int; this is what makes the ledger able to answer
+        that question correctly instead of a number nobody updates. A cache
+        hit makes zero API calls and costs nothing, so it does not count
+        against the daily analysis-rate cap this feeds -- only entries
+        provider='anthropic', operation='analysis', cache_hit=False, on the
+        given day."""
+        on = on or date.today()
+        return sum(1 for e in self._entries
+                   if e.provider == "anthropic" and e.operation == "analysis"
+                   and not e.cache_hit and e.at.date() == on)
+
     def cache_hit_rate(self) -> float:
         model = [e for e in self._entries if e.provider == "anthropic"]
         return (sum(1 for e in model if e.cache_hit) / len(model)) if model else 0.0

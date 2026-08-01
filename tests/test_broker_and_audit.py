@@ -431,3 +431,45 @@ def test_budget_states_and_hard_stop():
     assert led.state(on) is BudgetState.HARD_STOP
     assert led.may_analyse(on) is False
     assert led.cache_hit_rate() == 0.5
+
+
+# ------------------------------------------ analyses_today (T4 unit, Commit 4)
+# The materiality screen's w6 budget brake (agent.materiality.compute_score)
+# takes `analyses_today` as a plain caller-supplied int -- this method is what
+# makes the CostLedger able to answer that question correctly, so a caller
+# reads a real count instead of a number nobody updates. See agent/
+# materiality_cycle.py's own module docstring for whether anything actually
+# wires this in yet (nothing does -- there is no live call site).
+
+def test_analyses_today_counts_only_real_non_cache_hit_analysis_entries():
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0)
+    on = date(2026, 7, 20)
+    led.record(CostEntry("anthropic", "analysis", 100, 1.0,
+                         datetime(2026, 7, 20, 10, tzinfo=timezone.utc)))
+    led.record(CostEntry("anthropic", "analysis", 0, 0.0,
+                         datetime(2026, 7, 20, 11, tzinfo=timezone.utc), cache_hit=True))
+    led.record(CostEntry("anthropic", "analysis", 50, 0.5,
+                         datetime(2026, 7, 20, 12, tzinfo=timezone.utc)))
+    # a different day, and a different operation -- neither counts
+    led.record(CostEntry("anthropic", "analysis", 50, 0.5,
+                         datetime(2026, 7, 19, 12, tzinfo=timezone.utc)))
+    led.record(CostEntry("anthropic", "market_data", 10, 0.1,
+                         datetime(2026, 7, 20, 13, tzinfo=timezone.utc)))
+    assert led.analyses_today(on) == 2
+
+
+def test_analyses_today_defaults_to_todays_date():
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0)
+    led.record(CostEntry("anthropic", "analysis", 1, 1.0, datetime.now(timezone.utc)))
+    assert led.analyses_today() == 1
+
+
+def test_would_exceed_hard_stop_checks_the_estimate_before_recording_anything():
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0)
+    on = date(2026, 7, 20)
+    led.record(CostEntry("anthropic", "analysis", 1, 25.0,
+                         datetime(2026, 7, 5, tzinfo=timezone.utc)))
+    assert led.would_exceed_hard_stop(4.0, on) is False    # 25 + 4 = 29 < 30
+    assert led.would_exceed_hard_stop(5.0, on) is True     # 25 + 5 = 30 >= 30
+    # checking does not itself record anything
+    assert led.month_to_date(on) == 25.0
