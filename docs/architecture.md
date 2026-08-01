@@ -827,6 +827,52 @@ prefix, lands in the low tens of dollars monthly. Suggested budget for a $500 pi
 Note the ratio to capital — $20/month against $500 is still 4% monthly, which is a reason
 to keep the pilot short and to treat its P&L as noise, not a reason to hide the number.
 
+**Measured cost estimate (review round 2, 2026-08-01).** The paragraph above was a
+qualitative guess. This one is measured: it runs the same `build_analysis_prompt` and
+`_estimate_input_tokens`/`_price` functions `run_analysis` itself uses for its pre-call
+budget check (§8.2's own enforcement point), against the real committed 10-K fixture
+(`scripts/fixtures/edgar/AAPL_10K_0000320193-25-000079.htm`, 1,520,208 bytes), plus a
+synthetic market-snapshot fact — not a separate approximation done outside the code path
+it's meant to describe.
+
+`agent.filing_text.extract_filing_text` yields 209,728 characters from the raw fixture
+(13.8% extraction ratio). The full analysis prompt — system instructions, the boundary
+delimiters, and the per-fact envelope/line-numbering `build_analysis_prompt` adds around
+the extracted text — is larger than the raw extraction alone: 1,279 system characters plus
+217,520 user characters, 218,799 total. At this codebase's own chars-per-token heuristic
+(`agent.analysis._CHARS_PER_TOKEN_ESTIMATE = 4`), that is **54,699 estimated input tokens**
+— about 4% above a back-of-envelope 209,728/4, because the prompt carries more than just
+the extracted document text.
+
+At configured rates (`config.example.json`'s `t4_input_price_per_million_tokens=2.0`,
+`t4_output_price_per_million_tokens=10.0`) and the same worst-case output-token assumption
+`run_analysis`'s own pre-call brake uses (`max_output_tokens=4000`, since actual output
+length is unknown before the call completes): input cost **$0.1094**, output cost **$0.04**,
+**$0.1494 per analysis, worst case**. This is a ceiling, not an expected average — a cache
+hit costs $0, and an accepted analysis's real output is typically well under the 4,000-token
+ceiling, so realized per-analysis cost should usually run below this figure.
+
+At the configured cap of 8 analyses/day, over 21 trading days/month (verified against
+`agent.market_calendar.is_trading_day` for August and September 2026, both 21; October
+2026 is 22, November 2026 is 20 — 21 is a representative, not an assumed, figure) — 168
+analyses/month — the worst-case monthly total is **8 × 21 × $0.1494 ≈ $25.10**. That sits
+above the $20 target and below the $30 hard stop, confirming the plan's own reading: `w6`'s
+budget brake (§3.2, `w6 * analyses_today / max_model_analyses_per_day`) is expected to
+engage for part of most months by design, not as a bug, and realized spend should land
+below this worst-case ceiling because it assumes zero cache hits and maximum output length
+on every one of the 8 daily slots.
+
+**Does this change `max_model_analyses_per_day` (currently 8)?** No — this estimate does
+not by itself justify lowering it. $25.10 is a worst-case ceiling roughly 25% above the $20
+target but still $4.90 under the $30 hard stop; the plan already treats $20 as a target
+rather than a cap and holds the $10 gap to the hard stop as headroom for exactly this kind
+of worst-case-vs-actual variance. Lowering the cap (e.g. to 6/day, worst case ≈ $18.82/month)
+would buy more headroom under the target at the cost of screening out more candidates before
+any of them reach a model call. The number that should actually decide this is *observed*
+pilot spend, not this pre-pilot estimate — if realized month-to-date cost tracks close to the
+$25 ceiling rather than nearer $20, that is the trigger to revisit the cap, not this
+calculation. The value is unchanged here per instruction; this is a report, not a fix.
+
 ### 8.3 One gated path to broker-side effect
 
 Invariant #2 was previously stated as *one code path from store to orders* and enforced only

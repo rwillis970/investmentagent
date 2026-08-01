@@ -98,6 +98,18 @@ from dataclasses import dataclass
 from .edgar_collector import FIELD_DOCUMENT
 from .store import AsOfView
 
+# review round 2 (2026-08-01): this module's own validation logic (schema
+# checks, citation resolution, the period-attribution heuristic below) can
+# change independently of a prompt template, a model, or an output schema
+# -- fixing a bug in `_looks_like_header_row`, or widening/narrowing
+# `_HEADER_WINDOW`, changes what gets refused WITHOUT touching
+# PROMPT_VERSION/model_id/SCHEMA_VERSION at all. `agent.analysis_cache.
+# CacheKey` includes this as a fifth component precisely so a cached
+# refusal produced under an OLDER validator is not served forever once the
+# validator itself changes -- bumping this constant is the same kind of
+# deliberate cache-invalidation event a prompt/schema bump already is.
+VALIDATOR_VERSION = "t4-validator-v1"
+
 _HEADER_WINDOW = 8   # lines of preceding context checked for a header row
 
 _PERIOD_MARKER_RE = re.compile(
@@ -237,6 +249,33 @@ def _check_period_attribution(claim: Claim, *, citation_index: dict, section: st
         f"{section}[{index}] makes a period-specific claim ({claim.text!r}) but none of "
         "its filing_document citations have a header row establishing column order "
         f"within {_HEADER_WINDOW} preceding lines -- unsupported period attribution"
+    )
+
+
+def serialize_output(output: AnalysisOutput) -> dict:
+    """`AnalysisOutput` <-> plain dict, JSON/JSONB-safe -- the ONE shared
+    implementation (review round 2, 2026-08-01: this used to be duplicated
+    privately inside `agent.extraction_store`; moved here, beside the type
+    it serializes, so a second durable consumer -- `agent.analysis_trigger`
+    -- reuses it rather than re-deriving the same shape a third time)."""
+    def encode_claims(claims: tuple[Claim, ...]) -> list[dict]:
+        return [{"text": c.text, "citations": list(c.citations)} for c in claims]
+    return {
+        "bull_case": encode_claims(output.bull_case),
+        "bear_case": encode_claims(output.bear_case),
+        "contradicting_evidence": encode_claims(output.contradicting_evidence),
+        "confidence": output.confidence,
+    }
+
+
+def deserialize_output(payload: dict) -> AnalysisOutput:
+    def decode_claims(raw: list[dict]) -> tuple[Claim, ...]:
+        return tuple(Claim(text=c["text"], citations=tuple(c["citations"])) for c in raw)
+    return AnalysisOutput(
+        bull_case=decode_claims(payload["bull_case"]),
+        bear_case=decode_claims(payload["bear_case"]),
+        contradicting_evidence=decode_claims(payload["contradicting_evidence"]),
+        confidence=payload["confidence"],
     )
 
 

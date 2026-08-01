@@ -28,7 +28,8 @@ OUTPUT = AnalysisOutput(
 
 def key(**over):
     base = dict(doc_sha256="a" * 64, prompt_version="t4-prompt-v1",
-               model_id="claude-sonnet-5", schema_version="t4-schema-v1")
+               model_id="claude-sonnet-5", schema_version="t4-schema-v1",
+               validator_version="t4-validator-v1")
     base.update(over)
     return CacheKey(**base)
 
@@ -132,7 +133,8 @@ def test_unrecognised_status_on_load_is_an_error(tmp_path):
     path = tmp_path / "extraction.jsonl"
     path.write_text(
         '{"doc_hash": "a", "prompt_version": "v1", "model_id": "m", '
-        '"schema_version": "s1", "status": "mystery", "payload": null, '
+        '"schema_version": "s1", "validator_version": "t4-validator-v1", '
+        '"status": "mystery", "payload": null, '
         '"tokens_in": null, "tokens_out": null, "cost_usd": null, '
         '"created_at": "2026-08-01T12:00:00+00:00"}\n'
     )

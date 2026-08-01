@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agent.cost import CostEntry, CostLedger
 from agent.edgar_collector import FIELD as FILING_FIELD
 from agent.edgar_collector import SOURCE_ID as EDGAR_SOURCE_ID
 from agent.market_data_collector import FIELD as SNAPSHOT_FIELD
@@ -67,9 +68,13 @@ def filing_fact(symbol, *, form="8-K", item_codes=("2.02",), observed_at=T0,
 UNIVERSE = {"AAPL": "US_EQUITY", "MSFT": "US_EQUITY"}
 
 
+def empty_ledger():
+    return CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0)
+
+
 def run_cycle(store, universe=UNIVERSE, **over):
     kw = dict(policy=POLICY, capability_policy=CAPS, live=True,
-              analyses_today=0, max_model_analyses_per_day=8,
+              ledger=empty_ledger(), max_model_analyses_per_day=8,
               approvals_today=0, max_approval_requests_per_day=4,
               cooldown_symbols=frozenset(), now=T0, min_peer_group_size=3)
     kw.update(over)
@@ -491,3 +496,48 @@ def test_config_sane_is_none_when_a_smaller_asset_class_group_still_meets_a_lowe
     universe = {"AAPL": "US_EQUITY", "MSFT": "US_EQUITY"}
     assert assert_materiality_config_sane(
         materiality_w5=1.0, symbol_universe=universe, min_peer_group_size=1) is None
+
+
+# ------------------------------------ w6 reads the REAL ledger (review round 2)
+# `run_materiality_cycle` used to take `analyses_today` as a plain, bare int
+# -- the previously-disclosed gap was that nothing ever computed it from
+# `agent.cost.CostLedger.analyses_today()`. It now takes `ledger` directly
+# and computes `analyses_today` internally, structurally closing that gap:
+# no caller can pass a stale or wrong number anymore.
+
+def test_analyses_today_is_computed_from_the_real_ledger_not_a_bare_int():
+    store = FactStore()
+    store.append(snapshot_fact("AAPL", ret_since_open=5.0, atr_20=0.1))
+    led = empty_ledger()
+    led.record(CostEntry("anthropic", "analysis", 100, 0.15,
+                         datetime(2026, 7, 31, 9, tzinfo=timezone.utc)))
+    led.record(CostEntry("anthropic", "analysis", 100, 0.15,
+                         datetime(2026, 7, 31, 10, tzinfo=timezone.utc)))
+    # a cache hit the same day must NOT count (CostLedger.analyses_today's
+    # own exclusion) -- proves this isn't just "count every row today"
+    led.record(CostEntry("anthropic", "analysis", 0, 0.0,
+                         datetime(2026, 7, 31, 11, tzinfo=timezone.utc), cache_hit=True))
+
+    result = run_cycle(store, universe={"AAPL": "US_EQUITY"}, ledger=led)
+    event = result.events[0]
+    assert event.score_components["raw_terms"]["analyses_today"] == 2
+
+
+def test_w6_budget_brake_moves_when_the_real_ledger_records_more_analyses():
+    store = FactStore()
+    store.append(snapshot_fact("AAPL", ret_since_open=5.0, atr_20=0.1))
+
+    quiet_ledger = empty_ledger()
+    quiet_result = run_cycle(store, universe={"AAPL": "US_EQUITY"}, ledger=quiet_ledger)
+    quiet_brake = quiet_result.events[0].score_components["weighted_terms"]["budget_brake"]
+
+    busy_ledger = empty_ledger()
+    for hour in range(4):
+        busy_ledger.record(CostEntry("anthropic", "analysis", 100, 0.15,
+                                     datetime(2026, 7, 31, hour, tzinfo=timezone.utc)))
+    busy_result = run_cycle(store, universe={"AAPL": "US_EQUITY"}, ledger=busy_ledger)
+    busy_brake = busy_result.events[0].score_components["weighted_terms"]["budget_brake"]
+
+    # budget_brake = -w6 * (analyses_today / max_model_analyses_per_day) --
+    # more real analyses today must push the brake more negative.
+    assert busy_brake < quiet_brake

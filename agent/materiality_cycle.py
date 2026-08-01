@@ -149,6 +149,7 @@ import statistics
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .cost import CostLedger
 from .earnings import earnings_proximity as _earnings_proximity
 from .edgar_collector import FIELD as _FILING_FIELD
 from .edgar_collector import SOURCE_ID as _EDGAR_SOURCE_ID
@@ -378,7 +379,7 @@ def build_materiality_candidates(view: AsOfView, symbol_universe: dict[str, str]
 def run_materiality_cycle(view: AsOfView, symbol_universe: dict[str, str], *,
                           policy: MaterialityPolicy,
                           capability_policy: TradeCapabilityPolicy, live: bool,
-                          analyses_today: int, max_model_analyses_per_day: int,
+                          ledger: CostLedger, max_model_analyses_per_day: int,
                           approvals_today: int, max_approval_requests_per_day: int,
                           cooldown_symbols: frozenset[str], now: datetime,
                           min_peer_group_size: int,
@@ -396,6 +397,31 @@ def run_materiality_cycle(view: AsOfView, symbol_universe: dict[str, str], *,
     reason (see `MaterialityCycleResult`'s own docstring and this module's
     SILENT NO-OP VISIBILITY section: a healthy "nothing material today"
     cycle must not be indistinguishable from a misconfigured one).
+
+    `ledger` IS `agent.cost.CostLedger` (SPEND), NOT `agent.ledger.Ledger`
+    (POSITIONS/LOTS) -- this codebase has two unrelated classes both
+    colloquially called "a ledger"; this parameter is the cost one, the
+    same object `agent.analysis.run_analysis` records `CostEntry` rows
+    into. `held_symbols`/`cooldown_symbols` above are still where the
+    OTHER ledger (`agent.ledger.Ledger`) would be wired in, if a caller has
+    one -- this module still does not import that module at all.
+
+    `ledger` (REVIEW FIX, review round 2, 2026-08-01): REPLACES what used
+    to be a bare `analyses_today: int` parameter. `w6`'s budget brake
+    (`agent.materiality.compute_score`) needs a REAL count of today's T4
+    analyses, and before this fix nothing in this codebase ever called
+    `agent.cost.CostLedger.analyses_today()` and passed the result in here
+    -- a disclosed gap named in this module's own delivery report but never
+    closed. `analyses_today = ledger.analyses_today(on=now.date())` is now
+    computed INTERNALLY, once per cycle, from the real ledger -- STRUCTURALLY
+    closing the gap: there is no longer a call shape where a caller could
+    supply a stale, hardcoded, or simply wrong count. `agent.materiality.
+    screen()`/`compute_score()` THEMSELVES are UNCHANGED and still take a
+    plain `analyses_today: int` -- this module remains the one place a
+    `CostLedger` (or any other real store) is translated into the bare
+    values `agent.materiality`'s own module docstring requires it to stay
+    testable against ("this module has to be fully testable against
+    synthetic candidates with neither one present").
 
     `min_peer_group_size`: reuse `agent.config.Config.
     materiality_min_peer_group_size` directly -- see module docstring's
@@ -423,6 +449,10 @@ def run_materiality_cycle(view: AsOfView, symbol_universe: dict[str, str], *,
     built = build_materiality_candidates(view, symbol_universe, now=now,
                                          min_peer_group_size=min_peer_group_size)
     eligible_universe = frozenset(symbol_universe)
+    # Computed ONCE per cycle from the real ledger -- see this function's
+    # own docstring's `ledger` section. `now.date()`, not wall-clock
+    # `date.today()`, so a replay against a past `now` scopes correctly.
+    analyses_today = ledger.analyses_today(on=now.date())
 
     events = []
     skipped = dict(built.skipped)

@@ -99,8 +99,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .analysis_cache import CachedRefusal, CacheKey, ExtractionCache
-from .analysis_output import (AnalysisOutput, AnalysisRefused, MalformedResponse,
-                              parse_analysis_output)
+from .analysis_output import (VALIDATOR_VERSION, AnalysisOutput, AnalysisRefused,
+                              MalformedResponse, parse_analysis_output)
 from .analysis_prompt import PROMPT_VERSION, SCHEMA_VERSION, build_analysis_prompt
 from .cost import CostEntry, CostLedger
 from .edgar_collector import FIELD_DOCUMENT
@@ -170,19 +170,27 @@ def run_analysis(facts: list[Fact], *, symbol: str, as_of: datetime, now: dateti
                  input_price_per_million_tokens: float,
                  output_price_per_million_tokens: float, max_output_tokens: int,
                  prompt_version: str = PROMPT_VERSION, schema_version: str = SCHEMA_VERSION,
+                 validator_version: str = VALIDATOR_VERSION,
                  run_id: str | None = None) -> AnalysisRunResult:
     """One T4 analysis call for `symbol`, from already-collected `facts`
     (must include exactly one filing_document fact -- see module
     docstring's EXACTLY ONE FILING_DOCUMENT FACT section). Raises
     `AnalysisError`/`BudgetExceeded` before any model call, or lets
     `agent.analysis_output.AnalysisRefused` propagate from a call that was
-    already made and already recorded."""
+    already made and already recorded.
+
+    `validator_version` defaults to `agent.analysis_output.
+    VALIDATOR_VERSION` -- the current build's own validation logic --
+    exactly the way `prompt_version`/`schema_version` already default to
+    this build's own current constants. Part of the cache key (review
+    round 2): see `agent.analysis_cache.CacheKey`'s own docstring."""
     if as_of.tzinfo is None or now.tzinfo is None:
         raise AnalysisError("as_of and now must both be timezone-aware datetimes")
 
     doc_fact = _single_document_fact(facts)
     key = CacheKey(doc_sha256=doc_fact.source_doc_hash, prompt_version=prompt_version,
-                  model_id=model_id, schema_version=schema_version)
+                  model_id=model_id, schema_version=schema_version,
+                  validator_version=validator_version)
 
     cached = cache.get(key)
     if isinstance(cached, CachedRefusal):

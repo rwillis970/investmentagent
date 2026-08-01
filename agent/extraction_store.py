@@ -71,7 +71,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .analysis_cache import CachedRefusal, CacheKey
-from .analysis_output import AnalysisOutput, Claim
+from .analysis_output import AnalysisOutput, deserialize_output, serialize_output
 
 ACCEPTED, REFUSED = "accepted", "refused"
 
@@ -133,10 +133,11 @@ class ExtractionCacheStore:
         for line in lines:
             row = json.loads(line)
             key = CacheKey(doc_sha256=row["doc_hash"], prompt_version=row["prompt_version"],
-                          model_id=row["model_id"], schema_version=row["schema_version"])
+                          model_id=row["model_id"], schema_version=row["schema_version"],
+                          validator_version=row["validator_version"])
             status = row["status"]
             if status == ACCEPTED:
-                self.put(key, _decode_output(row["payload"]), persist=False)
+                self.put(key, deserialize_output(row["payload"]), persist=False)
             elif status == REFUSED:
                 self.put_refusal(key, CachedRefusal(
                     message=row["payload"]["refusal_message"],
@@ -154,33 +155,12 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _encode_output(output: AnalysisOutput) -> dict:
-    def encode_claims(claims: tuple[Claim, ...]) -> list[dict]:
-        return [{"text": c.text, "citations": list(c.citations)} for c in claims]
-    return {
-        "bull_case": encode_claims(output.bull_case),
-        "bear_case": encode_claims(output.bear_case),
-        "contradicting_evidence": encode_claims(output.contradicting_evidence),
-        "confidence": output.confidence,
-    }
-
-
-def _decode_output(payload: dict) -> AnalysisOutput:
-    def decode_claims(raw: list[dict]) -> tuple[Claim, ...]:
-        return tuple(Claim(text=c["text"], citations=tuple(c["citations"])) for c in raw)
-    return AnalysisOutput(
-        bull_case=decode_claims(payload["bull_case"]),
-        bear_case=decode_claims(payload["bear_case"]),
-        contradicting_evidence=decode_claims(payload["contradicting_evidence"]),
-        confidence=payload["confidence"],
-    )
-
-
 def _encode_accepted(key: CacheKey, output: AnalysisOutput, at: datetime) -> dict:
     return {
         "doc_hash": key.doc_sha256, "prompt_version": key.prompt_version,
         "model_id": key.model_id, "schema_version": key.schema_version,
-        "status": ACCEPTED, "payload": _encode_output(output),
+        "validator_version": key.validator_version,
+        "status": ACCEPTED, "payload": serialize_output(output),
         "tokens_in": None, "tokens_out": None, "cost_usd": None,
         "created_at": at.isoformat(),
     }
@@ -190,6 +170,7 @@ def _encode_refused(key: CacheKey, refusal: CachedRefusal, at: datetime) -> dict
     return {
         "doc_hash": key.doc_sha256, "prompt_version": key.prompt_version,
         "model_id": key.model_id, "schema_version": key.schema_version,
+        "validator_version": key.validator_version,
         "status": REFUSED, "payload": {"refusal_message": refusal.message},
         "tokens_in": refusal.tokens_in, "tokens_out": refusal.tokens_out,
         "cost_usd": refusal.cost_usd,

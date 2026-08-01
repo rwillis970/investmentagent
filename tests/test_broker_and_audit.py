@@ -15,6 +15,7 @@ signs it with the same Gatekeeper's key -- simulating a StagedOrder that
 somehow got past the pipeline, which is exactly the scenario gate 4 exists
 to catch independently.
 """
+import os
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -27,7 +28,7 @@ from agent.audit import AuditError, AuditLog
 from agent.broker import (AccountPosture, CapabilityPolicyUnset, MissingApproval,
                           SimulatorBroker, detect_posture)
 from agent.broker.base import AccountSnapshot, BrokerAdapter, BrokerOrder
-from agent.cost import BudgetState, CostEntry, CostLedger
+from agent.cost import BudgetState, CostEntry, CostLedger, CostLedgerError
 from agent.daytrade import DayTradeGuard
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.money import to_decimal
@@ -473,3 +474,112 @@ def test_would_exceed_hard_stop_checks_the_estimate_before_recording_anything():
     assert led.would_exceed_hard_stop(5.0, on) is True     # 25 + 5 = 30 >= 30
     # checking does not itself record anything
     assert led.month_to_date(on) == 25.0
+
+
+# -------------------------------------------------- durability (review Commit 1)
+# The launchd job restarts on every non-zero exit -- observed repeatedly in
+# practice -- and an in-memory CostLedger loses every entry on restart,
+# resetting month-to-date spend to zero and letting the $30 hard stop be
+# re-blown arbitrarily many times. `path=` makes it durable: own file,
+# append-only, replay on load -- same discipline as every other store in
+# this codebase.
+
+def test_cost_ledger_with_no_path_is_unchanged_in_memory_only_behaviour():
+    """Every pre-existing call site constructs CostLedger without a path --
+    this must keep working exactly as before."""
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0)
+    led.record(CostEntry("anthropic", "analysis", 1, 5.0, datetime.now(timezone.utc)))
+    assert led.month_to_date() == 5.0
+
+
+def test_entries_survive_a_reload(tmp_path):
+    path = tmp_path / "cost_ledger.jsonl"
+    on = date(2026, 8, 1)
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0, path=path)
+    led.record(CostEntry("anthropic", "analysis", 100, 5.0,
+                         datetime(2026, 8, 1, 9, tzinfo=timezone.utc)))
+    led.record(CostEntry("anthropic", "analysis", 0, 0.0,
+                         datetime(2026, 8, 1, 10, tzinfo=timezone.utc), cache_hit=True))
+
+    reloaded = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0, path=path)
+    assert reloaded.month_to_date(on) == 5.0
+    assert reloaded.analyses_today(on) == 1
+    assert reloaded.cache_hit_rate() == 0.5
+
+
+def test_a_prior_month_entry_does_not_count_toward_the_current_months_hard_stop(tmp_path):
+    """The hard stop is MONTHLY -- replaying a file spanning more than one
+    month must not let a prior month's spend count against the current
+    month's budget."""
+    path = tmp_path / "cost_ledger.jsonl"
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0, path=path)
+    led.record(CostEntry("anthropic", "analysis", 1, 29.0,
+                         datetime(2026, 7, 15, tzinfo=timezone.utc)))   # last month, near-maxed
+    led.record(CostEntry("anthropic", "analysis", 1, 1.0,
+                         datetime(2026, 8, 1, tzinfo=timezone.utc)))    # this month
+
+    reloaded = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0, path=path)
+    assert reloaded.month_to_date(date(2026, 7, 20)) == 29.0
+    assert reloaded.month_to_date(date(2026, 8, 15)) == 1.0
+    assert reloaded.state(date(2026, 8, 15)) is BudgetState.OK
+    assert reloaded.would_exceed_hard_stop(0.5, date(2026, 8, 15)) is False
+
+
+def test_analyses_today_is_correct_across_a_mid_day_restart(tmp_path):
+    path = tmp_path / "cost_ledger.jsonl"
+    on = date(2026, 8, 1)
+    before_restart = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0,
+                                path=path)
+    before_restart.record(CostEntry("anthropic", "analysis", 100, 0.1,
+                                    datetime(2026, 8, 1, 9, tzinfo=timezone.utc)))
+    before_restart.record(CostEntry("anthropic", "analysis", 100, 0.1,
+                                    datetime(2026, 8, 1, 10, tzinfo=timezone.utc)))
+    assert before_restart.analyses_today(on) == 2
+
+    after_restart = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0,
+                               path=path)
+    assert after_restart.analyses_today(on) == 2   # both pre-restart rows survived
+    after_restart.record(CostEntry("anthropic", "analysis", 100, 0.1,
+                                   datetime(2026, 8, 1, 14, tzinfo=timezone.utc)))
+    assert after_restart.analyses_today(on) == 3   # pre- and post-restart rows both count
+
+
+def test_a_reload_does_not_re_append_rows_it_replayed(tmp_path):
+    path = tmp_path / "cost_ledger.jsonl"
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0, path=path)
+    led.record(CostEntry("anthropic", "analysis", 1, 1.0, datetime.now(timezone.utc)))
+    size_after_one_write = path.stat().st_size
+
+    CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0, path=path)
+    assert path.stat().st_size == size_after_one_write
+
+
+def test_cost_ledger_is_append_only(tmp_path):
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0,
+                     path=tmp_path / "cost_ledger.jsonl")
+    with pytest.raises(CostLedgerError):
+        led.update()
+    with pytest.raises(CostLedgerError):
+        led.delete()
+
+
+def test_every_recorded_row_is_fsynced_including_zero_cost_cache_hits(tmp_path, monkeypatch):
+    """The fsync question, answered explicitly rather than inherited from a
+    precedent that doesn't apply here: unlike a quarantined broker
+    activity (reconstructible by re-polling the broker), a spent dollar has
+    no external source of truth this system can reconstruct from later. A
+    lost CostEntry row means money that was actually spent is invisible to
+    the ledger, which UNDERSTATES month-to-date spend and therefore RAISES
+    the effective ceiling above the real $30 hard stop -- the dangerous
+    direction. Every row fsyncs unconditionally, including a $0 cache-hit
+    row (no fast/slow-path distinction), because the alternative is
+    deciding case-by-case which future row will turn out to have mattered."""
+    calls = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0,
+                     path=tmp_path / "cost_ledger.jsonl")
+    led.record(CostEntry("anthropic", "analysis", 100, 5.0, datetime.now(timezone.utc)))
+    led.record(CostEntry("anthropic", "analysis", 0, 0.0, datetime.now(timezone.utc),
+                         cache_hit=True))
+    assert len(calls) == 2

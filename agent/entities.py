@@ -88,34 +88,43 @@ class AnalysisResult:
     aggregate directly, the same reason `OpportunityEvent.materiality_score`
     is its own column rather than folded into `score_components`.
 
-    PRE-EXISTING, STILL-UNUSED SCHEMA, NOT REUSED HERE (a finding, stated
-    plainly): `migrations/001_init.sql` already defines `agent.document`/
-    `agent.extraction` tables shaped almost exactly like `agent.
-    analysis_cache.CacheKey`/`ExtractionCache` (`doc_hash + prompt_version +
-    model_id + schema_version` primary key, `payload`/`tokens_in`/
-    `tokens_out`/`cost_usd`/`status` columns) -- from Day 1, before any of
-    T4 was built, and never wired to a Python entity or a parity test
-    (absent from this file's own `CASES` list before this commit). That
-    table is the right shape for a DURABLE version of the in-memory
-    `ExtractionCache` this unit's Commit 4 built -- persisting the
-    extraction cache itself is a future unit's job, not this one's, and is
-    NOT what this entity is for. `AnalysisResult` is a different concept:
-    an append-only, per-analysis-call RESULT record linked to the
-    `OpportunityEvent` that triggered it, not a doc-keyed, overwrite-by-key
-    CACHE row. Conflating the two here would have been a silent design
-    decision; naming both and building only the one asked for is not.
+    A DIFFERENT CONCEPT FROM `Extraction`/`ExtractionCacheStore` (originally
+    flagged here as PRE-EXISTING, STILL-UNUSED SCHEMA when this entity was
+    first built, now durably backed as of review round 2 -- see
+    `Extraction`'s own docstring below): `AnalysisResult` is an append-only,
+    per-analysis-call RESULT record linked to the `OpportunityEvent` that
+    triggered it, not a doc-keyed, overwrite-by-key CACHE row. The two
+    remain intentionally separate tables for that reason -- conflating them
+    would have been a silent design decision.
 
-    PERSISTENCE: no store class exists for this entity in this codebase,
-    same as `OpportunityEvent`'s own disclosed gap. Nothing in
-    `agent.analysis.run_analysis` constructs an `AnalysisResult` either --
-    that wiring is out of this commit's scope (no `run_loop` wiring, per
-    this unit's own instruction)."""
+    PERSISTENCE (updated, review round 2, 2026-08-01): `agent.
+    analysis_result_store.AnalysisResultStore` now exists -- own file,
+    append-only, replay-on-load, same discipline as every other durable
+    store in this codebase. `result_id` is assigned INTERNALLY by that
+    store's own `record()` (a fresh, random id), never supplied by the
+    caller -- mirroring `agent.mode_store.ModeStore.write`'s own "seq
+    assigned internally" convention referenced on `ModeChange` above. This
+    entity remains a plain, append-only HISTORY row, not a keyed resource:
+    calling the trigger path (`agent.analysis_trigger.
+    analyze_opportunity_event`) twice for logically the same recurring
+    event (materiality_cycle.py's own disclosed "no dedup tracker yet"
+    gap) legitimately produces two distinct rows, not a conflict -- each
+    represents a real analysis ATTEMPT, whether it happened to be a fresh
+    call or a cache hit.
+
+    `validator_version` (review round 2 addition, alongside the same field
+    on `CacheKey`/`Extraction`) records which build of `agent.
+    analysis_output`'s own validation logic accepted this analysis --
+    completing the three version stamps (`prompt_version`, `schema_version`,
+    `validator_version`) needed to fully reconstruct why a recommendation
+    existed months later."""
     result_id: str
     event_id: str
     symbol: str
     model_id: str
     prompt_version: str
     schema_version: str
+    validator_version: str
     doc_sha256: str
     cache_hit: bool
     cost_usd: float
@@ -166,6 +175,14 @@ class Extraction:
     prompt_version: str
     model_id: str
     schema_version: str
+    # review round 2 (2026-08-01): the fifth CacheKey component -- see
+    # agent/analysis_cache.py's own CacheKey docstring. Part of this row's
+    # identity in practice (agent.extraction_store.ExtractionCacheStore
+    # keys on it too) even though it is not itself part of the SQL PRIMARY
+    # KEY constraint touched by migrations/006 -- see that migration's own
+    # comment for why the key is widened for `agent.extraction` but not
+    # for `agent.analysis_result` below.
+    validator_version: str
     status: str
     created_at: datetime
     payload: dict | None = None

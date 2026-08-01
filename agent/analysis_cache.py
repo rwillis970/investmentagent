@@ -1,8 +1,15 @@
 """The T4 extraction cache (§3.3, Appendix C.3, T4 unit Commit 4): "the same
 document is never paid for twice."
 
-KEYED EXACTLY PER APPENDIX C.3'S OWN SPEC -- not invented here:
-`sha256(doc) + prompt_version + model_id + schema_version`. `doc_sha256` is
+KEYED PER APPENDIX C.3'S OWN SPEC, PLUS ONE COMPONENT APPENDIX C.3 DID NOT
+NAME (`validator_version`, review round 2, 2026-08-01): `sha256(doc) +
+prompt_version + model_id + schema_version` is the ORIGINAL four-part key
+Appendix C.3 specifies; `validator_version` is a fifth, added because
+`agent.analysis_output`'s own schema/citation/period-attribution
+validation logic can change independently of a prompt, a model, or an
+output schema, and a cached REFUSAL produced under an older validator must
+not be served forever once the validator itself changes -- see that
+module's own `VALIDATOR_VERSION` docstring. `doc_sha256` is
 `agent.edgar.FilingDocumentFetch.sha256` (equivalently, the `source_doc_hash`
 `agent.edgar_collector.collect_filing_document` stores on the
 `filing_document` Fact) -- computed over the ACTUAL STORED bytes, i.e.
@@ -64,6 +71,12 @@ class CacheKey:
     prompt_version: str
     model_id: str
     schema_version: str
+    # review round 2 (2026-08-01): the validator's own logic (schema/
+    # citation/period-attribution checks in agent.analysis_output) can
+    # change independently of the other four components -- see that
+    # module's own VALIDATOR_VERSION docstring. Required, no default, same
+    # "no implicit fallback" posture as the other four fields on this key.
+    validator_version: str
 
 
 @dataclass(frozen=True)

@@ -19,7 +19,8 @@ OUTPUT = AnalysisOutput(
 
 def key(**over):
     base = dict(doc_sha256="a" * 64, prompt_version="t4-prompt-v1",
-               model_id="claude-sonnet-5", schema_version="t4-schema-v1")
+               model_id="claude-sonnet-5", schema_version="t4-schema-v1",
+               validator_version="t4-validator-v1")
     base.update(over)
     return CacheKey(**base)
 
@@ -59,6 +60,17 @@ def test_a_different_schema_version_is_a_different_key():
     cache = ExtractionCache()
     cache.put(key(), OUTPUT)
     assert cache.get(key(schema_version="t4-schema-v2")) is None
+
+
+def test_a_different_validator_version_is_a_different_key():
+    """review round 2, 2026-08-01: agent.analysis_output's own validation
+    logic (period attribution, citation checks) can change independently
+    of prompt_version/model_id/schema_version -- a cached refusal produced
+    under an older validator must not be served forever once the validator
+    itself changes. See agent/analysis_cache.py's own CacheKey docstring."""
+    cache = ExtractionCache()
+    cache.put(key(), OUTPUT)
+    assert cache.get(key(validator_version="t4-validator-v2")) is None
 
 
 def test_cache_key_is_hashable_and_usable_as_a_dict_key():

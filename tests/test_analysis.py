@@ -144,7 +144,8 @@ def test_a_cache_hit_makes_zero_model_calls_and_records_a_zero_cost_entry():
         contradicting_evidence=(), confidence=0.4,
     )
     key = CacheKey(doc_sha256=doc_fact.source_doc_hash, prompt_version="t4-prompt-v1",
-                  model_id=MODEL_ID, schema_version="t4-schema-v1")
+                  model_id=MODEL_ID, schema_version="t4-schema-v1",
+                  validator_version="t4-validator-v1")
     cache.put(key, cached_output)
 
     fake = FakeModelClient()   # nothing enqueued -- a real call would raise
@@ -197,7 +198,8 @@ def test_a_malformed_json_response_still_records_the_cost_entry_but_is_never_cac
     assert led.month_to_date(T0.date()) == pytest.approx(expected_cost)
     doc_fact = next(f for f in facts if f.field == FIELD_DOCUMENT)
     key = CacheKey(doc_sha256=doc_fact.source_doc_hash, prompt_version="t4-prompt-v1",
-                  model_id=MODEL_ID, schema_version="t4-schema-v1")
+                  model_id=MODEL_ID, schema_version="t4-schema-v1",
+                  validator_version="t4-validator-v1")
     assert cache.get(key) is None
 
     # not being poisoned: a later attempt against the same document can
@@ -337,7 +339,8 @@ def test_end_to_end_against_the_real_committed_10k_fixture():
     result = run(facts, view, model_client=fake, cache=cache)
     assert result.cache_hit is False
     key = CacheKey(doc_sha256=doc_fact.source_doc_hash, prompt_version="t4-prompt-v1",
-                  model_id=MODEL_ID, schema_version="t4-schema-v1")
+                  model_id=MODEL_ID, schema_version="t4-schema-v1",
+                  validator_version="t4-validator-v1")
     assert cache.get(key) is result.output
 
     # a second call against the SAME document is a cache hit
