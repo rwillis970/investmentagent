@@ -125,6 +125,56 @@ class AnalysisResult:
 
 
 @dataclass(frozen=True)
+class Extraction:
+    """One row of `agent.extraction` (`migrations/001_init.sql`) -- the
+    Day-1 schema for what this unit calls the extraction cache
+    (`agent.analysis_cache.CacheKey`/`ExtractionCache`), found DEFINED but
+    never wired to a Python entity or a parity test (see this file's own
+    `AnalysisResult` docstring, PRE-EXISTING, STILL-UNUSED SCHEMA section,
+    for the earlier half of this same finding). This entry closes that gap
+    for `agent.extraction` specifically; `agent.document` (the `doc_hash`
+    FK target) still has none -- out of scope here, a separate, smaller
+    unused table this commit does not touch.
+
+    Backed durably by `agent.extraction_store.ExtractionCacheStore` (review
+    Commit 2, 2026-08-01) -- own file, append-only, replay-on-load, the
+    same discipline as every other store in this codebase. The primary key
+    is the four-column tuple Appendix C.3 specifies (`doc_hash` +
+    `prompt_version` + `model_id` + `schema_version`), matching `CacheKey`
+    exactly (`doc_hash` here is the same field `CacheKey.doc_sha256`
+    names).
+
+    `status` DISCRIMINATES `"accepted"` FROM `"refused"` -- the column
+    that makes this table's EXISTING shape (unmodified from Day 1) already
+    sufficient for a cached refusal (review Commit 1's own finding): a
+    refused row's `payload` holds `{"refusal_message": ...}` instead of a
+    serialized `AnalysisOutput`, and `tokens_in`/`tokens_out`/`cost_usd`
+    apply identically to either outcome -- a refusal still spent real
+    tokens and real dollars on the one call that produced it. No column
+    was added or renamed for this; see `ExtractionCacheStore`'s own module
+    docstring for the full reasoning.
+
+    `payload`/`tokens_in`/`tokens_out`/`cost_usd` are all nullable in SQL
+    (no `NOT NULL`), matching this entity's own optional fields --
+    `ExtractionCacheStore.put()` (the ACCEPTED path) never has a real
+    token/cost figure to record, since `AnalysisOutput` itself carries none
+    (only `CachedRefusal` does); an accepted row's `tokens_in`/`tokens_out`/
+    `cost_usd` are therefore always `None` when written through that exact
+    method, a disclosed limitation, not a bug -- see that module's
+    docstring."""
+    doc_hash: str
+    prompt_version: str
+    model_id: str
+    schema_version: str
+    status: str
+    created_at: datetime
+    payload: dict | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: float | None = None
+
+
+@dataclass(frozen=True)
 class ApprovalRequest:
     request_id: str
     run_id: str

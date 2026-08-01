@@ -178,10 +178,13 @@ def test_would_exceed_hard_stop_refuses_before_any_model_call_and_records_nothin
 
 # --------------------------------------------------------- refusal handling
 
-def test_a_refused_response_still_records_the_cost_entry_but_is_not_cached():
+def test_a_malformed_json_response_still_records_the_cost_entry_but_is_never_cached():
     """Every real call writes a CostLedger row (Appendix C.3) regardless of
-    parse outcome -- money was already spent on the call. AnalysisRefused
-    propagates as-is: not retried, not cached."""
+    parse outcome -- money was already spent on the call. A malformed
+    (non-JSON) reply is a transport-level fluke, not a property of the
+    document -- it must never be cached (see agent.analysis's own module
+    docstring): caching it would permanently poison a filing over one bad
+    call."""
     facts, view = setup()
     fake = FakeModelClient()
     fake.enqueue(ModelResponse(raw_text="not valid json {", input_tokens=10, output_tokens=5))
@@ -196,6 +199,74 @@ def test_a_refused_response_still_records_the_cost_entry_but_is_not_cached():
     key = CacheKey(doc_sha256=doc_fact.source_doc_hash, prompt_version="t4-prompt-v1",
                   model_id=MODEL_ID, schema_version="t4-schema-v1")
     assert cache.get(key) is None
+
+    # not being poisoned: a later attempt against the same document can
+    # still succeed normally.
+    from agent.analysis_prompt import build_analysis_prompt
+    prompt = build_analysis_prompt(facts, symbol="AAPL", as_of=T0)
+    fake2 = FakeModelClient()
+    fake2.enqueue(ModelResponse(raw_text=json.dumps(valid_payload_for(prompt)),
+                                input_tokens=20, output_tokens=10))
+    result = run(facts, view, model_client=fake2, cache=cache, ledger_=led)
+    assert result.cache_hit is False
+
+
+def test_a_structural_refusal_is_cached_and_re_raised_without_a_second_model_call():
+    """A period-attribution failure or an empty bear case is a valid,
+    reproducible result for the exact (doc, prompt_version, model_id,
+    schema_version) tuple -- caching it means a document that refuses
+    deterministically is not paid for again on every screen cycle."""
+    facts, view = setup()
+    from agent.analysis_prompt import build_analysis_prompt
+    prompt = build_analysis_prompt(facts, symbol="AAPL", as_of=T0)
+    payload = valid_payload_for(prompt)
+    payload["bear_case"] = []   # a structural refusal, not a malformed reply
+    fake = FakeModelClient()
+    fake.enqueue(ModelResponse(raw_text=json.dumps(payload), input_tokens=10, output_tokens=5))
+    led = ledger()
+    cache = ExtractionCache()
+    with pytest.raises(AnalysisRefused, match="bear_case"):
+        run(facts, view, model_client=fake, ledger_=led, cache=cache)
+    assert led.analyses_today(T0.date()) == 1
+    real_cost = led.month_to_date(T0.date())
+    assert real_cost > 0
+
+    fake2 = FakeModelClient()   # nothing enqueued -- a second call must not happen
+    with pytest.raises(AnalysisRefused, match="bear_case"):
+        run(facts, view, model_client=fake2, ledger_=led, cache=cache)
+    assert fake2.calls == []
+    # the cache hit is free and does not count as a new analysis
+    assert led.analyses_today(T0.date()) == 1
+    assert led.month_to_date(T0.date()) == pytest.approx(real_cost)
+
+
+def test_bumping_prompt_version_invalidates_a_cached_refusal():
+    """The correct retry mechanism for a deterministically-refusing document
+    is a prompt/schema version bump, not a bare retry -- a different
+    prompt_version is a different CacheKey by construction."""
+    facts, view = setup()
+    from agent.analysis_prompt import build_analysis_prompt
+    prompt = build_analysis_prompt(facts, symbol="AAPL", as_of=T0, prompt_version="t4-prompt-v1")
+    payload = valid_payload_for(prompt)
+    payload["bear_case"] = []
+    fake = FakeModelClient()
+    fake.enqueue(ModelResponse(raw_text=json.dumps(payload), input_tokens=10, output_tokens=5))
+    cache = ExtractionCache()
+    with pytest.raises(AnalysisRefused):
+        run(facts, view, model_client=fake, cache=cache)
+
+    prompt_v2 = build_analysis_prompt(facts, symbol="AAPL", as_of=T0, prompt_version="t4-prompt-v2")
+    fake2 = FakeModelClient()
+    fake2.enqueue(ModelResponse(raw_text=json.dumps(valid_payload_for(prompt_v2)),
+                                input_tokens=15, output_tokens=8))
+    result = run_analysis(
+        facts, symbol="AAPL", as_of=T0, now=T0, view=view, model_client=fake2,
+        ledger=ledger(), cache=cache, model_id=MODEL_ID,
+        input_price_per_million_tokens=INPUT_PRICE,
+        output_price_per_million_tokens=OUTPUT_PRICE, max_output_tokens=MAX_OUTPUT_TOKENS,
+        prompt_version="t4-prompt-v2",
+    )
+    assert result.cache_hit is False
 
 
 # ------------------------------------------------------ single-document rule

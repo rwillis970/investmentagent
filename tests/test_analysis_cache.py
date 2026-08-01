@@ -6,7 +6,7 @@ agent.cost.CostLedger itself (also never persisted) -- not built here.
 """
 from __future__ import annotations
 
-from agent.analysis_cache import CacheKey, ExtractionCache
+from agent.analysis_cache import CachedRefusal, CacheKey, ExtractionCache
 from agent.analysis_output import AnalysisOutput, Claim
 
 OUTPUT = AnalysisOutput(
@@ -68,6 +68,39 @@ def test_cache_key_is_hashable_and_usable_as_a_dict_key():
     assert hash(k1) == hash(k2)
     d = {k1: "value"}
     assert d[k2] == "value"
+
+
+# ------------------------------------------------------ cached refusals
+# (review finding, 2026-08-01): a deterministic refusal -- a period-
+# attribution failure, an empty bear case -- is a valid, reproducible
+# result for one exact CacheKey, cached the same way a successful
+# AnalysisOutput is, so re-screening the same document does not pay for
+# the model again. See agent/analysis.py's own module docstring for why
+# a MalformedResponse (non-JSON reply) is deliberately NEVER put here.
+
+def test_put_refusal_then_get_returns_the_cached_refusal():
+    cache = ExtractionCache()
+    refusal = CachedRefusal(message="bear_case must be non-empty", tokens_in=10,
+                            tokens_out=5, cost_usd=0.001)
+    cache.put_refusal(key(), refusal)
+    assert cache.get(key()) is refusal
+
+
+def test_a_cached_refusal_and_a_cached_output_are_distinguishable_by_type():
+    cache = ExtractionCache()
+    cache.put(key(doc_sha256="e" * 64), OUTPUT)
+    cache.put_refusal(key(doc_sha256="f" * 64), CachedRefusal("x", 1, 1, 0.0))
+    assert isinstance(cache.get(key(doc_sha256="e" * 64)), AnalysisOutput)
+    assert isinstance(cache.get(key(doc_sha256="f" * 64)), CachedRefusal)
+
+
+def test_a_cached_refusal_follows_the_same_key_collision_rules_as_an_output():
+    cache = ExtractionCache()
+    cache.put_refusal(key(), CachedRefusal("x", 1, 1, 0.0))
+    assert cache.get(key(prompt_version="t4-prompt-v2")) is None
+    assert cache.get(key(model_id="claude-opus-5")) is None
+    assert cache.get(key(schema_version="t4-schema-v2")) is None
+    assert cache.get(key(doc_sha256="b" * 64)) is None
 
 
 def test_truncated_documents_get_a_different_key_via_their_own_sha256():

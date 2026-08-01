@@ -32,6 +32,7 @@ CASES = [
     (E.PlaybookCandidate, "agent.playbook_candidate"),
     (E.ModeChange, "policy.mode_state"),
     (E.AnalysisResult, "agent.analysis_result"),
+    (E.Extraction, "agent.extraction"),
 ]
 
 

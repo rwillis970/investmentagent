@@ -16,7 +16,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent.analysis_output import AnalysisRefused, parse_analysis_output
+from agent.analysis_output import (AnalysisRefused, MalformedResponse,
+                                   parse_analysis_output)
 from agent.analysis_prompt import CitableFact, build_analysis_prompt
 from agent.edgar_collector import FIELD_DOCUMENT
 from agent.market_data_collector import FIELD as SNAPSHOT_FIELD
@@ -112,6 +113,33 @@ def test_invalid_json_is_refused():
     with pytest.raises(AnalysisRefused, match="JSON"):
         parse_analysis_output("not json at all {", citation_index=prompt.citation_index,
                               view=view, as_of=T0)
+
+
+def test_invalid_json_raises_malformed_response_a_subclass_of_analysis_refused():
+    """agent.analysis.run_analysis needs to tell this apart from every other
+    refusal below: a non-JSON reply is a transport-level fluke (a
+    truncated call, a dropped connection), not a property of the document,
+    and must never be cached against the document's CacheKey -- see that
+    module's own docstring."""
+    prompt, view = setup()
+    with pytest.raises(MalformedResponse):
+        parse_analysis_output("not json at all {", citation_index=prompt.citation_index,
+                              view=view, as_of=T0)
+
+
+def test_every_other_refusal_is_not_a_malformed_response():
+    """Structural/schema/citation/period-attribution failures are
+    AnalysisRefused but deliberately NOT MalformedResponse -- these are
+    treated as a reproducible property of the (document, prompt_version,
+    model_id, schema_version) tuple, safe to cache, unlike a bad-JSON
+    reply."""
+    prompt, view = setup()
+    payload = valid_payload(prompt)
+    del payload["bear_case"]
+    with pytest.raises(AnalysisRefused) as exc_info:
+        parse_analysis_output(json.dumps(payload), citation_index=prompt.citation_index,
+                              view=view, as_of=T0)
+    assert not isinstance(exc_info.value, MalformedResponse)
 
 
 def test_missing_required_key_is_refused():

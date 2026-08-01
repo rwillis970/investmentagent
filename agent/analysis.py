@@ -31,12 +31,40 @@ estimate above), and is recorded BEFORE `parse_analysis_output` runs:
 money was already spent on the call whether or not the response turns out
 to be schema-valid.
 
-INVALID OUTPUT IS REFUSED, NEVER RETRIED, NEVER CACHED, NEVER SILENTLY
+INVALID OUTPUT IS REFUSED, NEVER RETRIED IN A LOOP, NEVER SILENTLY
 DEFAULTED -- "Invalid output is logged and skipped, never retried in a
 loop and never silently defaulted" (Appendix C.3). `AnalysisRefused`
-propagates to the caller exactly as `agent.analysis_output` raised it; this
-module does not catch it, does not retry the call, and writes nothing to
-the extraction cache for a refused response.
+always propagates to the caller exactly as `agent.analysis_output` raised
+it; this module never swallows it, and never makes a second model call in
+the same `run_analysis` invocation hoping for a different answer.
+
+A REFUSAL IS CACHED IF AND ONLY IF IT IS NOT A `MalformedResponse` (review
+finding, 2026-08-01). A period-attribution failure or an empty bear case
+is a reproducible property of the (document, prompt_version, model_id,
+schema_version) tuple -- caching it means a document that refuses
+deterministically is not paid for again on the next screening cycle with
+an outcome that cannot change. Caching the refusal is NOT the same thing
+as "retrying": it is the opposite -- it means the NEXT call for this exact
+key never happens at all, it is short-circuited to the same answer for
+free. The correct way to give a refusing document a genuine second chance
+is bumping `prompt_version` or `schema_version`, which is already a
+different `CacheKey` by construction -- no separate invalidation mechanism
+is needed or built.
+
+`MalformedResponse` -- a reply that did not even parse as JSON -- is the
+one refusal NEVER cached. A truncated or dropped reply is a
+transport-level fluke, not a property of the document; caching it would
+permanently poison a filing over one bad call. `agent.analysis_output`
+raises this as a distinct, narrower subclass of `AnalysisRefused`
+specifically so this module can tell the two cases apart -- every other
+refusal reaches here as the base `AnalysisRefused` (or a further subclass
+that is still not `MalformedResponse`) and IS cached via `cache.
+put_refusal`. This module cannot always be certain a non-`MalformedResponse`
+refusal is truly caused by the document rather than an unlucky model
+response (model output is not literally deterministic) -- the safer
+default, given §3.3's own "never retried in a loop" instruction, is to
+treat any refusal that survived JSON parsing as document-attributable and
+worth caching, rather than attempt a real call again speculatively.
 
 EXACTLY ONE FILING_DOCUMENT FACT PER CALL. The extraction cache's key
 (Appendix C.3: `sha256(doc) + prompt_version + model_id + schema_version`)
@@ -70,8 +98,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from .analysis_cache import CacheKey, ExtractionCache
-from .analysis_output import AnalysisOutput, parse_analysis_output
+from .analysis_cache import CachedRefusal, CacheKey, ExtractionCache
+from .analysis_output import (AnalysisOutput, AnalysisRefused, MalformedResponse,
+                              parse_analysis_output)
 from .analysis_prompt import PROMPT_VERSION, SCHEMA_VERSION, build_analysis_prompt
 from .cost import CostEntry, CostLedger
 from .edgar_collector import FIELD_DOCUMENT
@@ -156,6 +185,13 @@ def run_analysis(facts: list[Fact], *, symbol: str, as_of: datetime, now: dateti
                   model_id=model_id, schema_version=schema_version)
 
     cached = cache.get(key)
+    if isinstance(cached, CachedRefusal):
+        # A cache hit costs nothing and makes no model call -- whether the
+        # cached outcome was an acceptance or a refusal (see module
+        # docstring's A REFUSAL IS CACHED section).
+        ledger.record(CostEntry(PROVIDER, OPERATION, 0, 0.0, now, run_id=run_id,
+                                cache_hit=True))
+        raise AnalysisRefused(cached.message)
     if cached is not None:
         ledger.record(CostEntry(PROVIDER, OPERATION, 0, 0.0, now, run_id=run_id,
                                 cache_hit=True))
@@ -189,10 +225,23 @@ def run_analysis(facts: list[Fact], *, symbol: str, as_of: datetime, now: dateti
                             response.input_tokens + response.output_tokens, real_cost,
                             now, run_id=run_id, cache_hit=False))
 
-    # AnalysisRefused propagates as-is -- never retried, never cached, never
-    # silently defaulted (see module docstring).
-    output = parse_analysis_output(response.raw_text, citation_index=prompt.citation_index,
-                                   view=view, as_of=as_of)
+    try:
+        output = parse_analysis_output(response.raw_text, citation_index=prompt.citation_index,
+                                       view=view, as_of=as_of)
+    except MalformedResponse:
+        # Transport-level fluke, not a property of the document -- never
+        # cached (see module docstring). Propagates as-is.
+        raise
+    except AnalysisRefused as exc:
+        # Every other refusal is treated as a reproducible property of this
+        # exact CacheKey -- cached so the next screening cycle does not pay
+        # for the same document again (see module docstring). Propagates
+        # as-is after caching.
+        cache.put_refusal(key, CachedRefusal(
+            message=str(exc), tokens_in=response.input_tokens,
+            tokens_out=response.output_tokens, cost_usd=real_cost,
+        ))
+        raise
 
     cache.put(key, output)
     return AnalysisRunResult(output=output, cache_hit=False, cost=real_cost,

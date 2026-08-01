@@ -12,6 +12,16 @@ analysis. There is no code path that returns a partially-valid
 case to be present, and an unsupported claim anywhere is exactly as
 disqualifying as a citation to a fact that was never collected.
 
+`MalformedResponse` (a NARROWER subclass of `AnalysisRefused`, review
+finding, 2026-08-01) is raised ONLY when the reply cannot be parsed as
+JSON at all -- every other refusal in this module (missing key, empty
+bear case, bad citation, failed period attribution) validates an
+already-well-formed JSON object and is treated by `agent.analysis.
+run_analysis` as a reproducible property of the document, safe to cache
+against its `CacheKey`. `MalformedResponse` is not: a truncated or
+dropped reply says nothing reliable about the document, so it is never
+cached -- see that module's own docstring.
+
 CITATION FORMAT: `<fact_id>` (matches a key in the `citation_index`
 `agent.analysis_prompt.build_analysis_prompt` returned), or `<fact_id>
 #L<n>` / `<fact_id>#L<n>-L<m>` for a `filing_document` fact, pointing at
@@ -102,6 +112,22 @@ _CITATION_RE = re.compile(r"^([0-9a-f]{16})(?:#L(\d+)(?:-L(\d+))?)?$")
 class AnalysisRefused(Exception):
     """The analysis as a whole is refused -- never a partial acceptance.
     The message names exactly which check failed."""
+
+
+class MalformedResponse(AnalysisRefused):
+    """A NARROWER refusal: the response could not even be parsed as JSON.
+    This is deliberately a DIFFERENT case from every other `AnalysisRefused`
+    below (missing key, empty bear case, bad citation, failed period
+    attribution) -- those are validation failures over an already-parsed,
+    well-formed JSON object, and are treated as a reproducible property of
+    the (document, prompt_version, model_id, schema_version) tuple, safe to
+    cache. A non-JSON reply -- truncated mid-stream, a dropped connection,
+    any other transport-level fluke -- says nothing reliable about the
+    document at all, and `agent.analysis.run_analysis` never caches this
+    subclass against a document's CacheKey: doing so would permanently
+    poison a filing over one bad call. Still a plain `AnalysisRefused` to
+    every existing caller that catches the base class -- this is an
+    additional, narrower signal, not a different refusal path."""
 
 
 @dataclass(frozen=True)
@@ -223,7 +249,7 @@ def parse_analysis_output(raw_json: str, *, citation_index: dict, view: AsOfView
     try:
         payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
-        raise AnalysisRefused(f"response is not valid JSON: {exc}") from None
+        raise MalformedResponse(f"response is not valid JSON: {exc}") from None
 
     _require(isinstance(payload, dict), "response must be a JSON object")
     for key in ("bull_case", "bear_case", "contradicting_evidence", "confidence"):
