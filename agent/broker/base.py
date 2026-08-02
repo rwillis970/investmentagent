@@ -49,7 +49,8 @@ from decimal import Decimal
 from enum import Enum
 
 from ..accounts import BrokerCredentials, CrossAccountError
-from ..approval import ApprovalToken, order_fingerprint
+from ..approval import (ApprovalToken, verify_minimum_display_time,
+                        verify_modification_within_bounds)
 from ..pipeline import StagedOrder
 from ..policy import Gate, TradeCapabilityPolicy
 
@@ -478,14 +479,33 @@ class BrokerAdapter(ABC):
                 raise MissingApproval(
                     "cannot validate the approved price band without a reference price"
                 )
-            # Consumed atomically here: a retry, replay or restart cannot reuse it.
-            approval_token.consume(
-                fingerprint=order_fingerprint(
-                    symbol=staged.symbol, side=staged.side, qty=staged.authorized_qty,
-                    order_type=staged.order_type, time_in_force=staged.time_in_force,
-                    limit_price=staged.limit_price, lot_id=staged.lot_id),
-                price=price, now=self.clock(),
+            now = self.clock()
+            # §10, unattended wiring unit (2026-08-01): both checks enforced
+            # HERE, where the token is consumed -- not trusted from whatever
+            # assembled `staged` or from ApprovalService.approve()'s own
+            # earlier, UI-reported check. verify_modification_within_bounds
+            # allows `staged` to be a reduced/adversely-limited version of
+            # what was approved (§10's "modify within bounds"); anything else
+            # raises OrderMismatch, same as an exact-fingerprint failure.
+            # verify_minimum_display_time re-derives elapsed time from the
+            # token's own server-recorded shown_at, independent of anything
+            # a UI claimed at approve() time.
+            verify_modification_within_bounds(
+                approval_token, symbol=staged.symbol, side=staged.side,
+                qty=staged.authorized_qty, order_type=staged.order_type,
+                time_in_force=staged.time_in_force, limit_price=staged.limit_price,
+                lot_id=staged.lot_id,
             )
+            verify_minimum_display_time(approval_token, now=now)
+            # Consumed atomically here: a retry, replay or restart cannot
+            # reuse it. The fingerprint consumed is always the token's OWN
+            # (i.e. the originally-approved order's) fingerprint -- the real
+            # verification against the ACTUAL (possibly modified) `staged`
+            # order already happened above; `consume`'s own exact-match
+            # check is retained unchanged as a second, independent guard
+            # (see agent.approval.ApprovalToken.consume's own docstring).
+            approval_token.consume(fingerprint=approval_token.order_fingerprint,
+                                   price=price, now=now)
 
         return self._submit_impl(staged)
 

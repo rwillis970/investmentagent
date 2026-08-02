@@ -204,6 +204,7 @@ from .holding import HoldingPolicyRegistry
 from .ledger import CashAdjustment, Fill
 from .ledger_store import LedgerStore
 from .mode_store import ModeStore
+from .pipeline_stage import PipelineCycleResult, PipelineRuntime, run_pipeline_stage
 from .startup import AccountReconciliation, StartupResult, run_startup
 
 LOGGER_NAME = "investmentagent.run_loop"
@@ -237,6 +238,9 @@ class CycleReport:
     new_cash_adjustments: dict[str, tuple[CashAdjustment, ...]]
     reconciliations: tuple[AccountReconciliation, ...]
     result: StartupResult
+    # Unattended wiring unit (2026-08-01): `None` unless `pipeline` was
+    # given to `run_cycle` -- see that parameter's own docstring.
+    pipeline_result: PipelineCycleResult | None = None
 
 
 def in_session_now(now: datetime) -> bool:
@@ -317,18 +321,41 @@ def run_cycle(*, accounts: list[AccountRuntime],
              mode_store: ModeStore, audit_log: AuditLog,
              approval_service: ApprovalService, target_mode: str,
              confirmed: bool = False, now: datetime,
-             logger: logging.Logger | None = None) -> CycleReport:
+             logger: logging.Logger | None = None,
+             pipeline: PipelineRuntime | None = None,
+             last_collected_at: datetime | None = None,
+             last_screened_at: datetime | None = None,
+             run_id: str = "") -> CycleReport:
     """One cycle: per account, construct the adapter/store/guard, sync
     fills, build a real AccountReconciliation -- then run_startup ONCE for
     every account together, then log. Raises whatever any step raises
     (CrossAccountError, SyncFillsError, any StartupHalted subclass, a
     broker TransportError, a SecretNotFoundError...); nothing here is
     caught -- see run_loop's own docstring for why that is deliberate and
-    wider than only a StartupHalted."""
+    wider than only a StartupHalted.
+
+    `pipeline` (unattended wiring unit, 2026-08-01): `None` (the default)
+    means exactly today's behaviour -- no collection, no screening, no T4,
+    no approval request, `pipeline_result` on the returned `CycleReport` is
+    `None`. When given, the collection -> screening -> T4 -> approval-
+    request stage (`agent.pipeline_stage.run_pipeline_stage`) runs ONCE,
+    AFTER `run_startup` succeeds for every account this cycle -- a halted
+    cycle never reaches it (fail-safe). `last_collected_at`/
+    `last_screened_at` are threaded through and echoed back (possibly
+    updated) on `CycleReport.pipeline_result` for `run_loop` to carry
+    across iterations -- see `agent.pipeline_stage`'s own module docstring
+    for why this is not new durable state. Every new stage `pipeline`
+    could run is independently flagged and defaults to off (`agent.config.
+    Config.data_collection_enabled`/`materiality_screen_enabled`/
+    `t4_analysis_enabled`/`approval_request_enabled`) -- see agent.
+    pipeline_stage's own module docstring for the full money-guardrail
+    reasoning."""
     log = logger or logging.getLogger(LOGGER_NAME)
     new_fills: dict[str, tuple[Fill, ...]] = {}
     new_cash_adjustments: dict[str, tuple[CashAdjustment, ...]] = {}
     reconciliations: list[AccountReconciliation] = []
+    primary_ledger = None   # the FIRST account's Ledger -- see agent.pipeline_stage's
+                            # own module docstring for why only one account feeds Unit 4.
 
     for acct in accounts:
         # "Resolve credentials" has no separate call here -- constructing
@@ -391,6 +418,8 @@ def run_cycle(*, accounts: list[AccountRuntime],
             day_trade_guard=guard, now=now,
         )
         reconciliations.append(recon)
+        if primary_ledger is None:
+            primary_ledger = store.to_ledger()
 
     result = run_startup(
         target_mode=target_mode, confirmed=confirmed, audit_log=audit_log,
@@ -402,9 +431,25 @@ def run_cycle(*, accounts: list[AccountRuntime],
               new_cash_adjustments=new_cash_adjustments,
               reconciliations=tuple(reconciliations), result=result)
 
+    pipeline_result = None
+    if pipeline is not None:
+        # AFTER run_startup succeeds -- a halted cycle raises out of
+        # run_startup above and never reaches here (fail-safe: no new
+        # opinions form from an untrusted cycle).
+        primary_recon = reconciliations[0] if reconciliations else None
+        pipeline_result = run_pipeline_stage(
+            pipeline, now=now, mode=result.mode,
+            last_collected_at=last_collected_at, last_screened_at=last_screened_at,
+            ledger=primary_ledger,
+            broker_account=primary_recon.broker_account if primary_recon else None,
+            broker_positions=primary_recon.broker_positions if primary_recon else (),
+            run_id=run_id,
+        )
+
     return CycleReport(now=now, new_fills=new_fills,
                        new_cash_adjustments=new_cash_adjustments,
-                       reconciliations=tuple(reconciliations), result=result)
+                       reconciliations=tuple(reconciliations), result=result,
+                       pipeline_result=pipeline_result)
 
 
 def run_loop(*, accounts: list[AccountRuntime],
@@ -415,7 +460,8 @@ def run_loop(*, accounts: list[AccountRuntime],
             now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
             sleep_fn: Callable[[float], None] = time.sleep,
             logger: logging.Logger | None = None,
-            max_cycles: int | None = None) -> None:
+            max_cycles: int | None = None,
+            pipeline: PipelineRuntime | None = None) -> None:
     """The scheduled loop. Runs `run_cycle` only when `in_session_now(now)`
     -- never overnight, never on a weekend/holiday -- and sleeps exactly
     until the next session's open otherwise, in one `sleep_fn` call, rather
@@ -445,15 +491,28 @@ def run_loop(*, accounts: list[AccountRuntime],
     or a real wait."""
     log = logger or logging.getLogger(LOGGER_NAME)
     cycles_run = 0
+    # Threaded across iterations exactly like `cycles_run` above -- NOT new
+    # durable state, just this loop's own local memory of when collection/
+    # screening last ran, so `run_cycle` (a pure function of its arguments,
+    # per this module's own established discipline) can gate each stage's
+    # cadence without holding hidden state itself. See agent.pipeline_stage's
+    # own module docstring for why losing this across a restart is safe.
+    last_collected_at: datetime | None = None
+    last_screened_at: datetime | None = None
     while max_cycles is None or cycles_run < max_cycles:
         now = now_fn()
         if in_session_now(now):
-            run_cycle(
+            report = run_cycle(
                 accounts=accounts, adapter_factory=adapter_factory,
                 mode_store=mode_store, audit_log=audit_log,
                 approval_service=approval_service, target_mode=target_mode,
                 confirmed=confirmed, now=now, logger=log,
+                pipeline=pipeline, last_collected_at=last_collected_at,
+                last_screened_at=last_screened_at, run_id=f"run-{now.isoformat()}",
             )
+            if report.pipeline_result is not None:
+                last_collected_at = report.pipeline_result.last_collected_at
+                last_screened_at = report.pipeline_result.last_screened_at
             cycles_run += 1
             sleep_for = float(cadence_seconds)
         else:

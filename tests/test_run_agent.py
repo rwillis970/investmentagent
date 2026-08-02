@@ -67,6 +67,12 @@ def test_main_returns_nonzero_and_logs_when_the_loop_raises(tmp_path, caplog):
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
+        "--fact-store-path", str(tmp_path / "facts.jsonl"),
+        "--cost-ledger-path", str(tmp_path / "cost_ledger.jsonl"),
+        "--extraction-cache-path", str(tmp_path / "extraction_cache.jsonl"),
+        "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
+        "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
+        "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -95,6 +101,12 @@ def test_main_calls_run_loop_with_the_configured_cadence_and_mode(tmp_path):
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
+        "--fact-store-path", str(tmp_path / "facts.jsonl"),
+        "--cost-ledger-path", str(tmp_path / "cost_ledger.jsonl"),
+        "--extraction-cache-path", str(tmp_path / "extraction_cache.jsonl"),
+        "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
+        "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
+        "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -113,6 +125,131 @@ def test_main_calls_run_loop_with_the_configured_cadence_and_mode(tmp_path):
     # the adapter is never actually called), just constructed.
     adapter = captured["adapter_factory"](captured["accounts"][0])
     assert adapter.account_id == "acct-a"
+    # UNATTENDED WIRING UNIT (Units 1-4): a real PipelineRuntime is now
+    # ALWAYS passed to run_loop_fn -- not None, and not omitted -- so the
+    # collection/screening/T4/approval-request stage is really reachable
+    # from this real entry point, not merely reachable in theory. See
+    # test_build_pipeline_runtime_the_money_guardrail_defaults_are_off below
+    # for the money-guardrail assertion this deliberately does NOT repeat
+    # here (this test is about run_loop's OWN call shape, not the
+    # runtime's contents).
+    from agent.pipeline_stage import PipelineRuntime
+    assert isinstance(captured["pipeline"], PipelineRuntime)
+
+
+def test_build_pipeline_runtime_the_money_guardrail_defaults_are_off(tmp_path):
+    """`config.example.json` (this fixture's own base) has all four stage
+    flags at their real default, False. `build_pipeline_runtime` must not
+    itself turn any of them on -- it only builds the real collaborators
+    each stage would use IF ITS OWN FLAG were set elsewhere. This is the
+    scripts/run_agent.py-level expression of the same guardrail already
+    covered at the orchestration level in tests/test_pipeline_stage.py's
+    own `test_a_default_runtime_is_a_complete_no_op...`."""
+    from agent import config as config_module
+    from agent.accounts import AccountType
+    from agent.approval import ApprovalService
+    from agent.audit import AuditLog
+    from agent.secrets_provider import InMemorySecretsProvider
+    from datetime import timedelta
+    from scripts.run_agent import build_pipeline_runtime
+
+    cfg = config_module.load(base_config())
+    creds = BrokerCredentials(account_id="acct-a", key_id="k", secret_ref="ref")
+    secrets = InMemorySecretsProvider(mode="PAPER")
+    approval_service = ApprovalService(expiration=timedelta(minutes=30),
+                                       min_display=timedelta(seconds=10), max_per_day=4)
+    pipeline = build_pipeline_runtime(
+        cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
+        account_type=AccountType.TAXABLE, audit_log=AuditLog(),
+        approval_service=approval_service,
+        fact_store_path=tmp_path / "facts.jsonl",
+        cost_ledger_path=tmp_path / "cost_ledger.jsonl",
+        extraction_cache_path=tmp_path / "extraction_cache.jsonl",
+        analysis_result_store_path=tmp_path / "analysis_results.jsonl",
+        approval_request_store_path=tmp_path / "approval_requests.jsonl",
+        opportunity_tracker_path=tmp_path / "opportunity_tracker.jsonl",
+    )
+    assert pipeline.data_collection_enabled is False
+    assert pipeline.materiality_screen_enabled is False
+    assert pipeline.t4_analysis_enabled is False
+    assert pipeline.approval_request_enabled is False
+    # THE ONE FLAG THAT GATES REAL, PAID ANTHROPIC API CALLS: no real
+    # AnthropicModelClient is even constructed while it is off.
+    assert pipeline.model_client is None
+    # every collaborator the (currently-off) stages WOULD use is still a
+    # real, usable object -- constructing them makes no network call by
+    # itself (see build_pipeline_runtime's own docstring).
+    assert pipeline.fact_store is not None
+    assert pipeline.market_data_client is not None
+    assert pipeline.edgar_client is not None
+    assert pipeline.cost_ledger is not None
+    assert pipeline.extraction_cache is not None
+    assert pipeline.result_store is not None
+    assert pipeline.opportunity_tracker is not None
+    assert pipeline.gatekeeper is not None
+    assert pipeline.approval_request_store is not None
+
+
+def test_build_pipeline_runtime_constructs_a_real_anthropic_client_only_when_t4_is_enabled(tmp_path):
+    from agent import config as config_module
+    from agent.accounts import AccountType
+    from agent.approval import ApprovalService
+    from agent.audit import AuditLog
+    from agent.model_client import AnthropicModelClient
+    from agent.secrets_provider import InMemorySecretsProvider
+    from datetime import timedelta
+    from scripts.run_agent import build_pipeline_runtime
+
+    cfg = config_module.load(base_config(t4_analysis_enabled=True))
+    creds = BrokerCredentials(account_id="acct-a", key_id="k", secret_ref="ref")
+    secrets = InMemorySecretsProvider(mode="PAPER")
+    approval_service = ApprovalService(expiration=timedelta(minutes=30),
+                                       min_display=timedelta(seconds=10), max_per_day=4)
+    pipeline = build_pipeline_runtime(
+        cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
+        account_type=AccountType.TAXABLE, audit_log=AuditLog(),
+        approval_service=approval_service,
+        fact_store_path=tmp_path / "facts.jsonl",
+        cost_ledger_path=tmp_path / "cost_ledger.jsonl",
+        extraction_cache_path=tmp_path / "extraction_cache.jsonl",
+        analysis_result_store_path=tmp_path / "analysis_results.jsonl",
+        approval_request_store_path=tmp_path / "approval_requests.jsonl",
+        opportunity_tracker_path=tmp_path / "opportunity_tracker.jsonl",
+    )
+    assert pipeline.t4_analysis_enabled is True
+    assert isinstance(pipeline.model_client, AnthropicModelClient)
+
+
+def test_build_pipeline_runtime_price_band_and_expiration_come_from_the_approval_service(tmp_path):
+    """Not recomputed a second time from cfg -- one number, one source (see
+    build_pipeline_runtime's own docstring)."""
+    from agent import config as config_module
+    from agent.accounts import AccountType
+    from agent.approval import ApprovalService
+    from agent.audit import AuditLog
+    from agent.secrets_provider import InMemorySecretsProvider
+    from datetime import timedelta
+    from scripts.run_agent import build_pipeline_runtime
+
+    cfg = config_module.load(base_config())
+    creds = BrokerCredentials(account_id="acct-a", key_id="k", secret_ref="ref")
+    secrets = InMemorySecretsProvider(mode="PAPER")
+    approval_service = ApprovalService(expiration=timedelta(minutes=17),
+                                       min_display=timedelta(seconds=10), max_per_day=4,
+                                       price_band_pct=2.5)
+    pipeline = build_pipeline_runtime(
+        cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
+        account_type=AccountType.TAXABLE, audit_log=AuditLog(),
+        approval_service=approval_service,
+        fact_store_path=tmp_path / "facts.jsonl",
+        cost_ledger_path=tmp_path / "cost_ledger.jsonl",
+        extraction_cache_path=tmp_path / "extraction_cache.jsonl",
+        analysis_result_store_path=tmp_path / "analysis_results.jsonl",
+        approval_request_store_path=tmp_path / "approval_requests.jsonl",
+        opportunity_tracker_path=tmp_path / "opportunity_tracker.jsonl",
+    )
+    assert pipeline.approval_expiration == timedelta(minutes=17)
+    assert pipeline.price_band_pct == 2.5
 
 
 def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
@@ -136,6 +273,12 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
+        "--fact-store-path", str(tmp_path / "facts.jsonl"),
+        "--cost-ledger-path", str(tmp_path / "cost_ledger.jsonl"),
+        "--extraction-cache-path", str(tmp_path / "extraction_cache.jsonl"),
+        "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
+        "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
+        "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]
@@ -165,6 +308,12 @@ def _argv(tmp_path, config_path):
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
+        "--fact-store-path", str(tmp_path / "facts.jsonl"),
+        "--cost-ledger-path", str(tmp_path / "cost_ledger.jsonl"),
+        "--extraction-cache-path", str(tmp_path / "extraction_cache.jsonl"),
+        "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
+        "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
+        "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -277,6 +426,12 @@ def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
+        "--fact-store-path", str(tmp_path / "facts.jsonl"),
+        "--cost-ledger-path", str(tmp_path / "cost_ledger.jsonl"),
+        "--extraction-cache-path", str(tmp_path / "extraction_cache.jsonl"),
+        "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
+        "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
+        "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]

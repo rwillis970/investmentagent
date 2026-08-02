@@ -310,7 +310,10 @@ def test_live_order_consumes_its_token_exactly_once():
                           order_type=s.order_type, time_in_force=s.time_in_force,
                           limit_price=s.limit_price),
                       price_at_analysis=500.0,
-                      shown_at=T0 - timedelta(seconds=15), now=T0)
+                      shown_at=T0 - timedelta(seconds=15), now=T0,
+                      symbol=s.symbol, side=s.side, qty=s.authorized_qty,
+                      order_type=s.order_type, time_in_force=s.time_in_force,
+                      limit_price=s.limit_price, lot_id=s.lot_id)
     b.submit(s, approval_token=tok)
     assert tok.consumed_at == T0
     s2 = staged(gk, client_order_id="c2")
@@ -370,10 +373,156 @@ def test_live_sell_approved_for_the_correct_lot_still_consumes():
                                     limit_price=100.0, lot_id="l1")
     tok = svc.approve(token_id="t1", request_id="r1", fingerprint=approved_fp,
                       price_at_analysis=100.0,
-                      shown_at=T0 - timedelta(seconds=15), now=T0)
+                      shown_at=T0 - timedelta(seconds=15), now=T0,
+                      symbol="SPY", side="SELL", qty=1.0, order_type="LIMIT",
+                      time_in_force="DAY", limit_price=100.0, lot_id="l1")
     s = make_staged(gk.signing_key, side="SELL", lot_id="l1")   # matches what was approved
     b.submit(s, approval_token=tok)
     assert tok.consumed_at == T0
+
+
+# --------------------------------- modify-within-bounds (§10, unattended unit)
+
+def approved_token(svc, *, symbol="SPY", side="BUY", qty=0.2, order_type="LIMIT",
+                   time_in_force="DAY", limit_price=500.0, lot_id=None,
+                   shown_delta=timedelta(seconds=15)):
+    fp = order_fingerprint(symbol=symbol, side=side, qty=qty, order_type=order_type,
+                           time_in_force=time_in_force, limit_price=limit_price,
+                           lot_id=lot_id)
+    return svc.approve(token_id="t1", request_id="r1", fingerprint=fp,
+                       price_at_analysis=limit_price, shown_at=T0 - shown_delta, now=T0,
+                       symbol=symbol, side=side, qty=qty, order_type=order_type,
+                       time_in_force=time_in_force, limit_price=limit_price, lot_id=lot_id)
+
+
+def test_a_reduced_buy_qty_still_consumes_without_re_approval():
+    """§10: quantity may be REDUCED without re-analysis."""
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, qty=0.2)
+    s = staged(gk, qty=0.1)   # reduced from the approved 0.2
+    b.submit(s, approval_token=tok)
+    assert tok.consumed_at == T0
+
+
+def test_a_buy_limit_moved_down_still_consumes():
+    """§10: a limit price may move ADVERSELY to the trade (lower, for a
+    BUY) without re-analysis."""
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, qty=0.2, limit_price=500.0)
+    s = staged(gk, qty=0.2, limit_price=495.0)   # lower ceiling -- more conservative
+    b.submit(s, approval_token=tok)
+    assert tok.consumed_at == T0
+
+
+def test_an_increased_buy_qty_is_refused_not_silently_authorized():
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, qty=0.2)
+    s = staged(gk, qty=0.3)   # increased -- must invalidate
+    with pytest.raises(OrderMismatch):
+        b.submit(s, approval_token=tok)
+
+
+def test_a_buy_limit_moved_up_is_refused():
+    """§10: moving a BUY limit UP loosens the constraint (willing to pay
+    more) -- this is a favourable move, not an adverse one, and must
+    invalidate rather than silently ride through as a 'modification'."""
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, qty=0.2, limit_price=500.0)
+    s = staged(gk, qty=0.2, limit_price=505.0)
+    with pytest.raises(OrderMismatch):
+        b.submit(s, approval_token=tok)
+
+
+def test_a_sell_limit_moved_up_still_consumes():
+    """§10: for a SELL/CLOSE, moving the limit UP (willing to accept only a
+    higher price) is the adverse-to-the-trade direction and is allowed."""
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, symbol="SPY", side="SELL", qty=1.0, limit_price=100.0,
+                         lot_id="l1")
+    s = make_staged(gk.signing_key, side="SELL", requested_qty=1.0, authorized_qty=1.0,
+                    limit_price=101.0, lot_id="l1")
+    b.submit(s, approval_token=tok)
+    assert tok.consumed_at == T0
+
+
+def test_a_sell_limit_moved_down_is_refused():
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, symbol="SPY", side="SELL", qty=1.0, limit_price=100.0,
+                         lot_id="l1")
+    s = make_staged(gk.signing_key, side="SELL", requested_qty=1.0, authorized_qty=1.0,
+                    limit_price=99.0, lot_id="l1")
+    with pytest.raises(OrderMismatch):
+        b.submit(s, approval_token=tok)
+
+
+def test_changing_symbol_invalidates_even_with_smaller_qty():
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, symbol="SPY", qty=0.2)
+    s = staged(gk, symbol="AAPL", qty=0.1)
+    with pytest.raises(OrderMismatch):
+        b.submit(s, approval_token=tok)
+
+
+# ------------------------ minimum display time re-checked at consumption
+
+def test_minimum_display_time_is_re_checked_at_submission_not_only_at_approve():
+    """§10, unattended wiring unit: `shown_at`/`min_display` are frozen onto
+    the token at mint time from data ApprovalService.approve() itself
+    received -- not from whatever the caller of submit() claims. A token
+    minted with a long-enough elapsed time at approve() but consumed too
+    soon after (here: consumed at the SAME instant it was minted) must
+    still be refused at submission."""
+    b, gk = broker(live=True, now=T0)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, qty=0.2, shown_delta=timedelta(seconds=15))
+    # Simulate a broker clock that is somehow only fractionally after
+    # shown_at (e.g. a clock skew, or a caller that fabricated `now` at
+    # approve() time) by directly rewinding the token's own shown_at to
+    # just before "now" -- proving the check reads the token's OWN stored
+    # value, not a value recomputed from anything the submit() caller
+    # supplies (submit() supplies nothing display-time-related at all).
+    tok.shown_at = T0 - timedelta(seconds=2)
+    s = staged(gk, qty=0.2)
+    with pytest.raises(Exception, match="minimum is 10s"):
+        b.submit(s, approval_token=tok)
+    assert tok.consumed_at is None
+
+
+def test_a_pre_unit_token_with_no_shown_at_is_not_retroactively_broken():
+    """Backward compatibility: a token minted without the new shown_at/
+    min_display fields (both default None) must not fail this new check --
+    see verify_minimum_display_time's own docstring."""
+    b, gk = broker(live=True)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    s = staged(gk, qty=0.2)
+    tok = svc.approve(token_id="t1", request_id="r1",
+                      fingerprint=order_fingerprint(symbol="SPY", side="BUY", qty=0.2,
+                                                    order_type="LIMIT", time_in_force="DAY",
+                                                    limit_price=500.0),
+                      price_at_analysis=500.0, shown_at=T0 - timedelta(seconds=15), now=T0)
+    tok.shown_at = None
+    tok.min_display = None
+    with pytest.raises(OrderMismatch):
+        # original_* fields are still empty defaults on this legacy-shaped
+        # token, so this still correctly refuses -- but via OrderMismatch,
+        # never via the (skipped) display-time check.
+        b.submit(s, approval_token=tok)
 
 
 # ----------------------------------------------------------------- audit

@@ -15,6 +15,7 @@ from . import mode as mode_fsm
 from .durations import parse_duration
 from .materiality import DEFAULT_FILING_WEIGHTS, MaterialityPolicy
 from .policy import CapabilityStatus, TradeCapabilityPolicy
+from .risk import RiskPolicy
 
 # The single source of truth for legal mode values is agent.mode -- keeping
 # a second, independent tuple here is exactly how the two drift apart. §9.2
@@ -127,6 +128,23 @@ class Config:
     # this one governs only sync_fills + reconciliation + run_startup, the
     # one loop that exists today.
     reconciliation_cycle_interval_seconds: int = 300
+
+    # UNATTENDED WIRING UNIT (2026-08-01), MONEY GUARDRAIL. Every new
+    # pipeline stage wired into `agent.run_loop.run_cycle` this unit gets
+    # its own flag, defaulting to False in BOTH this class and
+    # config.example.json -- an operator must explicitly opt in to each
+    # stage, one at a time, rather than a single commit silently turning on
+    # collection, screening, real model spend and approval-request creation
+    # together the next time the launchd job restarts. `t4_analysis_enabled`
+    # is the one that gates real, paid Anthropic API calls -- see agent/
+    # analysis_trigger.py and agent/run_loop.py's own module docstring for
+    # exactly what each flag gates. NONE of these default True; changing
+    # that default is a decision for whoever runs the pilot, made in their
+    # own config.json, never in this commit.
+    data_collection_enabled: bool = False
+    materiality_screen_enabled: bool = False
+    t4_analysis_enabled: bool = False
+    approval_request_enabled: bool = False
 
     approval_expiration_minutes: int = 30
     approval_min_display_seconds: int = 10
@@ -325,6 +343,21 @@ class Config:
     # broker rate, a conservative placeholder pending more observed fees.
     cat_fee_auto_admit_ceiling: float = 0.05
 
+    # Approval-card tax figures (§10, unattended wiring unit, 2026-08-01).
+    # `None`, not a guessed bracket: this codebase has no source for the
+    # operator's own marginal tax rate anywhere (checked directly -- no
+    # tax_rate/bracket field exists before this commit), and short-term vs
+    # long-term US capital-gains rates depend on the operator's total
+    # income, filing status and state, none of which this pilot collects.
+    # Inventing a number (e.g. "assume 24%") would be exactly the kind of
+    # confident-but-unconfirmed figure this codebase's own edgar_user_agent/
+    # cat_fee_auto_admit_ceiling precedent refuses to do -- see agent/
+    # approval_trigger.py for how a `None` rate surfaces on the card (the
+    # character and realised gain are always shown; the dollar tax estimate
+    # is shown only if the operator sets a real rate here).
+    estimated_short_term_tax_rate: float | None = None
+    estimated_long_term_tax_rate: float | None = None
+
     trade_capabilities: dict = field(default_factory=dict)
     sides: dict = field(default_factory=dict)
     funding: dict = field(default_factory=dict)
@@ -407,6 +440,24 @@ class Config:
             w5=self.materiality_w5, w6=self.materiality_w6,
             threshold=self.materiality_threshold,
             filing_weights=self.materiality_filing_weights,
+        )
+
+    @property
+    def risk_policy(self) -> RiskPolicy:
+        """ADDED (unattended wiring unit, Unit 4): the one input `agent.
+        pipeline.Gatekeeper` needs that this class did not already expose as
+        a property -- `capability_policy`/`materiality_policy` above are the
+        existing precedent for "derive the real policy object from this
+        dataclass's own fields, once, here" rather than reassembling it by
+        hand at every call site (`scripts/run_agent.py`, and any future one).
+        `version="config"` matches `capability_policy`'s own choice for the
+        same reason: this policy IS the config, not a separately-versioned
+        artifact."""
+        return RiskPolicy(
+            version="config", max_position_pct=self.max_position_pct,
+            max_sector_pct=self.max_sector_pct,
+            min_settled_cash_pct_of_nlv=self.minimum_settled_cash_pct_of_nlv,
+            min_absolute_settled_cash=self.minimum_absolute_settled_cash,
         )
 
 
@@ -655,6 +706,11 @@ def validate(cfg: Config) -> None:
 
     if cfg.cat_fee_auto_admit_ceiling <= 0:
         err.append("cat_fee_auto_admit_ceiling must be positive")
+
+    for name in ("estimated_short_term_tax_rate", "estimated_long_term_tax_rate"):
+        val = getattr(cfg, name)
+        if val is not None and not 0.0 <= val <= 1.0:
+            err.append(f"{name} must be between 0.0 and 1.0, or None")
 
     caps = cfg.capability_policy
     # Every dimension must be populated. TradeCapabilityPolicy default-denies,

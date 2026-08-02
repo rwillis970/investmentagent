@@ -231,6 +231,25 @@ day: as the count approaches the cap, the effective bar rises, so the last analy
 day are spent on genuinely larger events. Re-calibration is a weekly job and is logged as
 a policy version, because changing the threshold changes what the system trades.
 
+**"Already handled" (unattended wiring unit, Unit 2).** The trigger conjunction above runs on
+a cadence and the underlying evidence store is append-only, so the SAME still-most-recent
+filing produces the SAME conjunction result — and, without a tracker, would re-trigger every
+single screening cycle until a genuinely newer filing supersedes it. `agent.
+opportunity_event_tracker.OpportunityEventTracker` is a small, durable, append-only store
+keyed on `OpportunityEvent.event_id` itself, not a separately-derived `(symbol,
+accession_number)` pair: for a `FILING`-typed event, `event_id` is already deterministically
+built as `f"{source_id}:{symbol}:{observed_at.isoformat()}"`, where `observed_at` is the
+filing's own EDGAR-acceptance timestamp — stable for "the same" filing across every cycle
+that re-screens it, and only ever different once a genuinely newer filing has actually been
+accepted. An event is marked handled only on a terminal, non-retryable outcome — a persisted
+`AnalysisResult` (outcome `"analyzed"`) or an `AnalysisRefused` (outcome `"refused"`) — never
+on `BudgetExceeded`, because budget exhaustion is a fact about today's spend, not a fact about
+the document, and the same event must remain eligible once `CostLedger.analyses_today` resets.
+A `PRICE_MOVE`-typed event is never handed to T4 at all regardless of this tracker (§3.3 below
+has no document to analyze for one), so marking one handled would accomplish nothing: its
+`event_id` embeds `observed_at=now`, fresh by construction on every cycle, with no "same event"
+concept for the tracker to even recognize.
+
 ### 3.3 Event-driven prompt requirements
 
 Adopted as specified. Each approval request states why it is time-sensitive, carries
@@ -1119,7 +1138,45 @@ decision:
 Modify-within-bounds is supported as specified: quantity or notional may be reduced, and a
 limit price may be moved adversely to the trade, both without re-analysis. Any change that
 increases size, loosens the limit or alters the instrument invalidates the card and requires
-a fresh decision — otherwise "modify" becomes a bypass of the risk constrainer.
+a fresh decision — otherwise "modify" becomes a bypass of the risk constrainer. Enforced where
+the token is consumed (`BrokerAdapter.submit`, `agent/broker/base.py`), not at the UI: the
+signed `ApprovalToken` now carries the original approved order's own `symbol`/`side`/`qty`/
+`order_type`/`time_in_force`/`limit_price`/`lot_id` in the clear (a one-way fingerprint hash
+cannot support a "is this smaller order a conservative subset" comparison), and
+`verify_modification_within_bounds` re-checks the order actually being submitted against those
+fields immediately before the existing, unchanged `ApprovalToken.consume()` call — a caller
+that skips this check cannot reach `consume()` at all in this codebase's real submit path.
+
+**Sibling invalidation (unattended wiring unit, Unit 4).** With two or more approval requests
+pending for the same account, each one's post-trade figures (reserve, concentration, sector
+exposure, earliest normal exit, day-trade count) were computed assuming every OTHER pending
+request would be rejected — approving one makes every sibling's displayed figures wrong the
+instant it fills. This codebase's `agent.approval_request_store.ApprovalRequestStore` resolves
+this by INVALIDATING every other pending request for the same account the moment one is
+approved (never on a rejection — a rejected request changes nothing about the book), rather
+than recomputing the survivors' figures in place. Recomputing was rejected: it risks a human
+approving a card whose numbers silently changed after they read it, and the risk of an
+operator acting on stale-but-still-displayed figures is worse than the cost of asking them to
+look again. This also matches this codebase's own existing precedent elsewhere in this same
+section — a stale quote invalidates a token, and an out-of-bounds modification invalidates a
+card — both are "ask again" outcomes, not "silently correct it for you" ones. An invalidated
+sibling carries `invalidated_reason=f"sibling_approved:{request_id}"`, naming which approval
+invalidated it; invalidating an already-decided sibling is refused (nothing to invalidate),
+and invalidating an already-invalidated one is a no-op, not an error.
+
+**Friction is enforced server-side (§10, unattended wiring unit, Unit 5), not by the UI.** Both
+of §10's friction requirements — a card younger than the configured minimum display time
+cannot be approved, and `decision_elapsed_ms` is logged on every decision — are re-checked at
+the same point modify-within-bounds is: at token consumption
+(`agent.approval.verify_minimum_display_time`, called from `BrokerAdapter.submit`), using
+`shown_at`/`min_display` recorded onto the `ApprovalToken` server-side at mint time, not a
+value a UI reports back. A UI that never rendered the friction delay, or that lies about how
+long a card was on screen, cannot shorten it: submission re-derives the elapsed time from the
+server's own clock at minting. `decision_elapsed_ms` is computed by
+`agent.approval_request_store.ApprovalRequestStore.decide` from its own server-recorded
+`shown_at`, for BOTH `APPROVED` and `REJECTED` decisions — closing a gap in the pre-Unit-4
+`ApprovalService`, which only ever logged elapsed time for an approval, since only an approval
+minted a token.
 
 ---
 

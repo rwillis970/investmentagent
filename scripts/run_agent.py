@@ -195,22 +195,36 @@ from agent import config as config_module
 from agent import failure_sentinel
 from agent import market_calendar
 from agent import mode as mode_fsm
-from agent.accounts import BrokerCredentials
+from agent.accounts import AccountType, BrokerCredentials
 from agent.approval import ApprovalService
+from agent.approval_request_store import ApprovalRequestStore
 from agent.audit import AuditLog
 from agent.broker.alpaca import AlpacaPaperAdapter
+from agent.broker.alpaca_market_data import AlpacaMarketDataClient
 from agent.broker.base import BrokerAdapter
 from agent.cash_event_quarantine import (CashEventQuarantineError,
                                          CashEventQuarantineStore,
                                          refuse_admission_reason)
+from agent.analysis_cache import ExtractionCache
+from agent.analysis_result_store import AnalysisResultStore
+from agent.cost import CostLedger
+from agent.daytrade import DayTradeGuard
+from agent.edgar import EdgarClient
+from agent.edgar_collector import TickerCikCache
 from agent.execution_quarantine import ExecutionQuarantineError, ExecutionQuarantineStore
+from agent.extraction_store import ExtractionCacheStore
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger_store import read_opening_balance_established_at
 from agent.mode_store import ModeStore
+from agent.model_client import AnthropicModelClient, ModelClient
 from agent.money import to_decimal
+from agent.opportunity_event_tracker import OpportunityEventTracker
+from agent.pipeline import Gatekeeper
+from agent.pipeline_stage import PipelineRuntime
 from agent.run_loop import AccountRuntime, run_loop as real_run_loop
 from agent.secrets_provider import KeychainSecretsProvider, SecretsProvider
 from agent.startup import _reconcile_mode_persistence
+from agent.store import FactStore
 
 LOGGER_NAME = "investmentagent.run_loop"
 
@@ -271,6 +285,140 @@ def build_account_runtime(cfg: config_module.Config, *, account_id: str,
         cash_quarantine_store_path=cash_quarantine_store_path, policy_registry=registry,
         max_day_trades_per_5_sessions=cfg.max_day_trades_per_5_sessions,
         cat_fee_auto_admit_ceiling=to_decimal(cfg.cat_fee_auto_admit_ceiling),
+    )
+
+
+def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
+                          credentials: BrokerCredentials,
+                          secrets_provider: SecretsProvider,
+                          account_type: AccountType,
+                          audit_log: AuditLog,
+                          approval_service: ApprovalService,
+                          fact_store_path: str | Path,
+                          cost_ledger_path: str | Path,
+                          extraction_cache_path: str | Path,
+                          analysis_result_store_path: str | Path,
+                          approval_request_store_path: str | Path,
+                          opportunity_tracker_path: str | Path) -> PipelineRuntime:
+    """Constructs the real `agent.pipeline_stage.PipelineRuntime` this
+    unattended unit's own MONEY GUARDRAIL requires: every one of the four
+    stage flags below is read straight from `cfg` (defaulting False, per
+    agent/config.py's own docstring) -- this function does not itself turn
+    anything on, it only builds the real collaborators each stage would use
+    IF its own flag is set. A fresh checkout with a fresh config.json
+    therefore still makes zero new collector calls, zero screening
+    decisions, zero model calls and zero approval requests, exactly as
+    before this unit, until an operator edits config.json.
+
+    STORES ARE SHARED, NOT PER-ACCOUNT (see agent/pipeline_stage.py's own
+    module docstring) -- `fact_store`/`cost_ledger`/`extraction_cache`/
+    `result_store`/`opportunity_tracker` are process-global concepts in
+    this codebase already (`agent.materiality_cycle`/`agent.cost.CostLedger`
+    were never scoped per account either); `approval_request_store` and
+    `gatekeeper` are keyed to THIS account because Unit 4's own approval
+    path uses the first reconciled account's ledger/broker state each
+    cycle -- this script constructs exactly one account's worth (see this
+    script's own "no accounts-roster file format" limitation, noted in the
+    module docstring), so "this account" and "the first account" are the
+    same account here.
+
+    `account_type` has no existing source anywhere in this codebase
+    (checked directly: `agent.config.Config` has no such field, and this
+    pilot's own real deployment is a single taxable account -- see
+    tests/test_approval_trigger.py's own `ACCT = "acct-taxable"`) -- it is
+    a new, required CLI flag (`--account-type`, default "TAXABLE") on this
+    script, not invented here.
+
+    `AlpacaMarketDataClient`/`EdgarClient` are constructed UNCONDITIONALLY,
+    the same posture `_real_adapter_factory` already takes for
+    `AlpacaPaperAdapter` (constructed regardless of whether any given cycle
+    ends up calling it) -- constructing a client makes no network call by
+    itself, and this script already requires a PAPER-bound
+    `secrets_provider` structurally (see module docstring's "DOES THE SAME
+    DEAD END EXIST" sections), so there is no mode under which
+    `AlpacaMarketDataClient`'s own PAPER-only construction guard could fire
+    here that the real adapter would not already have refused first.
+
+    `AnthropicModelClient` IS THE ONE EXCEPTION -- constructed ONLY when
+    `cfg.t4_analysis_enabled` is true, specifically so that inspecting this
+    script's own behaviour (or a future refactor) never finds a
+    fully-built, ready-to-call real Anthropic client sitting in memory on a
+    process where the money guardrail flag is off; `None` otherwise, which
+    `PipelineRuntime.model_client` already accepts (`_analyze_and_request`
+    is never reached when `t4_analysis_enabled` is false, so `None` is
+    never dereferenced).
+
+    `price_band_pct`/`approval_expiration` are read OFF THE ALREADY-
+    CONSTRUCTED `approval_service`, not recomputed a second time from
+    `cfg` here -- one number, one source, matching `agent.approval.
+    ApprovalService`'s own fields exactly rather than risking a second,
+    independently-hardcoded value drifting from the first."""
+    market_data_client = AlpacaMarketDataClient(
+        credentials=credentials, secrets_provider=secrets_provider,
+        feed=cfg.market_data_feed,
+        http_timeout_seconds=cfg.market_data_http_timeout_seconds,
+        http_max_retries=cfg.market_data_http_max_retries,
+    )
+    edgar_client = EdgarClient(
+        user_agent=cfg.edgar_user_agent,
+        http_timeout_seconds=cfg.edgar_http_timeout_seconds,
+        http_max_retries=cfg.edgar_http_max_retries,
+        min_request_interval_seconds=cfg.edgar_min_request_interval_seconds,
+    )
+    cost_ledger = CostLedger(monthly_budget=cfg.monthly_budget_usd,
+                            warning_at=cfg.budget_warning_usd,
+                            hard_stop_at=cfg.budget_hard_stop_usd, path=cost_ledger_path)
+    model_client: ModelClient | None = None
+    if cfg.t4_analysis_enabled:
+        model_client = AnthropicModelClient(model_id=cfg.t4_model_id,
+                                            secrets_provider=secrets_provider)
+    gatekeeper = Gatekeeper(
+        account_id=account_id, account_type=account_type,
+        capability_policy=cfg.capability_policy, risk_policy=cfg.risk_policy,
+        day_trade_guard=DayTradeGuard(account_id=account_id,
+                                      max_per_5_sessions=cfg.max_day_trades_per_5_sessions),
+        live=cfg.mode == "PRODUCTION_ACTIVE",
+    )
+    return PipelineRuntime(
+        data_collection_enabled=cfg.data_collection_enabled,
+        data_collection_interval_seconds=cfg.data_collection_interval_seconds,
+        fact_store=FactStore(fact_store_path),
+        market_data_client=market_data_client,
+        edgar_client=edgar_client,
+        ticker_cik_cache=TickerCikCache(),
+        ticker_cik_refresh_max_age=timedelta(
+            hours=cfg.edgar_ticker_cik_refresh_interval_hours),
+        materiality_screen_enabled=cfg.materiality_screen_enabled,
+        opportunity_screen_interval_seconds=cfg.opportunity_screen_interval_minutes * 60,
+        symbol_universe=cfg.symbol_universe,
+        materiality_policy=cfg.materiality_policy,
+        capability_policy=cfg.capability_policy,
+        cost_ledger=cost_ledger,
+        max_model_analyses_per_day=cfg.max_model_analyses_per_day,
+        max_approval_requests_per_day=cfg.max_approval_requests_per_day,
+        min_peer_group_size=cfg.materiality_min_peer_group_size,
+        opportunity_tracker=OpportunityEventTracker(opportunity_tracker_path),
+        live=cfg.mode == "PRODUCTION_ACTIVE",
+        t4_analysis_enabled=cfg.t4_analysis_enabled,
+        model_client=model_client,
+        extraction_cache=ExtractionCacheStore(extraction_cache_path),
+        result_store=AnalysisResultStore(analysis_result_store_path),
+        t4_model_id=cfg.t4_model_id,
+        t4_input_price_per_million_tokens=cfg.t4_input_price_per_million_tokens,
+        t4_output_price_per_million_tokens=cfg.t4_output_price_per_million_tokens,
+        t4_max_output_tokens=cfg.t4_max_output_tokens,
+        edgar_document_max_bytes=cfg.edgar_document_max_bytes,
+        approval_request_enabled=cfg.approval_request_enabled,
+        gatekeeper=gatekeeper,
+        approval_request_store=ApprovalRequestStore(approval_request_store_path),
+        audit_log=audit_log,
+        approval_expiration=approval_service.expiration,
+        price_band_pct=approval_service.price_band_pct,
+        max_position_pct=cfg.max_position_pct,
+        minimum_holding_period=cfg.minimum_hold,
+        account_type=account_type,
+        estimated_short_term_tax_rate=cfg.estimated_short_term_tax_rate,
+        estimated_long_term_tax_rate=cfg.estimated_long_term_tax_rate,
     )
 
 
@@ -599,6 +747,56 @@ def _parse_args(argv: list[str] | None):
                              "execution_quarantine.py) -- survives a restart; required "
                              "unless --advance-mode-to is given. Also required, alongside "
                              "--account-id, for --admit-execution/--reject-execution.")
+    parser.add_argument("--fact-store-path",
+                        help="durable agent.store.FactStore file the collection/screening "
+                             "pipeline (Units 1-3, unattended wiring unit) reads and writes -- "
+                             "required unless --advance-mode-to/--admit-execution/"
+                             "--reject-execution/--admit-cash-event/--reject-cash-event is "
+                             "given. Harmless if the collection/screening flags are off: the "
+                             "store is still constructed (see agent.pipeline_stage's own "
+                             "money-guardrail docstring), just never written to.")
+    parser.add_argument("--cost-ledger-path",
+                        help="durable agent.cost.CostLedger file -- the SAME ledger the §8.2 "
+                             "hard stop and the T3 w6 budget brake both read, so a restart "
+                             "does not reset month-to-date spend. Required unless "
+                             "--advance-mode-to/--admit-execution/--reject-execution/"
+                             "--admit-cash-event/--reject-cash-event is given.")
+    parser.add_argument("--extraction-cache-path",
+                        help="durable agent.extraction_store.ExtractionCacheStore file -- so "
+                             "a restart does not re-pay for a document already analysed. "
+                             "SHARED across accounts (see agent.pipeline_stage's own module "
+                             "docstring). Required unless --advance-mode-to/"
+                             "--admit-execution/--reject-execution/--admit-cash-event/"
+                             "--reject-cash-event is given.")
+    parser.add_argument("--analysis-result-store-path",
+                        help="durable agent.analysis_result_store.AnalysisResultStore file -- "
+                             "one row per real T4 analysis call. SHARED across accounts. "
+                             "Required unless --advance-mode-to/--admit-execution/"
+                             "--reject-execution/--admit-cash-event/--reject-cash-event is "
+                             "given.")
+    parser.add_argument("--approval-request-store-path",
+                        help="durable agent.approval_request_store.ApprovalRequestStore file "
+                             "(Unit 4, unattended wiring unit) -- one row per approval request "
+                             "this account's analyses produced, including suppressed/"
+                             "invalidated ones. Required unless --advance-mode-to/"
+                             "--admit-execution/--reject-execution/--admit-cash-event/"
+                             "--reject-cash-event is given.")
+    parser.add_argument("--opportunity-tracker-path",
+                        help="durable agent.opportunity_event_tracker.OpportunityEventTracker "
+                             "file (Unit 2, unattended wiring unit) -- which OpportunityEvents "
+                             "have already been screened/analysed, so a restart does not "
+                             "re-trigger the same filing forever. Required unless "
+                             "--advance-mode-to/--admit-execution/--reject-execution/"
+                             "--admit-cash-event/--reject-cash-event is given.")
+    parser.add_argument("--account-type", default="TAXABLE",
+                        choices=[t.value for t in AccountType],
+                        help="this account's tax treatment -- feeds agent.pipeline."
+                             "Gatekeeper and the approval card's tax figures (Unit 4). "
+                             "Defaults to TAXABLE, this pilot's actual real account "
+                             "(agent.config has no field for this; every existing test "
+                             "fixture in this codebase already assumes a single taxable "
+                             "account -- see e.g. tests/test_approval_trigger.py's own "
+                             "ACCT = \"acct-taxable\").")
     parser.add_argument("--cash-quarantine-store-path",
                         help="durable CashEventQuarantineStore file (agent/"
                              "cash_event_quarantine.py) -- survives a restart; required "
@@ -692,6 +890,12 @@ def _parse_args(argv: list[str] | None):
             ("--ledger-store-path", args.ledger_store_path),
             ("--quarantine-store-path", args.quarantine_store_path),
             ("--cash-quarantine-store-path", args.cash_quarantine_store_path),
+            ("--fact-store-path", args.fact_store_path),
+            ("--cost-ledger-path", args.cost_ledger_path),
+            ("--extraction-cache-path", args.extraction_cache_path),
+            ("--analysis-result-store-path", args.analysis_result_store_path),
+            ("--approval-request-store-path", args.approval_request_store_path),
+            ("--opportunity-tracker-path", args.opportunity_tracker_path),
         ) if val is None]
         if missing:
             parser.error(
@@ -782,6 +986,18 @@ def main(argv: list[str] | None = None, *,
             min_display=timedelta(seconds=cfg.approval_min_display_seconds),
             max_per_day=cfg.max_approval_requests_per_day,
         )
+        pipeline = build_pipeline_runtime(
+            cfg, account_id=args.account_id, credentials=credentials,
+            secrets_provider=secrets_provider,
+            account_type=AccountType(args.account_type),
+            audit_log=audit_log, approval_service=approval_service,
+            fact_store_path=args.fact_store_path,
+            cost_ledger_path=args.cost_ledger_path,
+            extraction_cache_path=args.extraction_cache_path,
+            analysis_result_store_path=args.analysis_result_store_path,
+            approval_request_store_path=args.approval_request_store_path,
+            opportunity_tracker_path=args.opportunity_tracker_path,
+        )
 
         run_loop_fn(
             accounts=[account],
@@ -790,7 +1006,7 @@ def main(argv: list[str] | None = None, *,
             approval_service=approval_service, target_mode=cfg.mode,
             confirmed=args.confirmed,
             cadence_seconds=cfg.reconciliation_cycle_interval_seconds,
-            logger=log,
+            logger=log, pipeline=pipeline,
         )
         return 0
     except Exception as exc:   # noqa: BLE001 -- see agent.run_loop.run_loop's
