@@ -5,6 +5,7 @@ import pytest
 from agent.approval import (ApprovalError, ApprovalService, OrderMismatch,
                             PriceOutOfBand, TokenConsumed, TokenExpired,
                             TokenReissued, order_fingerprint)
+from agent.approval_request_store import ApprovalRequestStore
 
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
 ORDER = dict(symbol="SPY", side="BUY", qty=0.02, order_type="LIMIT",
@@ -64,14 +65,36 @@ def test_minimum_display_time_is_enforced():
         approve(service(), shown_delta=timedelta(seconds=3))
 
 
-def test_daily_cap_and_stop_loss_bypass():
+def test_daily_cap_and_stop_loss_bypass(tmp_path):
+    """`can_request` is a thin delegate onto the durable
+    `ApprovalRequestStore.count_decided_on` (renamed from `count_created_on`,
+    earmarking unit, 2026-08-02 -- the cap counts DECIDED requests only,
+    APPROVED or REJECTED; see that store's own module docstring) -- there
+    is no more in-memory `_issued_today`/`note_request` on `ApprovalService`
+    itself; the cap is created by actually DECIDING requests in the store,
+    the same durable count the real production path (`agent.
+    approval_trigger.request_approval_for_analysis`) checks. A request that
+    is merely created (never decided) does not spend the cap."""
+    from agent import market_calendar
+
     svc = service(max_per_day=2)
-    day = T0.date()
-    assert svc.can_request(day)
-    svc.note_request(day)
-    svc.note_request(day)
-    assert not svc.can_request(day)
-    assert svc.can_request(day, is_stop_loss=True)
+    store = ApprovalRequestStore(tmp_path / "approval_request.jsonl")
+    day = market_calendar.session_for_instant(T0)
+
+    def create_and_decide(decision="APPROVED"):
+        req = store.create(account_id="acct-1", run_id="r", proposal_snapshot={},
+                           risk_result={}, price_at_analysis=100.0,
+                           price_band_low=99.0, price_band_high=101.0,
+                           now=T0, expiration=timedelta(minutes=30))
+        store.decide(req.request_id, decision=decision, now=T0 + timedelta(seconds=5),
+                     decided_by="operator")
+        return req
+
+    assert svc.can_request(day, store)
+    create_and_decide("APPROVED")
+    create_and_decide("REJECTED")
+    assert not svc.can_request(day, store)
+    assert svc.can_request(day, store, is_stop_loss=True)
 
 
 def test_a_token_id_cannot_be_reissued():
@@ -89,6 +112,21 @@ def test_reissue_is_blocked_even_after_consumption():
     tok.consume(fingerprint=order_fingerprint(**ORDER), price=500.0, now=T0)
     with pytest.raises(TokenReissued, match="already been issued and consumed"):
         approve(svc, now=T0 + timedelta(minutes=1))
+
+
+def test_token_for_request_returns_the_matching_token():
+    """Bridge unit, 2026-08-02: `ApprovalRequestStore.outstanding_earmarks`'s
+    earmark-handoff query surface -- a linear scan over already-held
+    `_tokens`, keyed by each token's own `request_id`, not a new index."""
+    svc = service()
+    tok = approve(svc)
+    assert svc.token_for_request("r1") is tok
+
+
+def test_token_for_request_returns_none_for_an_unknown_request_id():
+    svc = service()
+    approve(svc)
+    assert svc.token_for_request("no-such-request") is None
 
 
 def test_rubber_stamp_detection():

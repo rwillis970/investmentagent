@@ -193,6 +193,15 @@ class Extraction:
 
 @dataclass(frozen=True)
 class ApprovalRequest:
+    """`earmark` (earmarking unit, 2026-08-02): the settled cash this
+    request's order would consume if approved and filled -- the order's own
+    authorized notional for a BUY, `0.0` for a SELL/CLOSE (a close FREES
+    cash; it reserves none). See `agent.approval_request_store.
+    ApprovalRequestStore.outstanding_earmarks` for why this is recorded per
+    request rather than recomputed later from `proposal_snapshot`: a request
+    already decided/invalidated/expired must stop contributing to the sum
+    without this store having to re-derive "was this a BUY" and "what was
+    its notional" from a loosely-typed dict every time."""
     request_id: str
     run_id: str
     proposal_snapshot: dict
@@ -200,6 +209,7 @@ class ApprovalRequest:
     price_at_analysis: float
     price_band_low: float
     price_band_high: float
+    earmark: float
     shown_at: datetime
     expires_at: datetime
     decision: str | None = None

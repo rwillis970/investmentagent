@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+
+from .approval_request_store import ApprovalRequestStore
 
 
 class ApprovalError(Exception):
@@ -229,15 +231,36 @@ class ApprovalService:
     min_display: timedelta
     max_per_day: int
     price_band_pct: float = 1.0
-    _issued_today: dict = field(default_factory=dict)
     _tokens: dict[str, ApprovalToken] = field(default_factory=dict)
 
-    def can_request(self, day, *, is_stop_loss: bool = False) -> bool:
-        # A stop-loss exception may bypass the cap; nothing else may (§4.3).
-        return is_stop_loss or self._issued_today.get(day, 0) < self.max_per_day
-
-    def note_request(self, day) -> None:
-        self._issued_today[day] = self._issued_today.get(day, 0) + 1
+    def can_request(self, day: date, store: ApprovalRequestStore, *,
+                    is_stop_loss: bool = False) -> bool:
+        """THIN DELEGATE (cleanup unit, review round 3) -- the durable
+        `agent.approval_request_store.ApprovalRequestStore` is now the ONE
+        place the daily approval cap is counted from: `count_decided_on`
+        (renamed from `count_created_on`, earmarking unit, 2026-08-02 -- the
+        cap counts DECIDED requests only, APPROVED or REJECTED, not every
+        request ever created; see that store's own module docstring). This
+        method used to keep its own in-memory `_issued_today` counter
+        (`note_request` incremented it) -- an in-memory count that resets on
+        every restart, the exact defect already fixed on `agent.cost.
+        CostLedger` via its own `path=` durability. `_issued_today`/
+        `note_request` are deleted this same commit rather than kept
+        alongside the durable store: nothing in this codebase called
+        either of them outside this class's own now-deleted body and their
+        own dedicated unit test (grepped directly, one call site each,
+        both fixed in the same commit) -- `agent.approval_trigger.
+        request_approval_for_analysis`, the one real production path that
+        creates an approval request, has always counted directly against
+        `ApprovalRequestStore.count_decided_on`, never through this method.
+        `is_stop_loss` is kept, unlike the counter: §4.3 names "a stop-loss
+        exception approval is the one card allowed to bypass the daily
+        approval cap" as a real, load-bearing invariant, even though no
+        caller in this codebase passes `is_stop_loss=True` yet (there is no
+        stop-loss-exception path built at all) -- dropping the parameter
+        here would silently retract a promise this codebase's own docs
+        make, not just delete dead code."""
+        return is_stop_loss or store.count_decided_on(day) < self.max_per_day
 
     def approve(self, *, token_id: str, request_id: str, fingerprint: str,
                 price_at_analysis: float, shown_at: datetime,
@@ -280,6 +303,23 @@ class ApprovalService:
         )
         self._tokens[token_id] = tok
         return tok
+
+    def token_for_request(self, request_id: str) -> ApprovalToken | None:
+        """Query surface for `agent.approval_request_store.
+        ApprovalRequestStore.outstanding_earmarks`'s earmark-handoff (bridge
+        unit, 2026-08-02): is there already a live token for this request,
+        and if so, has its earmark been released (consumed/expired/swept)
+        or not. Deliberately does NOT know `agent.approval_bridge`'s own
+        token_id-derivation scheme (`f"tok-{request_id}"`) -- that would leak
+        the bridge's own implementation detail into this class, which knows
+        nothing about requests beyond the bare kwargs `approve()` accepts.
+        Every `ApprovalToken` already carries its own `request_id` (set at
+        mint time), so this is a linear scan over state this class already
+        holds, not a new index or a second source of truth."""
+        for tok in self._tokens.values():
+            if tok.request_id == request_id:
+                return tok
+        return None
 
     def sweep_expired(self, *, now: datetime) -> list[ApprovalToken]:
         """§8.1 startup: `consume()` only ever notices a token is stale when

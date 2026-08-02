@@ -896,14 +896,16 @@ calculation. The value is unchanged here per instruction; this is a report, not 
 
 Invariant #2 was previously stated as *one code path from store to orders* and enforced only
 where it was tested: the `submit` path. That was a point patch, not an invariant. Any second
-method on the broker adapter that produces a broker-side effect is a second path, and it
-reaches the broker without a signed `StagedOrder`, without a capability re-check and
+method the broker adapter grew that produced a broker-side effect would have BEEN a second
+path — reaching the broker without a signed `StagedOrder`, without a capability re-check and
 without gate 4. The hole was not hypothetical: `cancel(client_order_id: str)` was abstract on the
 adapter, took a bare string, and was ungated — the same hole as `submit`, already merged,
 lower consequence only because it reduces exposure rather than creating it. It was closed in
 commit 556e2c2, together with the `__init_subclass__` tripwire and the submit-signature
-test. What follows records the invariant that fix had to satisfy; it is a report of a closed
-defect, not a still-open concern.
+test. As of that commit, `cancel` is gated exactly like `submit`, and `CANCEL`/`CLOSE` are
+both live, staged, signed order kinds (`REPLACE` remains the one deliberately deferred
+kind — see the table below). What follows records the invariant that fix had to satisfy; it
+is a report of a closed, already-shipped defect, not a still-open concern or planned work.
 
 The invariant was therefore restated at the interface level, before a concrete broker
 adapter existed to be refactored around it. **Every broker-side effect is an order kind, and
@@ -980,15 +982,57 @@ rejected.
   "opportunity_screen_interval_minutes": 5,
   "routine_decision_interval_minutes": 240,
   "event_driven_analysis_enabled": true,
+  "reconciliation_cycle_interval_seconds": 300,
+  "data_collection_enabled": false,
+  "materiality_screen_enabled": false,
+  "t4_analysis_enabled": false,
+  "approval_request_enabled": false,
   "approval_expiration_minutes": 30,
   "approval_min_display_seconds": 10,
   "max_model_analyses_per_day": 8,
   "max_approval_requests_per_day": 4,
   "max_new_positions_per_day": 3,
   "max_day_trades_per_5_sessions": 3,
+  "materiality_w1": 1.0,
+  "materiality_w2": 1.0,
+  "materiality_w3": 1.0,
+  "materiality_w4": 0.0,
+  "materiality_w5": 1.0,
+  "materiality_w6": 1.0,
+  "materiality_threshold": 2.0,
+  "threshold_version": "materiality-v1-uncalibrated",
+  "materiality_filing_weights": {
+    "8-K:2.02": 1.0,
+    "8-K:4.02": 1.0,
+    "8-K:1.01": 1.0,
+    "8-K:5.02": 1.0,
+    "8-K:7.01": 1.0,
+    "10-K": 1.0,
+    "10-Q": 1.0
+  },
   "monthly_budget_usd": 20,
   "budget_warning_usd": 15,
   "budget_hard_stop_usd": 30,
+  "broker_http_timeout_seconds": 10,
+  "broker_http_max_retries": 2,
+  "market_data_feed": "iex",
+  "market_data_http_timeout_seconds": 10,
+  "market_data_http_max_retries": 2,
+  "edgar_user_agent": "REPLACE_ME InvestmentAgent Pilot replace-with-your-real-contact-email@example.com",
+  "edgar_min_request_interval_seconds": 0.15,
+  "edgar_http_timeout_seconds": 10,
+  "edgar_http_max_retries": 2,
+  "edgar_ticker_cik_refresh_interval_hours": 24,
+  "symbol_universe": {},
+  "materiality_min_peer_group_size": 3,
+  "edgar_document_max_bytes": 5000000,
+  "t4_model_id": "claude-sonnet-5",
+  "t4_input_price_per_million_tokens": 2.0,
+  "t4_output_price_per_million_tokens": 10.0,
+  "t4_max_output_tokens": 4000,
+  "cat_fee_auto_admit_ceiling": 0.05,
+  "estimated_short_term_tax_rate": null,
+  "estimated_long_term_tax_rate": null,
   "trade_capabilities": {
     "US_EQUITY": "PRODUCTION_ALLOWED",
     "ETF": "PRODUCTION_ALLOWED",
@@ -1017,10 +1061,48 @@ rejected.
     "STOP": "PRODUCTION_ALLOWED",
     "TRAILING_STOP": "PAPER_ONLY"
   },
-  "sessions": { "REGULAR": "PRODUCTION_ALLOWED", "EXTENDED": "DISABLED" },
-  "time_in_force": { "DAY": "PRODUCTION_ALLOWED", "GTC": "DISABLED" }
+  "sessions": {
+    "REGULAR": "PRODUCTION_ALLOWED",
+    "EXTENDED": "DISABLED"
+  },
+  "time_in_force": {
+    "DAY": "PRODUCTION_ALLOWED",
+    "GTC": "DISABLED"
+  }
 }
 ```
+
+REGENERATED VERBATIM FROM THE REPOSITORY'S `config.example.json` (cleanup unit, review
+round 3) -- the block above had been stale since well before this cleanup unit, missing
+every field added across several prior sessions, not only the most recent one:
+`reconciliation_cycle_interval_seconds`; the four money-guardrail stage flags
+(`data_collection_enabled`/`materiality_screen_enabled`/`t4_analysis_enabled`/
+`approval_request_enabled`, see §3.2's dedup-tracker note and §10's sibling-invalidation
+note above for what they gate); the T3 materiality weights/threshold/filing-weight table
+(`materiality_w1`-`w6`, `materiality_threshold`, `threshold_version`,
+`materiality_filing_weights` -- see §3.2's score formula for what these feed);
+`materiality_min_peer_group_size`; `symbol_universe`; the Alpaca trading- and market-data-API
+HTTP timeout/retry pairs (`broker_http_*`, `market_data_http_*`) and `market_data_feed`; the
+full EDGAR collector configuration (`edgar_user_agent`, `edgar_min_request_interval_seconds`,
+`edgar_http_*`, `edgar_ticker_cik_refresh_interval_hours`, `edgar_document_max_bytes`); the T4
+model/pricing fields (`t4_model_id`, `t4_input_price_per_million_tokens`,
+`t4_output_price_per_million_tokens`, `t4_max_output_tokens`); `cat_fee_auto_admit_ceiling`;
+and `estimated_short_term_tax_rate`/`estimated_long_term_tax_rate` (§10's tax-figures note).
+
+The following fields in the block above have no explanation anywhere else in this document
+(checked directly, not assumed) -- named here rather than given invented prose, since each
+one's real behaviour is documented in its own module's docstring in `agent/config.py`/the
+module that reads it, not duplicated a second time here: `reconciliation_cycle_interval_
+seconds`, `data_collection_enabled`, `materiality_screen_enabled`, `t4_analysis_enabled`,
+`approval_request_enabled`, `broker_http_timeout_seconds`, `broker_http_max_retries`,
+`market_data_feed`, `market_data_http_timeout_seconds`, `market_data_http_max_retries`,
+`edgar_user_agent`, `edgar_min_request_interval_seconds`, `edgar_http_timeout_seconds`,
+`edgar_http_max_retries`, `edgar_ticker_cik_refresh_interval_hours`, `symbol_universe`,
+`materiality_min_peer_group_size`, `edgar_document_max_bytes`, `t4_model_id`,
+`t4_max_output_tokens`, `cat_fee_auto_admit_ceiling`, `estimated_short_term_tax_rate`,
+`estimated_long_term_tax_rate`. (`materiality_w1`-`w6`, `materiality_threshold` and
+`materiality_filing_weights` are NOT in this list -- §3.2's score formula and filing-weight
+discussion already explain what those fields mean, under their bare `w1`-`w6` names.)
 
 `assert_account_posture` is asserted, then verified against the broker; a mismatch halts
 trading. `full_portfolio_review_schedule` is not yet a field — scheduled reviews arrive with

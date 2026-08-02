@@ -25,6 +25,7 @@ import pytest
 
 from agent.analysis import BudgetExceeded
 from agent.analysis_output import AnalysisRefused
+from agent import market_calendar
 from agent.cost import CostLedger
 from agent.edgar_collector import FIELD as FILING_FIELD
 from agent.edgar_collector import SOURCE_ID as EDGAR_SOURCE_ID
@@ -386,9 +387,14 @@ def test_an_already_handled_event_is_not_re_sent_to_t4(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_budget_exceeded_skips_the_event_continues_the_cycle_and_is_not_marked_handled(
+def test_budget_exceeded_skips_the_event_continues_the_cycle_and_is_eligible_next_session(
     tmp_path, monkeypatch,
 ):
+    """Earmarking unit (2026-08-02): BudgetExceeded used to be recorded
+    NOWHERE AT ALL, so the same event retried every screen interval for the
+    rest of the day. It is now recorded with `eligible_again_at` set to the
+    NEXT TRADING SESSION's open -- blocked for the remainder of today, but
+    not permanently handled either."""
     e1 = event(event_id="e1")
     e2 = event(event_id="e2", score=1.0)
     patch_screening(monkeypatch, [e1, e2])
@@ -401,7 +407,10 @@ def test_budget_exceeded_skips_the_event_continues_the_cycle_and_is_not_marked_h
                                 last_collected_at=None, last_screened_at=None)
     # the cycle did not halt -- e2 was still attempted
     assert calls == ["e1", "e2"]
-    assert trk.is_handled("e1") is False
+    assert trk.is_handled("e1", T0) is True   # blocked for the rest of today
+    next_session = market_calendar.next_trading_day(market_calendar.session_for_instant(T0))
+    next_open = market_calendar.session_times(next_session).open
+    assert trk.is_handled("e1", next_open) is False   # eligible again next session
     kinds = {evt.event_id: kind for evt, kind, _ in result.trigger_outcomes}
     assert kinds["e1"] == "budget_exceeded"
     assert kinds["e2"] == "analyzed"
@@ -416,8 +425,9 @@ def test_a_refused_analysis_marks_the_event_handled_as_refused(tmp_path, monkeyp
     rt = t4_runtime(tmp_path, opportunity_tracker=trk)
     result = run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
                                 last_collected_at=None, last_screened_at=None)
-    assert trk.is_handled("e1") is True
+    assert trk.is_handled("e1", T0) is True
     assert trk.all()[0].outcome == "refused"
+    assert trk.all()[0].eligible_again_at is None   # permanent
     kinds = {evt.event_id: kind for evt, kind, _ in result.trigger_outcomes}
     assert kinds["e1"] == "refused"
 
@@ -431,8 +441,9 @@ def test_a_successful_analysis_marks_the_event_handled_as_analyzed(tmp_path, mon
     rt = t4_runtime(tmp_path, opportunity_tracker=trk)
     run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
                        last_collected_at=None, last_screened_at=None)
-    assert trk.is_handled("e1") is True
+    assert trk.is_handled("e1", T0) is True
     assert trk.all()[0].outcome == "analyzed"
+    assert trk.all()[0].eligible_again_at is None   # permanent
 
 
 # ------------------------------------------------ approval-request creation gating
@@ -564,3 +575,97 @@ def test_approval_request_is_skipped_when_no_market_snapshot_is_available_for_th
                        last_collected_at=None, last_screened_at=None,
                        ledger=FakeLedger(), broker_account=SimpleNamespace(account_id="acct-1"))
     assert approval_calls == []
+
+
+# ---------------------------------------------- insufficient settled cash (item 6/7)
+
+def test_insufficient_settled_cash_is_not_marked_handled_immediately_but_is_eligible_next_session(
+    tmp_path, monkeypatch,
+):
+    """Same posture as BudgetExceeded (module docstring): a suppression
+    caused by today's cash says nothing about the document, so the event is
+    blocked for the rest of today but eligible again once the next trading
+    session opens -- never permanently handled, never retried every screen
+    interval either."""
+    from agent.accounts import AccountType
+    from agent.approval_trigger import ApprovalTriggerResult
+    from agent.daytrade import DayTradeGuard
+    from agent.pipeline import Gatekeeper
+    from agent.risk import RiskPolicy
+
+    e1 = event(event_id="e1")
+    patch_screening(monkeypatch, [e1])
+    calls = []
+    patch_analyze(monkeypatch, {"e1": analysis_result("e1")}, calls)
+
+    def fake_request(evt, analysis, **kwargs):
+        return ApprovalTriggerResult(request=None, staged=None,
+                                     suppressed_reason="insufficient_settled_cash")
+
+    monkeypatch.setattr(pipeline_stage, "request_approval_for_analysis", fake_request)
+
+    gk = Gatekeeper(account_id="acct-1", account_type=AccountType.TAXABLE,
+                    capability_policy=initial_policy(),
+                    risk_policy=RiskPolicy("t", max_position_pct=10.0, max_sector_pct=100.0,
+                                          min_settled_cash_pct_of_nlv=5.0,
+                                          min_absolute_settled_cash=10.0),
+                    day_trade_guard=DayTradeGuard(account_id="acct-1", max_per_5_sessions=3))
+    trk = tracker(tmp_path)
+    rt = t4_runtime(tmp_path, approval_enabled=True, opportunity_tracker=trk)
+    rt = _replace(rt, gatekeeper=gk)
+
+    class FakeLedger:
+        def positions(self):
+            return {}
+
+    result = run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                                last_collected_at=None, last_screened_at=None,
+                                ledger=FakeLedger(), broker_account=account_snapshot())
+    kinds = {evt.event_id: kind for evt, kind, _ in result.trigger_outcomes}
+    assert kinds["e1"] == "insufficient_settled_cash"
+    assert trk.is_handled("e1", T0) is True
+    next_session = market_calendar.next_trading_day(market_calendar.session_for_instant(T0))
+    next_open = market_calendar.session_times(next_session).open
+    assert trk.is_handled("e1", next_open) is False
+
+
+def test_a_loosely_typed_approval_outcome_without_suppressed_reason_is_still_marked_analyzed(
+    tmp_path, monkeypatch,
+):
+    """Defensive: `test_approval_request_is_attempted_when_flag_and_all_
+    collaborators_are_present` (above) monkeypatches `request_approval_for_
+    analysis` to return a bare `SimpleNamespace`, not a real
+    `ApprovalTriggerResult` -- `_analyze_and_request`'s `getattr(...,
+    "suppressed_reason", None)` guard must not raise on that, and must fall
+    through to the normal "analyzed" mark_handled path."""
+    from agent.accounts import AccountType
+    from agent.daytrade import DayTradeGuard
+    from agent.pipeline import Gatekeeper
+    from agent.risk import RiskPolicy
+
+    e1 = event(event_id="e1")
+    patch_screening(monkeypatch, [e1])
+    calls = []
+    patch_analyze(monkeypatch, {"e1": analysis_result("e1")}, calls)
+    monkeypatch.setattr(pipeline_stage, "request_approval_for_analysis",
+                        lambda *a, **k: SimpleNamespace(request="sentinel-request"))
+
+    gk = Gatekeeper(account_id="acct-1", account_type=AccountType.TAXABLE,
+                    capability_policy=initial_policy(),
+                    risk_policy=RiskPolicy("t", max_position_pct=10.0, max_sector_pct=100.0,
+                                          min_settled_cash_pct_of_nlv=5.0,
+                                          min_absolute_settled_cash=10.0),
+                    day_trade_guard=DayTradeGuard(account_id="acct-1", max_per_5_sessions=3))
+    trk = tracker(tmp_path)
+    rt = t4_runtime(tmp_path, approval_enabled=True, opportunity_tracker=trk)
+    rt = _replace(rt, gatekeeper=gk)
+
+    class FakeLedger:
+        def positions(self):
+            return {}
+
+    run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                       last_collected_at=None, last_screened_at=None,
+                       ledger=FakeLedger(), broker_account=account_snapshot())
+    assert trk.is_handled("e1", T0) is True
+    assert trk.all()[0].outcome == "analyzed"

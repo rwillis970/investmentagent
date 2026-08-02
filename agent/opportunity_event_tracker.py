@@ -28,12 +28,28 @@ reaches a TERMINAL outcome whose result will not change on a later retry --
 a persisted `AnalysisResult` (success) or an `AnalysisRefused` (the
 document deterministically refuses again; already durably cached by
 `agent.extraction_store.ExtractionCacheStore` per review round 1).
-DELIBERATELY NOT marked handled on `agent.analysis.BudgetExceeded`: that
-outcome says nothing about the document, only about today's remaining
-budget, and the SAME still-most-material filing should be eligible again
-once `agent.cost.CostLedger.analyses_today` resets tomorrow -- marking it
-handled here would silently convert a budget throttle into a permanent,
-one-shot-per-filing rule that was never asked for.
+
+`eligible_again_at` (earmarking unit, 2026-08-02) -- `None` MEANS
+PERMANENT, A REAL DATETIME MEANS TEMPORARY. `"analyzed"`/`"refused"` are
+permanent (`eligible_again_at=None`): the document will not change on a
+later retry, and marking it handled forever is correct. `"budget_exceeded"`
+and `"insufficient_settled_cash"` (see `agent.pipeline_stage`'s own module
+docstring) are NEITHER permanent NOR silently ignored -- both say nothing
+about the DOCUMENT, only about a resource that resets on its own schedule
+(today's model-call budget; today's settled cash), so both are recorded
+with `eligible_again_at` set to the NEXT trading SESSION's open (`agent.
+market_calendar.next_trading_day`/`session_times`, computed by the caller,
+`agent.pipeline_stage._next_session_open` -- never a bare 24-hour offset,
+which would drift across a weekend or holiday the same way this codebase's
+other UTC-date bugs did). `is_handled(event_id, now)` therefore now takes
+`now`: a permanent record is handled at any `now`; a temporary one is
+handled only while `now` is still before its own `eligible_again_at`.
+BEFORE THIS FIX, `agent.analysis.BudgetExceeded` was recorded NOWHERE AT
+ALL -- the SAME still-most-material filing retried every single screen
+interval for the rest of the day, every day, until the budget itself
+happened to allow it through, rather than waiting for the next session the
+way this fix now makes it. This was never the intended behaviour; it was
+simply never implemented (see this unit's own report).
 
 FSYNC: EVERY ROW. Losing a "handled" row is not a money risk on its own
 (`run_analysis`'s own extraction cache already prevents re-paying the model
@@ -46,10 +62,16 @@ argues for the weaker, flush-only posture `agent.execution_quarantine`
 reserves for genuinely broker-reconstructible state.
 
 APPEND-ONLY, NOT KEYED/IDEMPOTENT. Marking the same event_id handled twice
-is not an error (the real caller checks `is_handled` first and never would,
-but this store does not assume that) -- it simply appends a second row;
-`is_handled` only needs "at least one row exists for this id," never "the
-latest row."""
+is not an error (a temporary `budget_exceeded`/`insufficient_settled_cash`
+record is expected to be superseded by a later row for the same event_id,
+once the event is re-screened and re-triggers past its own
+`eligible_again_at`) -- it simply appends a second row. `is_handled`
+(earmarking unit, 2026-08-02: REVISED from "at least one row exists for
+this id" -- see above) now consults only the MOST RECENT row for a given
+event_id -- the latest row is always the one that determines whether the
+id is CURRENTLY handled, since a later row (a fresh `budget_exceeded` the
+next time the cap binds, or a later `"analyzed"`) always supersedes an
+earlier one's own window."""
 from __future__ import annotations
 
 import json
@@ -68,22 +90,28 @@ class HandledRecord:
     event_id: str
     outcome: str
     handled_at: datetime
+    # `None` = permanent ("analyzed"/"refused"); a real datetime = temporary
+    # ("budget_exceeded"/"insufficient_settled_cash"), the next trading
+    # session's open -- see module docstring.
+    eligible_again_at: datetime | None = None
 
 
 class OpportunityEventTracker:
     def __init__(self, path: str | Path):
         self._path = Path(path)
         self._records: list[HandledRecord] = []
-        self._handled_ids: set[str] = set()
+        self._latest_by_id: dict[str, HandledRecord] = {}
         if self._path.exists():
             self._load_into()
 
     # -- write ----------------------------------------------------------------
     def mark_handled(self, event_id: str, *, outcome: str, now: datetime,
+                     eligible_again_at: datetime | None = None,
                      persist: bool = True) -> HandledRecord:
-        rec = HandledRecord(event_id=event_id, outcome=outcome, handled_at=now)
+        rec = HandledRecord(event_id=event_id, outcome=outcome, handled_at=now,
+                            eligible_again_at=eligible_again_at)
         self._records.append(rec)
-        self._handled_ids.add(event_id)
+        self._latest_by_id[event_id] = rec
         if persist:
             self._append_row(rec)
         return rec
@@ -95,8 +123,19 @@ class OpportunityEventTracker:
         raise OpportunityEventTrackerError("append-only; rows are never deleted")
 
     # -- read ---------------------------------------------------------------
-    def is_handled(self, event_id: str) -> bool:
-        return event_id in self._handled_ids
+    def is_handled(self, event_id: str, now: datetime) -> bool:
+        """Whether `event_id` is CURRENTLY handled, per its MOST RECENT
+        record (see module docstring for why the latest row wins, not "any
+        row exists"). `None` -> not handled at all. A permanent record
+        (`eligible_again_at=None`) is handled at any `now`; a temporary one
+        is handled only while `now` is still before its own
+        `eligible_again_at`."""
+        rec = self._latest_by_id.get(event_id)
+        if rec is None:
+            return False
+        if rec.eligible_again_at is None:
+            return True
+        return now < rec.eligible_again_at
 
     def all(self) -> tuple[HandledRecord, ...]:
         return tuple(self._records)
@@ -107,6 +146,8 @@ class OpportunityEventTracker:
             fh.write(json.dumps({
                 "event_id": rec.event_id, "outcome": rec.outcome,
                 "handled_at": rec.handled_at.isoformat(),
+                "eligible_again_at": (rec.eligible_again_at.isoformat()
+                                      if rec.eligible_again_at else None),
             }) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -116,7 +157,11 @@ class OpportunityEventTracker:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
         for line in lines:
             row = json.loads(line)
+            eligible_again_at = row.get("eligible_again_at")
             self.mark_handled(
                 row["event_id"], outcome=row["outcome"],
-                now=datetime.fromisoformat(row["handled_at"]), persist=False,
+                now=datetime.fromisoformat(row["handled_at"]),
+                eligible_again_at=(datetime.fromisoformat(eligible_again_at)
+                                   if eligible_again_at else None),
+                persist=False,
             )

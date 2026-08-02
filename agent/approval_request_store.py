@@ -28,29 +28,54 @@ to a `shown_at` a UI reports -- see `agent/approval.py`'s own
 only ever recorded it for the approved case (§3.4's own median-decision-time
 metric needs rejected decisions in the sample too, not just approved ones).
 
-SIBLING INVALIDATION (§10, Unit 4 item 3) -- INVALIDATE, NOT RECOMPUTE.
-With two or more requests pending against the same account, each one's
-post-trade figures (reserve, concentration, sector exposure) were computed
-assuming the OTHERS were still pending. Approving one changes the ground
-truth the others were built on. Two options: silently recompute the
-survivors' figures, or invalidate them and require a fresh decision.
-Recomputing was rejected: a human may already have read a card's figures
-before an approval elsewhere changes them invisibly underneath that
-reading -- the same reasoning this codebase already applies to a stale
-quote (§3.3: "if the quote moves outside the band... the token is
-invalidated and a fresh decision is required") and to an out-of-bounds
-modification (§10: "otherwise 'modify' becomes a bypass of the risk
-constrainer"). A card whose own numbers can silently change while a human
-is looking at it is worse than one that disappears and has to be
-re-issued. `decide()` therefore invalidates every OTHER pending request
-for the same account the instant one is APPROVED (never on a REJECTED
-decision -- rejecting a candidate does not change any other candidate's
-post-trade arithmetic), with `invalidated_reason` naming the approved
-sibling's `request_id` so the record explains itself to a later reader.
+SIBLING INVALIDATION -- REMOVED (earmarking unit, 2026-08-02). Two or more
+requests pending against the same account used to have their post-trade
+figures (reserve, concentration, sector exposure) computed assuming the
+OTHERS were not pending at all -- approving one changed the ground truth
+the others were built on, and `decide()` used to paper over that by
+INVALIDATING every other pending request for the same account the instant
+one was APPROVED, forcing a fresh decision on each. That was a symptom
+fix, not the real one: the underlying defect was that a pending BUY
+consumed no accounted-for cash at all until it was actually submitted, so
+two pending requests could each be priced as though the other did not
+exist. Earmarking (`outstanding_earmarks` below, and `agent.risk.
+PortfolioState.pending_buy_notional`, wired for the first time this unit)
+removes the need for invalidation directly: a pending request's post-trade
+figures now already net out every OTHER pending request's earmark (see
+`agent.approval_trigger._post_trade_state`), so approving one no longer
+changes any sibling's arithmetic, and there is nothing left for
+invalidation to correct. `invalidate()` itself is UNCHANGED and stays --
+it is still the right mechanism for a stale quote (price drifted outside
+the band) or an expired card, neither of which this unit touches.
 
 FSYNC: EVERY ROW -- no external source of truth for an approval decision
 once made; same reasoning as `agent.cost.CostLedger`/`agent.
 analysis_result_store.AnalysisResultStore`.
+
+`count_decided_on` (renamed from `count_created_on`, earmarking unit,
+2026-08-02) COUNTS DECIDED REQUESTS ONLY -- APPROVED or REJECTED --
+NOT EVERY REQUEST CREATED. `max_approval_requests_per_day` exists to
+protect a scarce resource: operator attention (§3.4). A card that expired
+unread, or was invalidated, or was suppressed before a request ever
+existed, spent none of that attention -- only a request an operator
+actually DECIDED did. The old `count_created_on` counted every row
+appended by `create()`, regardless of whether anything ever came of it;
+this store now tracks `_decided_dates`, appended to by `decide()` (for
+both APPROVED and REJECTED -- `decision_elapsed_ms` is logged for both
+already, for the same "the cap protects attention spent either way"
+reason), keyed on `market_calendar.session_for_instant(now)` exactly as
+before. `count_decided_on`'s signature is otherwise the same shape as the
+old method (`day: date`); every caller (`agent.approval_trigger.
+request_approval_for_analysis`'s rate-limit recheck, `agent.
+pipeline_stage.run_pipeline_stage`'s `approvals_today` computation feeding
+`agent.materiality.screen`) is updated the same commit. The
+`pipeline_stage` caller had an independent, pre-existing bug fixed
+incidentally here too: it was calling the old method with a raw
+`now.date()` (a UTC calendar date), not `market_calendar.
+session_for_instant(now)` -- the exact defect the cleanup unit (review
+round 3) fixed at this store's OTHER caller but not this one, since only
+`approval_trigger.py`'s call site was in that unit's scope. See this
+unit's own report.
 """
 from __future__ import annotations
 
@@ -60,8 +85,18 @@ import secrets
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from . import market_calendar
 from .entities import ApprovalRequest
+
+if TYPE_CHECKING:
+    # Type-only: `agent.approval.ApprovalService` imports THIS module (it
+    # constructs `ApprovalRequestStore` type hints), so a real, module-level
+    # import here would be circular. `from __future__ import annotations`
+    # (above) already makes every annotation in this file lazy/string, so
+    # this guarded import is safe and only ever runs for a type checker.
+    from .approval import ApprovalService
 
 
 class ApprovalRequestStoreError(Exception):
@@ -73,7 +108,7 @@ class ApprovalRequestStore:
         self._path = Path(path)
         self._current: dict[str, ApprovalRequest] = {}
         self._account_of: dict[str, str] = {}
-        self._created_dates: list[date] = []
+        self._decided_dates: list[date] = []
         if self._path.exists():
             self._load_into()
 
@@ -81,7 +116,8 @@ class ApprovalRequestStore:
     def create(self, *, account_id: str, run_id: str, proposal_snapshot: dict,
               risk_result: dict, price_at_analysis: float, price_band_low: float,
               price_band_high: float, now: datetime, expiration: timedelta,
-              request_id: str | None = None, persist: bool = True) -> ApprovalRequest:
+              earmark: float = 0.0, request_id: str | None = None,
+              persist: bool = True) -> ApprovalRequest:
         request_id = request_id or f"apr-{secrets.token_hex(12)}"
         if request_id in self._current:
             raise ApprovalRequestStoreError(f"request_id {request_id!r} already exists")
@@ -89,11 +125,10 @@ class ApprovalRequestStore:
             request_id=request_id, run_id=run_id, proposal_snapshot=proposal_snapshot,
             risk_result=risk_result, price_at_analysis=price_at_analysis,
             price_band_low=price_band_low, price_band_high=price_band_high,
-            shown_at=now, expires_at=now + expiration,
+            earmark=earmark, shown_at=now, expires_at=now + expiration,
         )
         self._current[request_id] = req
         self._account_of[request_id] = account_id
-        self._created_dates.append(now.date())
         if persist:
             self._append_event("created", account_id, req)
         return req
@@ -116,16 +151,12 @@ class ApprovalRequestStore:
         updated = replace(current, decision=decision, decided_by=decided_by,
                           decided_at=now, decision_elapsed_ms=elapsed_ms)
         self._current[request_id] = updated
+        # Counts against the daily cap regardless of APPROVED/REJECTED -- see
+        # module docstring's `count_decided_on` section: the cap protects
+        # operator attention, and a decision spends it either way.
+        self._decided_dates.append(market_calendar.session_for_instant(now))
         if persist:
             self._append_event("decided", self._account_of[request_id], updated)
-
-        if decision == "APPROVED":
-            account_id = self._account_of[request_id]
-            for other_id, other in list(self._current.items()):
-                if (other_id != request_id and self._account_of.get(other_id) == account_id
-                        and other.decision is None and other.invalidated_reason is None):
-                    self.invalidate(other_id, reason=f"sibling_approved:{request_id}",
-                                    now=now, persist=persist)
         return updated
 
     def invalidate(self, request_id: str, *, reason: str, now: datetime,
@@ -170,8 +201,51 @@ class ApprovalRequestStore:
             out.append(req)
         return tuple(out)
 
-    def count_created_on(self, day: date) -> int:
-        return sum(1 for d in self._created_dates if d == day)
+    def count_decided_on(self, day: date) -> int:
+        return sum(1 for d in self._decided_dates if d == day)
+
+    def outstanding_earmarks(self, account_id: str, now: datetime, *,
+                            service: "ApprovalService | None" = None) -> float:
+        """The total settled cash reserved by every pending BUY request for
+        `account_id` -- pending, not expired, not decided, not invalidated
+        (the same filter `pending()` already applies; a SELL/CLOSE request's
+        `earmark` is always `0.0`, so it contributes nothing here without a
+        separate side check). See `agent.risk.PortfolioState.
+        pending_buy_notional`, wired from this method's return value in
+        `agent.approval_trigger.request_approval_for_analysis`.
+
+        TOKEN HANDOFF (bridge unit, 2026-08-02, Prompt 3 -- this is the unit
+        this method's own previous docstring named as deferred). `pending()`
+        alone excludes any DECIDED request, approved or rejected, the
+        instant it is decided -- correct for a REJECTED request (nothing was
+        ever going to consume that cash) but wrong for an APPROVED one: an
+        approved-but-unspent token must not free cash a live order is about
+        to consume. Passing `service` (an `agent.approval.ApprovalService`)
+        folds in every APPROVED request in THIS store whose `agent.
+        approval_bridge`-minted token (`service.token_for_request(rid)`)
+        still holds its earmark -- not yet consumed, not past its own
+        `expires_at`, not swept. `service=None` (the default) preserves this
+        method's EXACT prior behaviour -- an approved request's earmark
+        releases the instant `pending()` excludes it -- for a caller with no
+        service to pass; see this unit's own report for which real caller
+        (`agent.approval_trigger.request_approval_for_analysis`) that still
+        is today, and why."""
+        total = sum(req.earmark for req in self.pending(account_id=account_id, now=now))
+        if service is not None:
+            for rid, req in self._current.items():
+                if self._account_of.get(rid) != account_id:
+                    continue
+                if req.decision != "APPROVED":
+                    continue
+                tok = service.token_for_request(rid)
+                if tok is None:
+                    continue
+                if tok.consumed_at is not None or tok.swept_at is not None:
+                    continue
+                if now >= tok.expires_at:
+                    continue
+                total += req.earmark
+        return total
 
     def _require(self, request_id: str) -> ApprovalRequest:
         current = self._current.get(request_id)
@@ -199,10 +273,12 @@ class ApprovalRequestStore:
             if event == "created":
                 self._current[req.request_id] = req
                 self._account_of[req.request_id] = account_id
-                self._created_dates.append(req.shown_at.date())
             else:
                 self._current[req.request_id] = req
                 self._account_of.setdefault(req.request_id, account_id)
+                if event == "decided" and req.decided_at is not None:
+                    self._decided_dates.append(
+                        market_calendar.session_for_instant(req.decided_at))
 
 
 def _encode(r: ApprovalRequest) -> dict:
@@ -210,7 +286,8 @@ def _encode(r: ApprovalRequest) -> dict:
         "request_id": r.request_id, "run_id": r.run_id,
         "proposal_snapshot": r.proposal_snapshot, "risk_result": r.risk_result,
         "price_at_analysis": r.price_at_analysis, "price_band_low": r.price_band_low,
-        "price_band_high": r.price_band_high, "shown_at": r.shown_at.isoformat(),
+        "price_band_high": r.price_band_high, "earmark": r.earmark,
+        "shown_at": r.shown_at.isoformat(),
         "expires_at": r.expires_at.isoformat(), "decision": r.decision,
         "decided_by": r.decided_by,
         "decided_at": r.decided_at.isoformat() if r.decided_at else None,
@@ -224,7 +301,7 @@ def _decode(row: dict) -> ApprovalRequest:
         request_id=row["request_id"], run_id=row["run_id"],
         proposal_snapshot=row["proposal_snapshot"], risk_result=row["risk_result"],
         price_at_analysis=row["price_at_analysis"], price_band_low=row["price_band_low"],
-        price_band_high=row["price_band_high"],
+        price_band_high=row["price_band_high"], earmark=row.get("earmark", 0.0),
         shown_at=datetime.fromisoformat(row["shown_at"]),
         expires_at=datetime.fromisoformat(row["expires_at"]),
         decision=row["decision"], decided_by=row["decided_by"],

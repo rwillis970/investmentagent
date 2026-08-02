@@ -8,6 +8,23 @@ that a structural branch rather than a config flag or a comment: it returns
 NOT_APPLICABLE / None immediately for ROTH_IRA and TRADITIONAL_IRA (via
 `AccountType.is_retirement`), and computes short/long-term and wash-sale
 normally for TAXABLE.
+
+`classify()` does NOT compute a wash-sale WINDOW itself -- `repurchased_
+within_window` is a plain bool the caller supplies (`agent.approval_trigger.
+_tax_figures`'s own `WASH_SALE_WINDOW_DAYS = 30`, checked there against
+`Ledger.fills`); this module only decides what a `True`/`False` means for
+`wash_sale_flag` (a loss, repurchased within whatever window the caller
+computed). A module-level `WASH_SALE_WINDOW` constant used to sit here
+unreferenced by any code in this file (or anywhere else -- checked
+directly) whose comment claimed a symmetric "30 days on each side of the
+sale, inclusive of the sale day" (61 days total), while the value it held
+was 30 days and the ONE place that concept is actually enforced
+(`_tax_figures`) checks only backward from the sale (a prior repurchase, up
+to 30 days before), never forward. Removed (cleanup unit, review round 3)
+rather than wired up: this module has no caller that needs a window
+constant of its own, and reintroducing one here would just recreate the
+exact "two independent, unreconciled ideas of the same window" defect this
+same cleanup unit collapsed for the approval-cap counter.
 """
 from __future__ import annotations
 
@@ -18,8 +35,6 @@ from enum import Enum
 from .accounts import AccountType
 
 LONG_TERM_THRESHOLD = timedelta(days=365)
-# 61-day window: 30 days on each side of the sale, inclusive of the sale day.
-WASH_SALE_WINDOW = timedelta(days=30)
 
 
 class TaxCharacter(Enum):
