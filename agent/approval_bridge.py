@@ -50,23 +50,27 @@ request's own `proposal_snapshot` (the actual approved order,
 passes them straight through; see this unit's own tests for the explicit
 "defaults can never succeed" assertion.
 
-SHOWN_AT AGREEMENT, NOT A SECOND GUESS. This bridge always passes the
-STORE's own `request.shown_at` into `ApprovalService.approve` -- never a
-value this function's own caller supplies -- so `ApprovalService.approve`'s
-`now - shown_at` computation and `ApprovalRequestStore.decide`'s
-already-recorded `request.decision_elapsed_ms` are computed from the
-IDENTICAL `shown_at`. They can still disagree if THIS function's own `now`
-differs from whatever `now` the caller passed to the earlier `decide()`
-call -- the natural calling convention is one shared `now` for the single
-real-world action "an operator approved this," spanning both the `decide()`
-call and this mint call. Rather than silently pick one figure over the
-other (which would let a token's own `decision_elapsed_ms` drift from the
-store's already-audited record of how long the card was actually on
-screen), this function computes what `approve()` is ABOUT to compute,
-compares it against the store's own recorded figure FIRST, and raises
-BEFORE ever calling `approve()` -- so a caller that got `now` wrong never
-mints a token at all (and never burns the request's one `token_id`); it can
-simply retry with the correct `now`.
+SHOWN_AT AGREEMENT IS A TOLERANCE, NOT AN EQUALITY (review fix, 2026-08-02).
+This bridge always passes the STORE's own `request.shown_at` into
+`ApprovalService.approve` -- never a value this function's own caller
+supplies -- and always passes the STORE's own already-audited
+`request.decision_elapsed_ms` THROUGH as the token's authoritative figure,
+rather than letting `approve()` recompute one from `now - shown_at` at
+mint time. An earlier version of this function REQUIRED the recomputed
+figure to EXACTLY equal the stored one before it would even call
+`approve()` -- but any real caller calls `decide()`, then mints with a
+SECOND, independent `datetime.now()` read a few microseconds or
+milliseconds later; those two reads are never bit-for-bit equal, so that
+check could never survive a real caller. The intent survives as a SANITY
+BOUND instead (`SHOWN_AT_DRIFT_TOLERANCE_MS` below): this function still
+computes what `approve()` would compute from `now - request.shown_at`, and
+still raises BEFORE ever calling `approve()` (so a rejected attempt never
+burns the request's one `token_id`) -- but only if that recomputed figure
+is NEGATIVE (a `now` before `shown_at` -- impossible for a genuine mint)
+or exceeds the store's own recorded `decision_elapsed_ms` by more than the
+tolerance (a `shown_at` genuinely wrong, or a caller passing a `now` from
+some unrelated, much later action -- not clock jitter between two reads of
+the same real approval).
 
 TOKEN_ID IS DERIVED, NEVER CALLER-SUPPLIED (idempotent replay). `f"tok-
 {request_id}"` -- a request_id is already unique (`ApprovalRequestStore.
@@ -104,6 +108,16 @@ so this guard is defensive -- it exists so a FUTURE producer cannot
 silently introduce a compound proposal through this bridge without
 confronting this constraint, not a fix for an existing bug.
 
+PRICE BAND IS INHERITED FROM THE REQUEST, NOT RECOMPUTED (review fix,
+2026-08-02). This function always passes `request.price_band_low`/
+`request.price_band_high` into `ApprovalService.approve` -- the exact band
+the operator saw on the card -- rather than letting `approve()` derive one
+fresh from `price_at_analysis`/its own `price_band_pct` at mint time.
+`ApprovalService.approve` prefers the stored band and audits any
+disagreement with what it would otherwise compute (see that method's own
+docstring); this function supplies `audit_log` through to it so that trace
+actually gets written when this bridge is the caller.
+
 EARMARK HANDOFF (item 2). This module does not itself move an earmark
 anywhere -- there is nothing to move. The earmark lives on the REQUEST
 (`ApprovalRequest.earmark`, unchanged by this unit) for the request's
@@ -121,6 +135,17 @@ from datetime import datetime
 
 from .approval import ApprovalService, ApprovalToken, order_fingerprint
 from .approval_request_store import ApprovalRequestStore
+from .audit import AuditLog
+
+# Review fix, 2026-08-02: a generous bound for wall-clock jitter between the
+# decide() call and this mint call (two separate datetime.now() reads on any
+# real caller) -- NOT a real signal that anything is wrong, and not meant to
+# be tight. A shown_at genuinely off by more than this (an hour, a day, a
+# caller passing `now` from some unrelated action) is a real defect worth
+# refusing to mint over; five seconds of scheduling/IO jitter between two
+# calls that are supposed to represent the same real-world "operator
+# approved this" instant is not.
+SHOWN_AT_DRIFT_TOLERANCE_MS = 5000
 
 
 class ApprovalBridgeError(Exception):
@@ -152,12 +177,21 @@ def _reject_compound_snapshot(proposal_snapshot: dict) -> None:
 
 
 def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
-                        service: ApprovalService, now: datetime) -> ApprovalToken:
+                        service: ApprovalService, now: datetime,
+                        audit_log: AuditLog | None = None) -> ApprovalToken:
     """Given a request_id and the store, mint the corresponding token (or
     raise `ApprovalBridgeError`). See module docstring for the guard order,
-    the real-field passthrough, the shown_at-agreement check, and the
-    deterministic token_id. The ONLY production caller of
-    `ApprovalService.approve`."""
+    the real-field passthrough, the shown_at-agreement tolerance, the
+    inherited price band, and the deterministic token_id. The ONLY
+    production caller of `ApprovalService.approve`.
+
+    `audit_log`, when supplied, is passed straight through to `approve()`
+    so a price-band disagreement between what this request stored and what
+    `service` would compute today gets an audit row (see `ApprovalService.
+    approve`'s own docstring) -- optional because, like `service` itself in
+    `agent.approval_trigger.request_approval_for_analysis`, no real caller
+    in this codebase constructs this bridge yet (there is no operator
+    decision surface to call it from -- see module docstring)."""
     request = store.get(request_id)
     if request is None:
         raise ApprovalBridgeError(f"unknown request_id {request_id!r}")
@@ -181,20 +215,28 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
     _reject_compound_snapshot(proposal)
 
     # The store's own recorded shown_at, ALWAYS -- never a value this
-    # function's own caller supplies (see module docstring). Computed here,
-    # BEFORE calling approve(), so a disagreement is caught before this
-    # request's one token_id is ever consumed by ApprovalService -- a retry
-    # with a corrected `now` would otherwise hit TokenReissued for a token
-    # that was never actually minted successfully the first time.
+    # function's own caller supplies (see module docstring). The sanity
+    # bound below is computed BEFORE calling approve(), so a rejected
+    # attempt is caught before this request's one token_id is ever consumed
+    # by ApprovalService -- a retry with a corrected `now` would otherwise
+    # hit TokenReissued for a token that was never actually minted
+    # successfully the first time.
     would_be_elapsed_ms = int((now - request.shown_at).total_seconds() * 1000)
-    if would_be_elapsed_ms != request.decision_elapsed_ms:
+    if would_be_elapsed_ms < 0:
         raise ApprovalBridgeError(
-            f"decision_elapsed_ms disagreement for request {request_id}: "
-            f"this call's own `now` would compute {would_be_elapsed_ms}ms "
-            f"from the store's shown_at, but the store recorded "
-            f"{request.decision_elapsed_ms}ms at decide() time. Pass the "
-            "same `now` used for the decide() call that approved this "
-            "request, rather than a later one."
+            f"negative elapsed for request {request_id}: this call's own "
+            f"`now` ({now.isoformat()}) is BEFORE the store's own shown_at "
+            f"({request.shown_at.isoformat()}); refusing to mint a token"
+        )
+    if would_be_elapsed_ms > request.decision_elapsed_ms + SHOWN_AT_DRIFT_TOLERANCE_MS:
+        raise ApprovalBridgeError(
+            f"shown_at drift for request {request_id} exceeds the "
+            f"{SHOWN_AT_DRIFT_TOLERANCE_MS}ms tolerance: this call's own "
+            f"`now` would compute {would_be_elapsed_ms}ms from the store's "
+            f"shown_at, but the store recorded "
+            f"{request.decision_elapsed_ms}ms at decide() time. Pass a "
+            "`now` close to the one used for the decide() call that "
+            "approved this request."
         )
 
     token_id = f"tok-{request_id}"
@@ -211,4 +253,7 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
         qty=proposal["authorized_qty"], order_type=proposal["order_type"],
         time_in_force=proposal["time_in_force"],
         limit_price=proposal.get("limit_price"), lot_id=proposal.get("lot_id"),
+        decision_elapsed_ms=request.decision_elapsed_ms,
+        price_band_low=request.price_band_low, price_band_high=request.price_band_high,
+        audit_log=audit_log,
     )

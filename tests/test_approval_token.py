@@ -114,6 +114,99 @@ def test_reissue_is_blocked_even_after_consumption():
         approve(svc, now=T0 + timedelta(minutes=1))
 
 
+# ------------------------------------------------ review fix, 2026-08-02
+
+def test_approve_uses_the_computed_band_when_no_stored_band_is_given():
+    """Backward-compat fallback: every pre-existing caller (no `price_band_
+    low`/`price_band_high`) keeps the original computed-band behaviour."""
+    svc = service(price_band_pct=1.0)
+    tok = approve(svc)   # price_at_analysis=500.0 in the `approve()` helper
+    assert tok.price_band == pytest.approx((495.0, 505.0))
+
+
+def test_approve_uses_the_stored_band_when_supplied_and_it_agrees():
+    svc = service(price_band_pct=1.0)
+    tok = svc.approve(token_id="t1", request_id="r1",
+                      fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+                      shown_at=T0 - timedelta(seconds=15), now=T0,
+                      price_band_low=495.0, price_band_high=505.0)
+    assert tok.price_band == (495.0, 505.0)
+
+
+def test_approve_prefers_the_stored_band_over_a_disagreeing_computed_one():
+    svc = service(price_band_pct=1.0)   # would compute (495.0, 505.0)
+    tok = svc.approve(token_id="t1", request_id="r1",
+                      fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+                      shown_at=T0 - timedelta(seconds=15), now=T0,
+                      price_band_low=490.0, price_band_high=510.0)
+    assert tok.price_band == (490.0, 510.0)
+
+
+def test_approve_audits_a_price_band_disagreement_when_an_audit_log_is_given():
+    from agent.audit import AuditLog
+
+    svc = service(price_band_pct=1.0)
+    audit = AuditLog()
+    svc.approve(token_id="t1", request_id="r1",
+               fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+               shown_at=T0 - timedelta(seconds=15), now=T0,
+               price_band_low=490.0, price_band_high=510.0, audit_log=audit)
+    actions = [e.action for e in audit.events]
+    assert "approval_token_price_band_drift" in actions
+
+
+def test_approve_does_not_audit_a_stored_band_that_agrees():
+    from agent.audit import AuditLog
+
+    svc = service(price_band_pct=1.0)
+    audit = AuditLog()
+    svc.approve(token_id="t1", request_id="r1",
+               fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+               shown_at=T0 - timedelta(seconds=15), now=T0,
+               price_band_low=495.0, price_band_high=505.0, audit_log=audit)
+    assert audit.events == ()
+
+
+def test_approve_disagreement_without_an_audit_log_still_prefers_the_stored_band():
+    """No sink to write to -- the stored band still wins, silently (a
+    disclosed limitation, not a defect: see this unit's own report)."""
+    svc = service(price_band_pct=1.0)
+    tok = svc.approve(token_id="t1", request_id="r1",
+                      fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+                      shown_at=T0 - timedelta(seconds=15), now=T0,
+                      price_band_low=490.0, price_band_high=510.0)
+    assert tok.price_band == (490.0, 510.0)
+
+
+def test_approve_uses_a_supplied_decision_elapsed_ms_instead_of_recomputing():
+    svc = service()
+    tok = svc.approve(token_id="t1", request_id="r1",
+                      fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+                      shown_at=T0 - timedelta(seconds=15), now=T0,
+                      decision_elapsed_ms=99_999)
+    assert tok.decision_elapsed_ms == 99_999   # NOT 15000, the live now-shown_at figure
+
+
+def test_approve_falls_back_to_the_live_elapsed_when_none_is_supplied():
+    svc = service()
+    tok = svc.approve(token_id="t1", request_id="r1",
+                      fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+                      shown_at=T0 - timedelta(seconds=15), now=T0)
+    assert tok.decision_elapsed_ms == 15_000
+
+
+def test_approve_min_display_gate_still_uses_the_live_clock_even_with_an_override():
+    """A supplied decision_elapsed_ms is an AUDIT figure, not a bypass of the
+    real-time §10 friction gate -- the gate must still use the live now -
+    shown_at, even when a caller passes a huge decision_elapsed_ms override."""
+    svc = service(min_display=timedelta(seconds=20))
+    with pytest.raises(ApprovalError, match="minimum is 20s"):
+        svc.approve(token_id="t1", request_id="r1",
+                   fingerprint=order_fingerprint(**ORDER), price_at_analysis=500.0,
+                   shown_at=T0 - timedelta(seconds=15), now=T0,
+                   decision_elapsed_ms=999_999)
+
+
 def test_token_for_request_returns_the_matching_token():
     """Bridge unit, 2026-08-02: `ApprovalRequestStore.outstanding_earmarks`'s
     earmark-handoff query surface -- a linear scan over already-held

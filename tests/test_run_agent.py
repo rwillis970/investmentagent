@@ -252,6 +252,47 @@ def test_build_pipeline_runtime_price_band_and_expiration_come_from_the_approval
     assert pipeline.price_band_pct == 2.5
 
 
+def test_build_pipeline_runtime_threads_the_real_approval_service_through(tmp_path):
+    """Review fix (2026-08-02): `build_pipeline_runtime` already RECEIVES a
+    real `approval_service` (this function already reads `.expiration`/
+    `.price_band_pct` off it -- see the two tests above) but never used to
+    pass the object itself into the `PipelineRuntime` it returns, leaving
+    `agent.approval_trigger.request_approval_for_analysis`'s own
+    `approval_service` parameter (bridge unit) `None` under `launchd` --
+    the earmark-handoff path (`agent.approval_request_store.
+    ApprovalRequestStore.outstanding_earmarks`'s `service=` kwarg) was
+    fully wired and tested but dead in the real process. Asserting
+    identity, not merely `is not None`, proves this is the SAME object the
+    caller constructed and configured -- not a second, independently-built
+    stand-in that would drift from it."""
+    from agent import config as config_module
+    from agent.accounts import AccountType
+    from agent.approval import ApprovalService
+    from agent.audit import AuditLog
+    from agent.secrets_provider import InMemorySecretsProvider
+    from datetime import timedelta
+    from scripts.run_agent import build_pipeline_runtime
+
+    cfg = config_module.load(base_config())
+    creds = BrokerCredentials(account_id="acct-a", key_id="k", secret_ref="ref")
+    secrets = InMemorySecretsProvider(mode="PAPER")
+    approval_service = ApprovalService(expiration=timedelta(minutes=30),
+                                       min_display=timedelta(seconds=10), max_per_day=4)
+    pipeline = build_pipeline_runtime(
+        cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
+        account_type=AccountType.TAXABLE, audit_log=AuditLog(),
+        approval_service=approval_service,
+        fact_store_path=tmp_path / "facts.jsonl",
+        cost_ledger_path=tmp_path / "cost_ledger.jsonl",
+        extraction_cache_path=tmp_path / "extraction_cache.jsonl",
+        analysis_result_store_path=tmp_path / "analysis_results.jsonl",
+        approval_request_store_path=tmp_path / "approval_requests.jsonl",
+        opportunity_tracker_path=tmp_path / "opportunity_tracker.jsonl",
+    )
+    assert pipeline.approval_service is not None
+    assert pipeline.approval_service is approval_service
+
+
 def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
     """The whole point of Commit 1: main() must not construct an in-memory-
     only AuditLog() -- it must pass --audit-log-path through, so a restart

@@ -411,6 +411,19 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
         approval_request_enabled=cfg.approval_request_enabled,
         gatekeeper=gatekeeper,
         approval_request_store=ApprovalRequestStore(approval_request_store_path),
+        # Review fix (2026-08-02): this function already RECEIVES a real,
+        # durable `approval_service` (its caller constructs one and reads
+        # `.expiration`/`.price_band_pct` off it two lines above) -- it was
+        # simply never threaded into the `PipelineRuntime` this function
+        # returns, leaving `agent.approval_trigger.
+        # request_approval_for_analysis`'s own `approval_service` parameter
+        # (bridge unit) `None` under `launchd`, so the earmark-handoff path
+        # in `agent.approval_request_store.ApprovalRequestStore.
+        # outstanding_earmarks` was dead in the real process even though it
+        # was already fully wired and tested. No new CLI flag or store path
+        # is needed -- everything this needed already existed at this call
+        # site; this was a one-line omission, not a missing collaborator.
+        approval_service=approval_service,
         audit_log=audit_log,
         approval_expiration=approval_service.expiration,
         price_band_pct=approval_service.price_band_pct,

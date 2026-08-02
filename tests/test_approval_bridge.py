@@ -77,6 +77,29 @@ def test_shown_at_and_decision_elapsed_ms_agree_by_construction(tmp_path):
     assert tok.decision_elapsed_ms == req.decision_elapsed_ms == 15_000
 
 
+def test_mints_a_token_bound_to_the_requests_own_stored_price_band(tmp_path):
+    """Review fix, 2026-08-02: the token enforces exactly the band the
+    operator saw on the card (99.0/101.0, from `make()`'s own `create()`
+    call), not a band freshly recomputed from `price_at_analysis` and the
+    service's own `price_band_pct` at mint time."""
+    store, req = make(tmp_path)
+    svc = service(price_band_pct=50.0)   # deliberately different from the stored band
+    tok = mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT)
+    assert tok.price_band == (req.price_band_low, req.price_band_high) == (99.0, 101.0)
+
+
+def test_a_price_band_disagreement_is_audited_when_an_audit_log_is_supplied(tmp_path):
+    from agent.audit import AuditLog
+
+    store, req = make(tmp_path)
+    svc = service(price_band_pct=50.0)   # 100 * 0.5/1.5 != the stored 99.0/101.0
+    audit = AuditLog()
+    mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT,
+                        audit_log=audit)
+    actions = [e.action for e in audit.events]
+    assert "approval_token_price_band_drift" in actions
+
+
 def test_token_id_is_deterministic_from_request_id(tmp_path):
     store, req = make(tmp_path)
     svc = service()
@@ -144,12 +167,50 @@ def test_refuses_an_invalidated_request(tmp_path):
 
 # ------------------------------------------------------ shown_at agreement
 
-def test_raises_on_shown_at_divergence_rather_than_picking_one(tmp_path):
+def test_raises_when_drift_exceeds_the_tolerance_rather_than_picking_one(tmp_path):
     store, req = make(tmp_path)
     svc = service()
-    later = DECIDE_AT + timedelta(seconds=30)
-    with pytest.raises(ApprovalBridgeError, match="decision_elapsed_ms disagreement"):
+    later = DECIDE_AT + timedelta(seconds=30)   # 30s >> 5000ms tolerance
+    with pytest.raises(ApprovalBridgeError, match="exceeds the 5000ms tolerance"):
         mint_approval_token(req.request_id, store=store, service=svc, now=later)
+
+
+def test_raises_on_a_negative_elapsed(tmp_path):
+    store, req = make(tmp_path)
+    svc = service()
+    with pytest.raises(ApprovalBridgeError, match="negative elapsed"):
+        mint_approval_token(req.request_id, store=store, service=svc,
+                            now=req.shown_at - timedelta(seconds=1))
+
+
+def test_a_small_clock_drift_still_mints_using_the_stores_own_elapsed_ms(tmp_path):
+    """Review fix, 2026-08-02: equality between two independent wall-clock
+    reads is unshippable -- any real caller calls decide(), then mints with
+    a SECOND, later datetime.now(). A few milliseconds of drift must mint
+    successfully, and the resulting token must carry the STORE's own
+    authoritative decision_elapsed_ms, not a slightly-different recomputed
+    one."""
+    store, req = make(tmp_path)
+    svc = service()
+    drifted_now = DECIDE_AT + timedelta(milliseconds=3)
+    tok = mint_approval_token(req.request_id, store=store, service=svc, now=drifted_now)
+    assert tok.decision_elapsed_ms == req.decision_elapsed_ms == 15_000
+
+
+def test_drift_right_at_the_tolerance_boundary_still_mints(tmp_path):
+    store, req = make(tmp_path)
+    svc = service()
+    at_boundary = DECIDE_AT + timedelta(milliseconds=5000)
+    tok = mint_approval_token(req.request_id, store=store, service=svc, now=at_boundary)
+    assert tok.decision_elapsed_ms == req.decision_elapsed_ms == 15_000
+
+
+def test_drift_one_millisecond_past_the_tolerance_boundary_raises(tmp_path):
+    store, req = make(tmp_path)
+    svc = service()
+    past_boundary = DECIDE_AT + timedelta(milliseconds=5001)
+    with pytest.raises(ApprovalBridgeError, match="exceeds the 5000ms tolerance"):
+        mint_approval_token(req.request_id, store=store, service=svc, now=past_boundary)
 
 
 def test_a_failed_mint_from_shown_at_divergence_does_not_burn_the_token_id(tmp_path):

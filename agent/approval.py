@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from .approval_request_store import ApprovalRequestStore
+from .audit import AuditLog
 
 
 class ApprovalError(Exception):
@@ -267,7 +268,11 @@ class ApprovalService:
                 now: datetime, symbol: str = "", side: str = "", qty: float = 0.0,
                 order_type: str = "", time_in_force: str = "",
                 limit_price: float | None = None,
-                lot_id: str | None = None) -> ApprovalToken:
+                lot_id: str | None = None,
+                decision_elapsed_ms: int | None = None,
+                price_band_low: float | None = None,
+                price_band_high: float | None = None,
+                audit_log: AuditLog | None = None) -> ApprovalToken:
         # A token_id is issued once. Re-approving would mint a fresh,
         # unconsumed token and silently reset the single-use guarantee — which
         # is exactly what a replayed inbox event or a restart would do.
@@ -277,14 +282,53 @@ class ApprovalService:
                 + (" and consumed" if self._tokens[token_id].consumed_at else "")
                 + "; a new decision requires a new token id"
             )
+        # LIVE re-check, unaffected by `decision_elapsed_ms` below (review
+        # fix, 2026-08-02): whether the card was ACTUALLY on screen long
+        # enough is a real-time enforcement gate (§10), not an audit figure
+        # -- a caller cannot pass a large `decision_elapsed_ms` to skip it.
         elapsed = now - shown_at
         if elapsed < self.min_display:
             raise ApprovalError(
                 f"card shown for {elapsed.total_seconds():.1f}s; minimum is "
                 f"{self.min_display.total_seconds():.0f}s before approve is enabled (§10)"
             )
-        band = (price_at_analysis * (1 - self.price_band_pct / 100.0),
-                price_at_analysis * (1 + self.price_band_pct / 100.0))
+
+        # PRICE BAND: inherited from the request, not recomputed, when the
+        # caller has one (review fix, 2026-08-02 -- `agent.approval_bridge.
+        # mint_approval_token` always does; a caller with no request, e.g.
+        # every pre-existing test, keeps the computed fallback). If the
+        # request's own stored band disagrees with what this service would
+        # compute today from `price_at_analysis`/`price_band_pct`, the
+        # STORED band wins (it is exactly what the operator saw) and the
+        # disagreement -- config having drifted between the request's
+        # creation and this mint -- is audited, not silently corrected.
+        computed_band = (price_at_analysis * (1 - self.price_band_pct / 100.0),
+                         price_at_analysis * (1 + self.price_band_pct / 100.0))
+        if price_band_low is not None and price_band_high is not None:
+            band = (price_band_low, price_band_high)
+            if (abs(band[0] - computed_band[0]) > 1e-6
+                    or abs(band[1] - computed_band[1]) > 1e-6) and audit_log is not None:
+                audit_log.append(
+                    actor="system", action="approval_token_price_band_drift",
+                    object_type="approval_request", object_id=request_id,
+                    after={"stored_band": [band[0], band[1]],
+                          "recomputed_band": [computed_band[0], computed_band[1]],
+                          "price_band_pct": self.price_band_pct,
+                          "price_at_analysis": price_at_analysis},
+                    timestamp=now,
+                )
+        else:
+            band = computed_band
+
+        # DECISION_ELAPSED_MS: the STORE's own already-audited figure is
+        # authoritative when supplied (review fix, 2026-08-02 -- see
+        # `agent.approval_bridge`'s own module docstring for why equality
+        # between two independent wall-clock reads is unshippable). Falls
+        # back to this call's own live computation for a caller with no
+        # request (every pre-existing test).
+        final_elapsed_ms = (decision_elapsed_ms if decision_elapsed_ms is not None
+                           else int(elapsed.total_seconds() * 1000))
+
         # `symbol`/`side`/`qty`/`order_type`/`time_in_force`/`limit_price`/
         # `lot_id` default to empty/zero/None so every pre-existing caller
         # that only ever exercised the exact-fingerprint path keeps working
@@ -295,7 +339,7 @@ class ApprovalService:
         tok = ApprovalToken(
             token_id=token_id, request_id=request_id, order_fingerprint=fingerprint,
             price_band=band, expires_at=now + self.expiration, decided_at=now,
-            decision_elapsed_ms=int(elapsed.total_seconds() * 1000),
+            decision_elapsed_ms=final_elapsed_ms,
             original_symbol=symbol, original_side=side, original_qty=qty,
             original_order_type=order_type, original_time_in_force=time_in_force,
             original_limit_price=limit_price, original_lot_id=lot_id,

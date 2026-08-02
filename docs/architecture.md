@@ -277,6 +277,14 @@ flags probable rubber-stamping and recommends lowering the cap. Every approval a
 records elapsed decision time in the audit log, which makes the control auditable after
 the fact rather than merely nominal.
 
+The cap counts DECIDED requests only — approved and rejected — not every request created.
+It exists to protect operator attention; a card that expired unread, was invalidated, or
+was suppressed before a request ever existed spent none of that attention, and none of those
+count against it. It rolls over on a market SESSION boundary (`agent.market_calendar`), never
+a bare UTC calendar date — a UTC-date rollover would reset the cap mid-session or hold it
+open across a weekend/holiday in a way that does not correspond to when an operator is
+actually available to spend it.
+
 ---
 
 ## 4. Minimum holding period
@@ -1077,8 +1085,8 @@ round 3) -- the block above had been stale since well before this cleanup unit, 
 every field added across several prior sessions, not only the most recent one:
 `reconciliation_cycle_interval_seconds`; the four money-guardrail stage flags
 (`data_collection_enabled`/`materiality_screen_enabled`/`t4_analysis_enabled`/
-`approval_request_enabled`, see §3.2's dedup-tracker note and §10's sibling-invalidation
-note above for what they gate); the T3 materiality weights/threshold/filing-weight table
+`approval_request_enabled`, see §3.2's dedup-tracker note and §10's earmarking/request-token
+bridge notes for what they gate); the T3 materiality weights/threshold/filing-weight table
 (`materiality_w1`-`w6`, `materiality_threshold`, `threshold_version`,
 `materiality_filing_weights` -- see §3.2's score formula for what these feed);
 `materiality_min_peer_group_size`; `symbol_universe`; the Alpaca trading- and market-data-API
@@ -1229,22 +1237,77 @@ cannot support a "is this smaller order a conservative subset" comparison), and
 fields immediately before the existing, unchanged `ApprovalToken.consume()` call — a caller
 that skips this check cannot reach `consume()` at all in this codebase's real submit path.
 
-**Sibling invalidation (unattended wiring unit, Unit 4).** With two or more approval requests
-pending for the same account, each one's post-trade figures (reserve, concentration, sector
-exposure, earliest normal exit, day-trade count) were computed assuming every OTHER pending
-request would be rejected — approving one makes every sibling's displayed figures wrong the
-instant it fills. This codebase's `agent.approval_request_store.ApprovalRequestStore` resolves
-this by INVALIDATING every other pending request for the same account the moment one is
-approved (never on a rejection — a rejected request changes nothing about the book), rather
-than recomputing the survivors' figures in place. Recomputing was rejected: it risks a human
-approving a card whose numbers silently changed after they read it, and the risk of an
-operator acting on stale-but-still-displayed figures is worse than the cost of asking them to
-look again. This also matches this codebase's own existing precedent elsewhere in this same
-section — a stale quote invalidates a token, and an out-of-bounds modification invalidates a
-card — both are "ask again" outcomes, not "silently correct it for you" ones. An invalidated
-sibling carries `invalidated_reason=f"sibling_approved:{request_id}"`, naming which approval
-invalidated it; invalidating an already-decided sibling is refused (nothing to invalidate),
-and invalidating an already-invalidated one is a no-op, not an error.
+**Earmarking (earmarking unit, 2026-08-02) — replaces sibling invalidation.** With two or
+more approval requests pending for the same account, each one's post-trade figures (reserve,
+concentration, sector exposure, earliest normal exit, day-trade count) used to be computed
+assuming every OTHER pending request would be rejected — approving one made every sibling's
+displayed figures wrong the instant it filled. An earlier version of this codebase covered
+that by INVALIDATING every other pending request for the same account the moment one was
+approved; that was a symptom fix, not the real one — the underlying defect was that a
+pending BUY consumed no accounted-for cash at all until it was actually submitted, so two
+pending requests could each be priced as though the other did not exist. Earmarking removes
+the need for invalidation directly: each pending BUY reserves the settled cash its own order
+would consume the moment its request is created (a SELL/CLOSE frees cash and earmarks
+nothing), and every pending card's post-trade figures — `reserve_pct_after` and
+`sector_exposure_pct_after`, the book-wide figures — are computed net of ALL outstanding
+earmarks, not just its own order's. `concentration_pct_after` stays symbol-specific and is
+deliberately not netted against a sibling's earmark (a sibling belongs, in the common case,
+to a different symbol). Because every pending card already accounts for every other pending
+card's own cash consumption, approving one request never alters another's arithmetic — the
+only justification sibling invalidation ever had — so pending requests may be approved in
+any order, in any combination, or not at all, with no card ever needing a fresh decision on
+that account. `agent.approval_request_store.ApprovalRequestStore.invalidate()` itself is
+unchanged and still exists, for the case it was always actually needed for: a stale quote
+(price drifted outside the band) or an out-of-bounds modification, neither of which
+earmarking touches.
+
+An approved-but-unspent token holds its own request's earmark until the token is consumed,
+expires, or is swept — an approval that is decided but never acted on must not free cash a
+live order is still about to consume. `ApprovalRequestStore.outstanding_earmarks` accepts
+the process's `ApprovalService` for exactly this: an APPROVED request whose token is still
+live is folded into the total the same as an ordinary pending sibling would be.
+
+**The request → token bridge (bridge unit, 2026-08-02, `agent.approval_bridge.
+mint_approval_token`) is the ONLY production path from an approved `ApprovalRequest` to a
+mintable `ApprovalToken`.** Before this unit, `ApprovalRequestStore.decide()` recorded a
+decision and `ApprovalService.approve()` minted a token, with nothing enforcing the join
+between them. The bridge refuses to mint unless the request's decision is exactly
+`APPROVED`, it is not invalidated, and it is not past its own `expires_at`; it passes the
+approved order's real fields (symbol, side, qty, order type, time in force, limit price, lot)
+from the request's own `proposal_snapshot` into `approve()` — those fields default to
+empty/zero/absent for backward compatibility, and a token minted without them can never pass
+`verify_modification_within_bounds` for any order, including the one actually approved; it
+passes the store's own server-recorded `shown_at` and already-audited `decision_elapsed_ms`
+through unchanged (not a fresh, independently computed figure — see below); and it inherits
+the request's own stored price band rather than letting `ApprovalService.approve` recompute
+one from the day's config, so the token enforces exactly the band the operator saw. The
+token's `token_id` is derived deterministically from `request_id` (not caller-supplied), so a
+replayed decision — a retried request, a duplicate inbox event — hits `ApprovalService`'s
+existing `TokenReissued` guard rather than minting a second, independently live token for one
+decision.
+
+The bridge refuses a `proposal_snapshot` naming more than one leg rather than silently
+minting a token for only its first: a sell-to-fund-buy cannot be one approval in a cash
+account, because the SELL's proceeds are unsettled for T+1 and `UNSETTLED_CASH` funding is a
+DISABLED capability. Financing a same-day BUY against a same-day SELL's still-unsettled
+proceeds is not a missing feature to build later — it is a settlement fact that makes "one
+approval, two legs" incoherent for this account type. No producer of `proposal_snapshot` in
+this codebase emits more than one leg today (§9's approval-request path only ever proposes
+one order for one symbol); this guard exists so a future producer cannot introduce a compound
+proposal through this bridge without confronting that constraint directly.
+
+Because minting happens in a call separate from the `decide()` call that approved the
+request, the bridge cannot require the two calls' own wall-clock reads to agree exactly — two
+independent `datetime.now()` reads a few milliseconds apart are never bit-for-bit equal. It
+instead enforces a sanity bound: refusing to mint only if the elapsed time it would itself
+compute from the store's `shown_at` is negative, or exceeds the store's own recorded
+`decision_elapsed_ms` by more than a small, named tolerance — ordinary clock jitter between
+the two calls mints normally, using the store's figure, not the freshly recomputed one; a
+`shown_at` genuinely wrong, or a `now` from some unrelated action, still refuses. Similarly,
+if the request's own stored price band disagrees with what `ApprovalService.approve` would
+compute fresh from the day's `price_band_pct` — configuration having drifted between the
+request's creation and this mint — the stored band still wins, and the disagreement is
+recorded to the audit log as a distinct, named event rather than corrected silently.
 
 **Friction is enforced server-side (§10, unattended wiring unit, Unit 5), not by the UI.** Both
 of §10's friction requirements — a card younger than the configured minimum display time
