@@ -46,6 +46,23 @@ def test_an_ordinary_cadence_field_is_freely_writable():
     assert classify("data_collection_interval_seconds") == FREELY_WRITABLE
 
 
+def test_demoted_throttle_fields_are_freely_writable_not_re_auth(tmp_path):
+    """Review follow-up, 2026-08-03: adding a symbol does not widen a risk
+    gate, and a new-position cap / cooldown period are throttles whose
+    worst case is fewer opportunities, not more exposure or less friction --
+    these three no longer belong in RE_AUTH_REQUIRED_FIELDS."""
+    for field in ("symbol_universe", "max_new_positions_per_day",
+                 "trade_cooldown_period"):
+        assert classify(field) == FREELY_WRITABLE, field
+
+
+def test_remaining_pdt_and_holding_fields_stay_re_auth_required():
+    for field in ("max_day_trades_per_5_sessions", "drawdown_pause_pct",
+                 "minimum_holding_period", "risk_profile",
+                 "approval_expiration_minutes"):
+        assert classify(field) == RE_AUTH_REQUIRED, field
+
+
 def test_capability_tables_are_not_writable_from_this_surface():
     for field in ("trade_capabilities", "sides", "funding", "order_types",
                  "sessions", "time_in_force"):

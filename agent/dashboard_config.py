@@ -67,6 +67,19 @@ NOT_WRITABLE = "not_writable"
 # identity string, uncalibrated screening weights, informational tax rates,
 # and infra timeout/retry/margin numbers that affect operational behaviour
 # but not risk sizing, spend authorization, or a control's own friction.
+#
+# THREE FIELDS DEMOTED HERE FROM RE_AUTH_REQUIRED (review follow-up,
+# 2026-08-03), on the operator's own correction, not my original call:
+# `symbol_universe` -- adding a symbol to the eligible set does not by
+# itself widen a risk gate (max_position_pct/max_sector_pct/the price band
+# still bind on whatever gets traded; a wider universe is more candidates
+# considered, not a looser control on any one of them); `max_new_positions_
+# per_day` and `trade_cooldown_period` -- both are THROTTLES, not gates:
+# their worst case (set too low, or lengthened) is fewer opportunities
+# taken, never more risk exposure or less friction on a given trade. My
+# original classification treated "any field with PDT/holding-policy
+# flavor" as gate-equivalent without checking which direction a bad value
+# actually pushes risk; these three don't belong with the fields that do.
 FREELY_WRITABLE_FIELDS = frozenset({
     "data_collection_interval_seconds", "event_feed_interval_minutes",
     "opportunity_screen_interval_minutes", "routine_decision_interval_minutes",
@@ -83,7 +96,8 @@ FREELY_WRITABLE_FIELDS = frozenset({
     "edgar_http_max_retries", "edgar_ticker_cik_refresh_interval_hours",
     "edgar_document_max_bytes", "cat_fee_auto_admit_ceiling",
     "t4_input_price_per_million_tokens", "t4_output_price_per_million_tokens",
-    "t4_max_output_tokens",
+    "t4_max_output_tokens", "symbol_universe", "max_new_positions_per_day",
+    "trade_cooldown_period",
 })
 
 # Exactly the operator's own named list (cash floor x2, max position x2 --
@@ -92,22 +106,25 @@ FREELY_WRITABLE_FIELDS = frozenset({
 # hard stop, t4_analysis_enabled, approval_min_display_seconds,
 # max_approval_requests_per_day) PLUS a small number of fields this module's
 # own report discloses as structurally identical and added the same way:
-# day-trade/new-position caps (PDT-adjacent, §4.4), symbol_universe
-# (widening what can ever be eligible to trade), drawdown_pause_pct (HALTS
-# AGENT-class, §6), minimum_holding_period/trade_cooldown_period (holding-
-# policy invariants, §4), risk_profile (silently changes MANY fields at
-# once via the §6 preset merge), and approval_expiration_minutes (a
+# `max_day_trades_per_5_sessions` (PDT-adjacent, §4.4 -- raising it changes
+# what the guard permits, not merely how often it's checked),
+# `drawdown_pause_pct` (HALTS AGENT-class, §6), `minimum_holding_period`
+# (a holding-policy invariant, §4 -- shortening it can release exposure a
+# longer hold was protecting), `risk_profile` (silently changes MANY fields
+# at once via the §6 preset merge), and `approval_expiration_minutes` (a
 # FRICTION-class token-lifetime control, alongside approval_min_display_
-# seconds). See this unit's own report for the full list and the reasoning
-# for each addition.
+# seconds). `symbol_universe`, `max_new_positions_per_day`, and
+# `trade_cooldown_period` were ORIGINALLY listed here too but are DEMOTED to
+# FREELY_WRITABLE above (review follow-up, 2026-08-03) -- see that set's own
+# comment for why. See this unit's own report for the full list and the
+# reasoning for each remaining addition.
 RE_AUTH_REQUIRED_FIELDS = frozenset({
     "minimum_settled_cash_pct_of_nlv", "minimum_absolute_settled_cash",
     "max_position_pct", "max_sector_pct", "price_band_pct",
     "budget_hard_stop_usd", "t4_analysis_enabled",
     "approval_min_display_seconds", "max_approval_requests_per_day",
-    "max_new_positions_per_day", "max_day_trades_per_5_sessions",
-    "symbol_universe", "drawdown_pause_pct", "minimum_holding_period",
-    "trade_cooldown_period", "risk_profile", "approval_expiration_minutes",
+    "max_day_trades_per_5_sessions", "drawdown_pause_pct",
+    "minimum_holding_period", "risk_profile", "approval_expiration_minutes",
 })
 
 _KNOWN_FIELDS = frozenset(f.name for f in dataclass_fields(config_module.Config))

@@ -6,6 +6,7 @@ lives in the pure `route_request` function and never in `_Handler`.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -254,6 +255,38 @@ def test_approval_card_path_serves_the_approval_card_html(tmp_path):
     result = route_request(runtime, method="GET", path="/approval-card")
     assert result.status == 200
     assert result.body == (STATIC_DIR / "approval_card.html").read_bytes()
+
+
+def test_command_center_html_has_no_support_js_reference(tmp_path):
+    """Follow-up unit, 2026-08-03: `agent_command_center.html` was replaced
+    with the standalone build (template runtime, React, and fonts inlined)
+    specifically to close the `support.js` gap this unit's own prior report
+    disclosed. `approval_card.html` is intentionally NOT covered here -- it
+    is unchanged and still has the gap; see dashboard_server._serve_static's
+    own docstring."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+    assert "support.js" not in html
+
+
+def test_command_center_html_makes_no_live_external_script_fetch(tmp_path):
+    """The literal ask was 'no unpkg.com URL' -- that does NOT hold as a raw
+    substring check against this exact, unmodified file: its embedded
+    `<script type="__bundler/ext_resources">` block records, as inert JSON
+    provenance metadata, the unpkg.com URLs React/ReactDOM were originally
+    fetched FROM at build time. That block is never executed (its `type`
+    is not a real script MIME type) and is never read at runtime. The
+    thing actually being asked for -- no LIVE fetch of an external script at
+    page load -- is what this test verifies: no `<script src="http(s)://...">`
+    tag exists anywhere in the served markup. React/ReactDOM are inlined as
+    compressed blobs in a `__bundler/manifest` block and reconstituted
+    in-page (e.g. into blob: URLs) by a small bootstrap script already in
+    the page, never fetched over the network. See this unit's own report."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+    assert not re.search(r'<script[^>]+src=["\']https?://', html)
 
 
 # ------------------------------------------------------------------------- 404

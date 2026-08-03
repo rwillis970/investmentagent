@@ -198,10 +198,15 @@ def _parse_json_body(body: bytes | None) -> dict:
 
 def _serve_static(filename: str) -> RouteResult:
     """Byte-identical to the uploaded design file -- never rewritten,
-    restyled, or reinterpreted (see this unit's own report for the
-    `support.js` dependency gap: the served markup references a script
-    this codebase does not have, so its `{{ }}`/`sc-for` bindings will not
-    actually populate in a browser without it)."""
+    restyled, or reinterpreted.
+
+    `agent_command_center.html` (follow-up unit, 2026-08-03) is now the
+    fully self-contained standalone build -- the template runtime, React,
+    and fonts are inlined; there is no `support.js` reference left to be
+    missing. `approval_card.html` is UNCHANGED from the original upload and
+    STILL depends on a `support.js` this codebase does not have -- its
+    `{{ }}`/`sc-for` bindings will not populate in a browser until it gets
+    the same standalone treatment (see this unit's own report)."""
     path = STATIC_DIR / filename
     if not path.exists():
         return _json_result(404, {"error": f"static asset {filename!r} not found"})
