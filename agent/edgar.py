@@ -245,7 +245,26 @@ class EdgarClient:
                                      sleep_fn=sleep_fn, monotonic_fn=monotonic_fn)
 
     def _get(self, url: str, *, params: dict | None = None) -> dict:
-        headers = {"User-Agent": self._user_agent, "Accept-Encoding": "gzip, deflate"}
+        # Accept-Encoding: identity, NOT "gzip, deflate" (production defect,
+        # 2026-08-03). `Transport`/`UrllibTransport` (agent/broker/
+        # transport.py) never inspects Content-Encoding and never
+        # decompresses -- `request`/`request_raw` hand back exactly the
+        # bytes `resp.read()` returned. Advertising gzip support here while
+        # the transport can't decode it means a real EDGAR response
+        # compressed in reply (confirmed: byte 0x8b at position 1 is the
+        # second byte of the 1f 8b gzip magic number) reaches `json.loads`
+        # (here) or `.decode("utf-8", ...)` (`filing_document`, below) as
+        # raw gzip bytes, which fails with exactly the reported
+        # `'utf-8' codec can't decode byte 0x8b in position 1` error --
+        # this halted a real running PAPER-mode loop during data
+        # collection. `identity` tells the server not to compress the
+        # response at all, so there is nothing for either call site to
+        # decompress. THE NARROW FIX FOR THIS PILOT: general compression
+        # support would need Content-Encoding threaded back through
+        # `Transport` and `_read_capped`'s byte cap applied to the
+        # decompressed body, not the wire body -- out of scope here; see
+        # this unit's own delivery report.
+        headers = {"User-Agent": self._user_agent, "Accept-Encoding": "identity"}
         attempts = self._max_retries + 1   # every call here is a read
         last_exc: TransportError | None = None
         for _ in range(attempts):
@@ -266,8 +285,13 @@ class EdgarClient:
         """Same retry/throttle/User-Agent discipline as `_get`, over
         `Transport.request_raw` instead of `request` -- a filing document
         body is not a JSON API response, so `_get` cannot serve it (see
-        `agent.broker.transport.Transport.request_raw`'s own docstring)."""
-        headers = {"User-Agent": self._user_agent, "Accept-Encoding": "gzip, deflate"}
+        `agent.broker.transport.Transport.request_raw`'s own docstring).
+
+        Accept-Encoding: identity here too, same reasoning as `_get`'s own
+        comment above -- a compressed filing document would otherwise reach
+        `filing_document`'s `.decode("utf-8", ...)` below as raw gzip bytes
+        and fail the same way."""
+        headers = {"User-Agent": self._user_agent, "Accept-Encoding": "identity"}
         attempts = self._max_retries + 1   # every call here is a read
         last_exc: TransportError | None = None
         for _ in range(attempts):

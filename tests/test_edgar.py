@@ -166,6 +166,48 @@ def test_ticker_cik_map_hits_the_documented_url_with_the_user_agent_header():
     assert call["headers"]["User-Agent"] == UA
 
 
+def test_get_requests_identity_encoding_not_gzip():
+    """Production defect, 2026-08-03: `_get` used to advertise `Accept-
+    Encoding: gzip, deflate`, but `agent.broker.transport.UrllibTransport`
+    never decompresses a response -- it hands back `resp.read()` verbatim.
+    A real EDGAR response compressed in reply reached `json.loads` as raw
+    gzip bytes and blew up with `'utf-8' codec can't decode byte 0x8b in
+    position 1` (0x8b is the second byte of the gzip magic number 1f 8b),
+    halting a real running PAPER-mode loop during data collection.
+    `identity` tells the server not to compress at all -- the narrow pilot
+    fix, not a transport redesign; see agent/edgar.py's own comment on
+    `_get` for the full reasoning."""
+    t = ScriptedTransport()
+    t.enqueue(200, {})
+    client, _ = edgar_client(t)
+    client.ticker_cik_map()
+    call = t.calls[0]
+    assert call["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_filings_for_cik_also_requests_identity_encoding():
+    """Same header, a different `_get` call site -- proves the fix isn't
+    scoped to `ticker_cik_map` alone."""
+    t = ScriptedTransport()
+    t.enqueue(200, _submissions_body())
+    client, _ = edgar_client(t)
+    client.filings_for_cik("0000320193")
+    call = t.calls[0]
+    assert call["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_get_correctly_parses_json_when_identity_encoding_is_requested():
+    """The header change must not disturb ordinary JSON parsing -- an
+    uncompressed response decodes and parses exactly as before."""
+    t = ScriptedTransport()
+    t.enqueue(200, {
+        "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+    })
+    client, _ = edgar_client(t)
+    result = client.ticker_cik_map()
+    assert result == {"AAPL": "0000320193"}
+
+
 # ------------------------------------------------------------------ filings_for_cik
 
 def _submissions_body(**over):
@@ -329,6 +371,60 @@ def test_filing_document_fetches_via_the_archives_url_with_declaring_user_agent(
     assert result.text == "<html>filing body</html>"
     assert result.truncated is False
     assert result.byte_length == len(b"<html>filing body</html>")
+
+
+def test_filing_document_requests_identity_encoding_not_gzip():
+    """Production defect, 2026-08-03: `_get_raw` used to advertise `Accept-
+    Encoding: gzip, deflate` too, and `Transport.request_raw`/
+    `UrllibTransport.request_raw` never decompresses either -- a compressed
+    filing document would reach `filing_document`'s own
+    `.decode("utf-8", ...)` as raw gzip bytes. `identity` is the same
+    narrow fix as `_get`'s own (see agent/edgar.py's comment on
+    `_get_raw`)."""
+    t = ScriptedTransport()
+    t.enqueue_raw(200, b"<html>filing body</html>")
+    client, _ = edgar_client(t)
+    client.filing_document("320193", "0000320193-26-000011",
+                           "aapl-20260430.htm", max_bytes=1_000_000)
+    call = t.calls[0]
+    assert call["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_filing_document_decodes_and_hashes_correctly_with_identity_encoding():
+    """Ties the header fix to the two things that must remain correct on an
+    ordinary, uncompressed response: text decoding and the sha256 identity
+    hash (computed over the actual stored bytes, per FilingDocumentFetch's
+    own docstring)."""
+    body = b"<html>real filing content, no gzip involved</html>"
+    t = ScriptedTransport()
+    t.enqueue_raw(200, body)
+    client, _ = edgar_client(t)
+    result = client.filing_document("320193", "0000320193-26-000011",
+                                    "aapl-20260430.htm", max_bytes=1_000_000)
+    assert t.calls[0]["headers"]["Accept-Encoding"] == "identity"
+    assert result.text == body.decode("utf-8")
+    assert result.sha256 == hashlib.sha256(body).hexdigest()
+    assert result.truncated is False
+
+
+def test_filing_document_byte_cap_still_applies_with_identity_encoding():
+    """The identity header change must not loosen the byte cap enforced in
+    `Transport.request_raw`/`_read_capped` -- a filing document longer than
+    `max_bytes` is still truncated at exactly `max_bytes`, same as before
+    the header change."""
+    full = b"y" * 500
+    truncated_body = full[:50]
+    t = ScriptedTransport()
+    t.enqueue_raw(200, truncated_body, truncated=True)
+    client, _ = edgar_client(t)
+    result = client.filing_document("320193", "0000320193-26-000011",
+                                    "aapl-20260430.htm", max_bytes=50)
+    call = t.calls[0]
+    assert call["headers"]["Accept-Encoding"] == "identity"
+    assert call["max_bytes"] == 50
+    assert result.truncated is True
+    assert result.byte_length == 50
+    assert result.sha256 == hashlib.sha256(truncated_body).hexdigest()
 
 
 def test_filing_document_computes_sha256_over_the_actual_stored_bytes():
