@@ -1113,3 +1113,136 @@ def test_admit_execution_never_constructs_a_broker_adapter(tmp_path, monkeypatch
         execution_id="e1", holding_policy_version="hp-v1",
     ))
     assert code == 0
+
+
+# --------------------------------------------------------------- --data-dir
+#
+# The launchd-deploy-broken follow-up (2026-08-03): the six-flags-with-no-
+# default defect (in fact eleven, by the time every unit that had added one
+# is counted) that crash-looped the real launchd job. --data-dir is the
+# fix for the CLASS, not just this instance -- every store/log path flag
+# now defaults to a named file inside it, so a future flag addition cannot
+# reproduce the same "wired in tests, absent in production" defect merely
+# by being required with no default.
+
+def test_data_dir_defaults_every_missing_store_path_to_a_named_file_inside_it(tmp_path):
+    from scripts.run_agent import _parse_args
+    data_dir = tmp_path / "data"
+    args = _parse_args([
+        "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--data-dir", str(data_dir),
+    ])
+    assert args.fact_store_path == str(data_dir / "facts.jsonl")
+    assert args.cost_ledger_path == str(data_dir / "cost_ledger.jsonl")
+    assert args.extraction_cache_path == str(data_dir / "extraction_cache.jsonl")
+    assert args.analysis_result_store_path == str(data_dir / "analysis_results.jsonl")
+    assert args.approval_request_store_path == str(data_dir / "approval_requests.jsonl")
+    assert args.opportunity_tracker_path == str(data_dir / "opportunity_events.jsonl")
+    assert args.ledger_store_path == str(data_dir / "ledger.jsonl")
+    assert args.quarantine_store_path == str(data_dir / "quarantine.jsonl")
+    assert args.cash_quarantine_store_path == str(data_dir / "cash_quarantine.jsonl")
+    assert args.mode_store_path == str(data_dir / "mode_state.jsonl")
+    assert args.audit_log_path == str(data_dir / "audit.jsonl")
+    # Created even though it didn't exist yet -- the whole point: a fresh
+    # install needs nothing pre-created beyond this one directory's own
+    # parent (and not even that -- mkdir(parents=True) handles it too).
+    assert data_dir.is_dir()
+
+
+def test_data_dir_default_is_resolved_to_an_absolute_path(tmp_path, monkeypatch):
+    from scripts.run_agent import _parse_args
+    monkeypatch.chdir(tmp_path)
+    args = _parse_args([
+        "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+    ])
+    assert args.data_dir == str(tmp_path / "data")
+
+
+def test_data_dir_explicit_relative_value_is_also_resolved_to_absolute(tmp_path, monkeypatch):
+    from pathlib import Path
+    from scripts.run_agent import _parse_args
+    monkeypatch.chdir(tmp_path)
+    args = _parse_args([
+        "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--data-dir", "relative_data",
+    ])
+    assert Path(args.data_dir).is_absolute()
+    assert args.data_dir == str(tmp_path / "relative_data")
+
+
+def test_explicit_store_path_overrides_are_untouched_by_data_dir_defaulting(tmp_path, monkeypatch):
+    """All existing flags stay accepted as explicit overrides -- none
+    removed, and an explicit value is never redirected into --data-dir."""
+    from scripts.run_agent import _parse_args
+    monkeypatch.chdir(tmp_path)   # only --ledger-store-path is overridden below --
+                                  # the other ten still default into --data-dir,
+                                  # so this isolates its (unused-by-this-test) cwd
+    explicit = tmp_path / "custom" / "ledger.jsonl"
+    args = _parse_args([
+        "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--ledger-store-path", str(explicit),
+    ])
+    assert args.ledger_store_path == str(explicit)
+    # Never auto-created for an explicit override -- only --data-dir itself
+    # gets that treatment; the pre-existing "must already exist" contract
+    # for an explicit path (see deploy/README.md) is unchanged.
+    assert not explicit.parent.exists()
+
+
+def test_data_dir_is_never_created_when_every_store_path_is_given_explicitly(tmp_path, monkeypatch):
+    from scripts.run_agent import _parse_args
+    monkeypatch.chdir(tmp_path)
+    _parse_args([
+        "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--ledger-store-path", str(tmp_path / "l.jsonl"),
+        "--quarantine-store-path", str(tmp_path / "q.jsonl"),
+        "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
+        "--fact-store-path", str(tmp_path / "facts.jsonl"),
+        "--cost-ledger-path", str(tmp_path / "cost_ledger.jsonl"),
+        "--extraction-cache-path", str(tmp_path / "extraction_cache.jsonl"),
+        "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
+        "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
+        "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
+        "--mode-store-path", str(tmp_path / "mode.jsonl"),
+        "--audit-log-path", str(tmp_path / "audit.jsonl"),
+    ])
+    assert not (tmp_path / "data").exists()
+
+
+def test_bare_invocation_with_only_the_four_identity_flags_parses_and_starts(tmp_path, monkeypatch):
+    """The exact contract item 1 of the follow-up demands: `python3
+    scripts/run_agent.py --config config.json --account-id X --key-id Y
+    --secret-ref Z` with NO path flags at all must parse AND start -- not
+    merely survive argparse. Runs main() for real (with run_loop_fn/
+    secrets_provider_factory injected, per this file's own convention) to
+    prove every store actually constructs, not just that _parse_args
+    returns."""
+    import json as json_module
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    monkeypatch.chdir(tmp_path)   # so the default ./data lands inside tmp_path
+
+    captured = {}
+
+    def fake_run_loop(**kwargs):
+        captured.update(kwargs)
+
+    code = main(
+        ["--config", str(config_path), "--account-id", "acct-a",
+        "--key-id", "k", "--secret-ref", "ref"],
+        run_loop_fn=fake_run_loop,
+        secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+    )
+    assert code == 0
+    assert (tmp_path / "data").is_dir()
+    assert len(captured["accounts"]) == 1
+    assert captured["accounts"][0].account_id == "acct-a"
+
+
+def test_missing_account_flags_without_advance_mode_still_errors_with_data_dir_present(tmp_path):
+    """--data-dir does not relax the truly-required identity/credential
+    flags -- only the path flags a default makes sense for."""
+    import pytest
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--data-dir", str(tmp_path / "data")])
+    assert exc_info.value.code == 2

@@ -18,9 +18,21 @@ logged-in user's own session, not as a daemon at boot.
 mkdir -p ~/investmentagent/state ~/investmentagent/logs
 ```
 
-These must exist and be writable *before* the job is loaded -- launchd does
-not create them, and `LedgerStore`/`ModeStore`/`AuditLog` all refuse to
-silently create a parent directory that doesn't exist.
+`~/investmentagent/logs` must exist and be writable *before* the job is
+loaded -- launchd itself creates `StandardOutPath`/`StandardErrorPath` but
+not a missing parent directory for them, and this script has no way to
+create that directory on launchd's behalf.
+
+`~/investmentagent/state` (the directory you'll pass as `--data-dir` in
+step 2) does NOT strictly need to be pre-created any more: `scripts/
+run_agent.py` now creates it itself (`mkdir -p`, equivalent to the command
+above) the moment any store path defaults into it. Creating it here
+anyway is still recommended -- it lets you confirm the path and
+permissions once, up front, rather than discovering a problem on the
+first launchd restart. An INDIVIDUAL store path you override explicitly
+(rather than leaving to default) is a different matter: for that path,
+the underlying store class (`LedgerStore`/`ModeStore`/`AuditLog`/etc.)
+still refuses to silently create ITS OWN parent directory, unchanged.
 
 ## 2. Fill in the placeholders
 
@@ -36,12 +48,49 @@ replace every `/REPLACE/...` value:
   Add it first with `agent.secrets_provider.KeychainSecretsProvider`'s own
   setup, or the macOS `Keychain Access` app / `security add-generic-password`
   directly.
-- `--ledger-store-path`, `--quarantine-store-path`, `--mode-store-path`,
-  `--audit-log-path`: paths under the `state/` directory created in step 1
+- `--data-dir`: an absolute path to the `state/` directory created in
+  step 1. Every durable store/log file `scripts/run_agent.py` needs
+  (ledger, quarantine, cash-quarantine, fact store, cost ledger,
+  extraction cache, analysis-result store, approval-request store,
+  opportunity tracker, mode store, audit log -- eleven files in total)
+  now defaults to a fixed name inside this one directory; you no longer
+  name any of them individually here. See "THE LAUNCHD DEPLOY WAS BROKEN"
+  below for why this replaced eleven separate `--..-path` flags.
 - `StandardOutPath`/`StandardErrorPath`: paths under the `logs/` directory
   created in step 1
 
 Do not put a raw secret anywhere in the plist itself.
+
+### THE LAUNCHD DEPLOY WAS BROKEN (2026-08-03) -- why this template changed
+
+This template used to enumerate every durable store path as its own
+`--..-path` flag. Each time a unit wired a new store into
+`scripts/run_agent.py`'s argparse -- most recently the collection/
+screening/T4/approval-request pipeline -- that flag had **no default**,
+and this checked-in template was never updated to match. The real,
+running launchd job failed argparse on every restart as a result and
+crash-looped: `KeepAlive` kept relaunching a process that could never get
+past its own argument parser. This was the THIRD "wired in tests, absent
+in production" defect found in this codebase (`approval_service` being the
+second).
+
+The fix is `--data-dir`, not a longer list of `--..-path` flags: every
+store/log path `scripts/run_agent.py` needs now defaults to a fixed
+filename inside one directory (see that script's own `_DEFAULT_STORE_
+FILENAMES` table), so a future store addition cannot reproduce this
+defect just by being required with no default. `python3 scripts/
+run_agent.py --config config.json --account-id X --key-id Y --secret-ref
+Z` -- no path flags at all -- now parses and starts; this template still
+pins `--data-dir` to an explicit, absolute path rather than relying on
+its own relative default (`./data`), since a relative default resolves
+against whatever directory launchd happens to start the process in, which
+this template does not otherwise control (no `WorkingDirectory` key is
+set). `tests/test_launchd_plist.py` asserts this template never goes back
+to enumerating individual store paths, and a separate test
+(`tests/test_run_agent_plist_parses.py`) feeds this exact template's
+`ProgramArguments` through `scripts/run_agent.py`'s own real argument
+parser, so a template/parser mismatch like this one fails a test again
+before it ever reaches a running launchd job.
 
 ## 3. Advance the persisted mode to PAPER (fresh install only)
 
@@ -54,11 +103,15 @@ commands once, from the repo root, before loading the job for the first
 time (`--confirmed` is not needed for either step):
 
 ```sh
-python3 scripts/run_agent.py --mode-store-path ~/investmentagent/state/mode_state.jsonl \
-  --audit-log-path ~/investmentagent/state/audit.jsonl --advance-mode-to RESEARCH
-python3 scripts/run_agent.py --mode-store-path ~/investmentagent/state/mode_state.jsonl \
-  --audit-log-path ~/investmentagent/state/audit.jsonl --advance-mode-to PAPER
+python3 scripts/run_agent.py --data-dir ~/investmentagent/state --advance-mode-to RESEARCH
+python3 scripts/run_agent.py --data-dir ~/investmentagent/state --advance-mode-to PAPER
 ```
+
+(`--data-dir` here resolves to the exact same `mode_state.jsonl`/`audit.jsonl`
+paths as before -- those are `_DEFAULT_STORE_FILENAMES`' own names for
+`--mode-store-path`/`--audit-log-path`. Pass `--mode-store-path`/
+`--audit-log-path` explicitly instead if you ever need either to live
+somewhere other than under `--data-dir`.)
 
 Each prints and exits 0 on success (or exits 1 with a clear reason if the
 step is illegal or out of order -- nothing is written to either store on a
@@ -131,8 +184,64 @@ needs to be renewed, a locked keychain still needs to be unlocked) --
 they exist so an operator finds out promptly rather than discovering days
 later that the loop has been silently failing the whole time.
 
+# Installing the operator dashboard (`com.investmentagent.dashboard`)
+
+This installs `scripts/run_dashboard.py` (§10; operator decision surface
+unit) as a second, separate macOS LaunchAgent, so the dashboard is
+reachable at `http://127.0.0.1:8765/` without a terminal open. Until this
+job existed there was no way to run the dashboard unattended at all --
+launched by hand, it would stop the moment the terminal it was started in
+closed.
+
+**Reads the SAME durable state as the reconciliation loop, not a second
+copy of it.** Point this job's `--data-dir` at the exact same directory
+as the reconciliation loop's own `--data-dir` (step 2 above) -- the
+dashboard attaches a read/decide surface onto the cost ledger, approval
+requests, opportunity tracker, and audit log a real `com.investmentagent.
+reconcile-loop` job is writing to, using the identical filenames (see
+`scripts/run_dashboard.py`'s own module docstring). It never constructs a
+broker adapter and never touches a credential (see `agent/dashboard_
+server.py`'s own "what this surface must never do").
+
+## 1. Fill in the placeholders
+
+Copy `deploy/com.investmentagent.dashboard.plist` to
+`~/Library/LaunchAgents/com.investmentagent.dashboard.plist` and replace
+every `/REPLACE/...` value:
+
+- the absolute path to `scripts/run_dashboard.py` in your checkout of this repo
+- the absolute path to your `config.json`
+- `--account-id` (optional for this script, but recommended -- without it,
+  `GET /api/state`'s `approvals.outstanding_earmarks_usd` reports `null`
+  with an unavailable-reason string instead of a real figure)
+- `--data-dir`: the SAME absolute path as the reconciliation loop's own
+  `--data-dir`
+- `StandardOutPath`/`StandardErrorPath`: paths under the `logs/` directory
+  created in step 1 of the reconciliation loop's own install (a second
+  pair of log files, not shared with the loop's own)
+
+`--host`/`--port` are already filled in (`127.0.0.1`/`8765`) and should
+stay that way -- `agent.dashboard_server.make_server` refuses any
+non-loopback host outright regardless of what this file says.
+
+## 2. Load the job
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.investmentagent.dashboard.plist
+```
+
+Then open `http://127.0.0.1:8765/` in a browser on the same machine.
+
+**Known gap, disclosed, not fixed here:** `scripts/run_dashboard.py` does
+not construct a broker adapter or a `DayTradeGuard`, so `GET /api/state`'s
+`risk_gates.current_reserve_pct`/`reconciliation.day_trade_count` report
+`null` with an unavailable-reason string even once this job is running --
+see this unit's own report for what wiring those in for real would
+require.
+
 ## Uninstalling
 
 ```sh
 launchctl bootout gui/$(id -u)/com.investmentagent.reconcile-loop
+launchctl bootout gui/$(id -u)/com.investmentagent.dashboard
 ```

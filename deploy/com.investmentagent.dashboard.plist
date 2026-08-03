@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for the operator dashboard (scripts/run_dashboard.py; operator
+  decision surface unit, 2026-08-03, launchd deploy broken follow up). Until
+  this file existed there was no way to run the dashboard unattended at
+  all: an operator had to start scripts/run_dashboard.py by hand, in a
+  terminal, every time. See deploy/README.md for installation and the
+  placeholder values below.
+
+  Every /REPLACE/... value below is a placeholder. Fill them in for your
+  own machine before loading this job; do not put a raw secret anywhere in
+  this file (this script reads no credential and constructs no broker
+  adapter at all, see agent/dashboard_server.py's own module docstring's
+  "what this surface must never do").
+
+  LOOPBACK ONLY, ALWAYS. The host flag is pinned to 127.0.0.1 explicitly,
+  not left to its own (already 127.0.0.1) default: this surface has no
+  authentication of its own and agent.dashboard_server.make_server refuses
+  any other host outright, but a template should say so explicitly rather
+  than relying on a default silently staying safe forever.
+
+  THE SAME DATA DIR TREATMENT AS THE RECONCILIATION LOOP'S OWN PLIST. One
+  data dir flag, not four separate individual path flags: see that plist's
+  own top-of-file comment for why enumerating store paths individually is
+  exactly the maintenance burden that crash looped the OTHER job in
+  production. Point this job's data dir at the SAME directory as a real
+  com.investmentagent.reconcile-loop job's own data dir: this script
+  attaches a read/decide surface onto that SAME durable state (cost
+  ledger, approval requests, opportunity tracker, audit log), not a
+  second, independent copy of it. See scripts/run_dashboard.py's own
+  module docstring.
+
+  THE ACCOUNT ID FLAG IS OPTIONAL FOR THIS SCRIPT (unlike the reconciliation
+  loop's own account id flag, which is required). Passing it here is still
+  recommended for a real, single-account pilot: without it, GET
+  /api/state's approvals.outstanding_earmarks_usd reports null with an
+  unavailable-reason string instead of a real figure (see
+  agent/dashboard_state.py's own module docstring). See this unit's own
+  report for the fuller list of what this dashboard does NOT wire up yet
+  (broker_account, broker_positions, day_trade_guard).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.investmentagent.dashboard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/investmentagent/scripts/run_dashboard.py</string>
+        <string>--config</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/config.json</string>
+        <string>--account-id</string>
+        <string>REPLACE_WITH_ACCOUNT_ID</string>
+        <string>--data-dir</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8765</string>
+    </array>
+
+    <!-- Start when the job is loaded, same reasoning as the reconciliation
+         loop's own plist. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on a non-zero exit only, same reasoning as the
+         reconciliation loop's own plist: this process is meant to run
+         forever (server.serve_forever()), so a non-zero exit means it
+         crashed, not that it finished. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Same reasoning as the reconciliation loop's own plist: bounds a
+         permanent failure (e.g. a config that no longer parses) to one
+         relaunch attempt a minute rather than a tight crash loop. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Separate files, not one shared path, same reasoning as the
+         reconciliation loop's own plist. Directory must exist and be
+         writable before this job is loaded. -->
+    <key>StandardOutPath</key>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/logs/dashboard.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/logs/dashboard.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

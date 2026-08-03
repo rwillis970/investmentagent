@@ -733,6 +733,50 @@ def _run_admit_or_reject_cash_event(*, decision: str, activity_id: str, account_
         return 1
 
 
+#  --data-dir DEFAULTING (launchd-deploy-broken follow-up, 2026-08-03).
+#
+#  THE DEFECT: the unattended-wiring unit added `--fact-store-path`/
+#  `--cost-ledger-path`/`--extraction-cache-path`/`--analysis-result-store-
+#  path`/`--approval-request-store-path`/`--opportunity-tracker-path` (and
+#  earlier units added `--ledger-store-path`/`--quarantine-store-path`/
+#  `--cash-quarantine-store-path`/`--mode-store-path`/`--audit-log-path`) as
+#  flags with NO DEFAULT -- exercised in every test in tests/test_run_agent.py
+#  (which always passes all eleven explicitly via `tmp_path`), but the
+#  checked-in `deploy/com.investmentagent.reconcile-loop.plist` and
+#  `deploy/README.md` were never updated to match, so the REAL, running
+#  launchd job failed `argparse` on every restart and crash-looped. This is
+#  the THIRD "wired in tests, absent in production" defect in this codebase
+#  (`approval_service` being the second -- see the operator-decision-surface
+#  unit's own report). Fixing the instance (editing the plist alone) would
+#  leave the SAME class of defect ready to recur the next time a flag is
+#  added; fixing the class means no *required, path-shaped* flag should ever
+#  again be able to lack a sane default.
+#
+#  THE FIX: `--data-dir` (default `./data`, resolved to an absolute path
+#  below) is the one new required-nothing flag. Every path flag in
+#  `_DEFAULT_STORE_FILENAMES` below defaults to a fixed filename inside it
+#  when not given explicitly -- every existing flag STAYS accepted as an
+#  explicit override (nothing removed; every test in tests/test_run_agent.py
+#  that already passes all eleven paths explicitly is completely unaffected).
+#  `--mode-store-path`/`--audit-log-path` lose their old `required=True`
+#  for the same reason: a required flag with no default is exactly the
+#  shape of bug this fix exists to close off, and there is no principled
+#  reason mode/audit should be treated differently from the other nine.
+_DEFAULT_STORE_FILENAMES = {
+    "fact_store_path": "facts.jsonl",
+    "cost_ledger_path": "cost_ledger.jsonl",
+    "extraction_cache_path": "extraction_cache.jsonl",
+    "analysis_result_store_path": "analysis_results.jsonl",
+    "approval_request_store_path": "approval_requests.jsonl",
+    "opportunity_tracker_path": "opportunity_events.jsonl",
+    "ledger_store_path": "ledger.jsonl",
+    "quarantine_store_path": "quarantine.jsonl",
+    "cash_quarantine_store_path": "cash_quarantine.jsonl",
+    "mode_store_path": "mode_state.jsonl",
+    "audit_log_path": "audit.jsonl",
+}
+
+
 def _parse_args(argv: list[str] | None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",
@@ -746,61 +790,60 @@ def _parse_args(argv: list[str] | None):
     parser.add_argument("--secret-ref",
                         help="keychain account name the API secret is stored under; "
                              "required unless --advance-mode-to is given")
+    parser.add_argument("--data-dir", default="./data",
+                        help="base directory for every store/log file below that isn't "
+                             "given an explicit override (resolved to an absolute path; "
+                             "created, mkdir -p, if it doesn't exist and at least one path "
+                             "below actually defaults into it). See _DEFAULT_STORE_FILENAMES "
+                             "just above this function for the exact filename each flag "
+                             "defaults to. This is the fix for 'required flag, no default, "
+                             "no matching plist update' as a CLASS, not a one-off patch to "
+                             "the eleven flags that happened to be missing this time.")
     parser.add_argument("--ledger-store-path",
-                        help="required unless --advance-mode-to/--admit-execution/"
-                             "--reject-execution is given. Also required, alongside "
+                        help="defaults to <data-dir>/ledger.jsonl. Also read, alongside "
                              "--account-id and --cash-quarantine-store-path, for "
                              "--admit-cash-event/--reject-cash-event -- --admit-cash-event "
                              "reads this store's opening-balance establishment instant to "
                              "refuse a pre-baseline admission (see module docstring's "
                              "--ADMIT-CASH-EVENT section); --reject-cash-event never reads "
-                             "it, but must supply it too for a uniform requirement.")
+                             "it, but takes the same default too.")
     parser.add_argument("--quarantine-store-path",
                         help="durable ExecutionQuarantineStore file (agent/"
-                             "execution_quarantine.py) -- survives a restart; required "
-                             "unless --advance-mode-to is given. Also required, alongside "
+                             "execution_quarantine.py) -- survives a restart; defaults to "
+                             "<data-dir>/quarantine.jsonl. Also read, alongside "
                              "--account-id, for --admit-execution/--reject-execution.")
     parser.add_argument("--fact-store-path",
                         help="durable agent.store.FactStore file the collection/screening "
                              "pipeline (Units 1-3, unattended wiring unit) reads and writes -- "
-                             "required unless --advance-mode-to/--admit-execution/"
-                             "--reject-execution/--admit-cash-event/--reject-cash-event is "
-                             "given. Harmless if the collection/screening flags are off: the "
-                             "store is still constructed (see agent.pipeline_stage's own "
-                             "money-guardrail docstring), just never written to.")
+                             "defaults to <data-dir>/facts.jsonl. Harmless if the collection/"
+                             "screening flags are off: the store is still constructed (see "
+                             "agent.pipeline_stage's own money-guardrail docstring), just "
+                             "never written to.")
     parser.add_argument("--cost-ledger-path",
                         help="durable agent.cost.CostLedger file -- the SAME ledger the §8.2 "
                              "hard stop and the T3 w6 budget brake both read, so a restart "
-                             "does not reset month-to-date spend. Required unless "
-                             "--advance-mode-to/--admit-execution/--reject-execution/"
-                             "--admit-cash-event/--reject-cash-event is given.")
+                             "does not reset month-to-date spend. Defaults to <data-dir>/"
+                             "cost_ledger.jsonl.")
     parser.add_argument("--extraction-cache-path",
                         help="durable agent.extraction_store.ExtractionCacheStore file -- so "
                              "a restart does not re-pay for a document already analysed. "
                              "SHARED across accounts (see agent.pipeline_stage's own module "
-                             "docstring). Required unless --advance-mode-to/"
-                             "--admit-execution/--reject-execution/--admit-cash-event/"
-                             "--reject-cash-event is given.")
+                             "docstring). Defaults to <data-dir>/extraction_cache.jsonl.")
     parser.add_argument("--analysis-result-store-path",
                         help="durable agent.analysis_result_store.AnalysisResultStore file -- "
                              "one row per real T4 analysis call. SHARED across accounts. "
-                             "Required unless --advance-mode-to/--admit-execution/"
-                             "--reject-execution/--admit-cash-event/--reject-cash-event is "
-                             "given.")
+                             "Defaults to <data-dir>/analysis_results.jsonl.")
     parser.add_argument("--approval-request-store-path",
                         help="durable agent.approval_request_store.ApprovalRequestStore file "
                              "(Unit 4, unattended wiring unit) -- one row per approval request "
                              "this account's analyses produced, including suppressed/"
-                             "invalidated ones. Required unless --advance-mode-to/"
-                             "--admit-execution/--reject-execution/--admit-cash-event/"
-                             "--reject-cash-event is given.")
+                             "invalidated ones. Defaults to <data-dir>/approval_requests.jsonl.")
     parser.add_argument("--opportunity-tracker-path",
                         help="durable agent.opportunity_event_tracker.OpportunityEventTracker "
                              "file (Unit 2, unattended wiring unit) -- which OpportunityEvents "
                              "have already been screened/analysed, so a restart does not "
-                             "re-trigger the same filing forever. Required unless "
-                             "--advance-mode-to/--admit-execution/--reject-execution/"
-                             "--admit-cash-event/--reject-cash-event is given.")
+                             "re-trigger the same filing forever. Defaults to <data-dir>/"
+                             "opportunity_events.jsonl.")
     parser.add_argument("--account-type", default="TAXABLE",
                         choices=[t.value for t in AccountType],
                         help="this account's tax treatment -- feeds agent.pipeline."
@@ -812,15 +855,16 @@ def _parse_args(argv: list[str] | None):
                              "ACCT = \"acct-taxable\").")
     parser.add_argument("--cash-quarantine-store-path",
                         help="durable CashEventQuarantineStore file (agent/"
-                             "cash_event_quarantine.py) -- survives a restart; required "
-                             "unless --advance-mode-to/--admit-execution/--reject-execution "
-                             "is given. Also required, alongside --account-id, for "
-                             "--admit-cash-event/--reject-cash-event.")
-    parser.add_argument("--mode-store-path", required=True,
-                        help="durable ModeStore file -- survives a restart")
-    parser.add_argument("--audit-log-path", required=True,
+                             "cash_event_quarantine.py) -- survives a restart; defaults to "
+                             "<data-dir>/cash_quarantine.jsonl. Also read, alongside "
+                             "--account-id, for --admit-cash-event/--reject-cash-event.")
+    parser.add_argument("--mode-store-path",
+                        help="durable ModeStore file -- survives a restart; defaults to "
+                             "<data-dir>/mode_state.jsonl")
+    parser.add_argument("--audit-log-path",
                         help="durable AuditLog file -- survives a restart, fsynced on every "
-                             "append (see agent/audit.py's own docstring for why)")
+                             "append (see agent/audit.py's own docstring for why); defaults "
+                             "to <data-dir>/audit.jsonl")
     parser.add_argument("--advance-mode-to", choices=list(mode_fsm.MODES), default=None,
                         help="advance the PERSISTED mode one legal §9.2 step, with no "
                              "broker adapter and no account reconciliation, then exit -- "
@@ -871,44 +915,77 @@ def _parse_args(argv: list[str] | None):
                              "irrelevant, and harmless, for PAPER")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+
+    # --data-dir DEFAULTING -- see _DEFAULT_STORE_FILENAMES's own comment
+    # just above this function for why this exists. Resolved to an absolute
+    # path unconditionally (cheap, no I/O); the actual defaulting -- and the
+    # directory's mkdir -p -- is scoped to ONLY the attrs the ACTIVE
+    # invocation shape (below) will actually read, not all eleven
+    # regardless of mode. Two reasons this scoping matters, not just one:
+    # (1) --admit-execution/--admit-cash-event/--advance-mode-to each use a
+    # small subset of the eleven stores -- defaulting (and creating a
+    # directory for) the other eight/nine would construct/touch stores
+    # those code paths never open, for no reason; (2) more importantly, a
+    # caller of ANY of these three narrower paths who supplies every path
+    # THEY need explicitly (as every existing test in tests/test_run_agent.py
+    # does) must never have `--data-dir`'s default (`./data`, relative to
+    # cwd) silently created on their behalf -- unscoped defaulting did
+    # exactly that during this fix's own development (every --advance-mode-
+    # to/--admit-execution/--admit-cash-event test omits the OTHER stores'
+    # flags, since its own code path never reads them, and a first version
+    # of this fix defaulted-and-created a real `./data` in the repo root on
+    # every one of those tests).
+    args.data_dir = str(Path(args.data_dir).resolve())
+
+    def _default_relevant_paths(attrs: tuple[str, ...]) -> None:
+        used = False
+        for attr in attrs:
+            if getattr(args, attr) is None:
+                setattr(args, attr, str(Path(args.data_dir) / _DEFAULT_STORE_FILENAMES[attr]))
+                used = True
+        if used:
+            Path(args.data_dir).mkdir(parents=True, exist_ok=True)
+
     if args.admit_execution is not None and args.reject_execution is not None:
         parser.error("--admit-execution and --reject-execution are mutually exclusive")
     if args.admit_cash_event is not None and args.reject_cash_event is not None:
         parser.error("--admit-cash-event and --reject-cash-event are mutually exclusive")
+    # VALIDATE BEFORE DEFAULTING, deliberately -- not just for the account-
+    # id/config/key-id/secret-ref values themselves. `parser.error()` below
+    # raises `SystemExit` immediately; checking these FIRST means an
+    # invocation that's about to be rejected outright never reaches
+    # `_default_relevant_paths` at all, so it never creates a directory on
+    # the way to failing. (Doing it the other way around -- default first,
+    # validate second -- was this fix's own first draft, and it meant every
+    # already-invalid invocation still mkdir'd `--data-dir` before erroring
+    # out; see tests/test_run_agent.py's own comment on this.)
     if args.admit_execution is not None or args.reject_execution is not None:
         missing = [name for name, val in (
             ("--account-id", args.account_id),
-            ("--quarantine-store-path", args.quarantine_store_path),
         ) if val is None]
         if missing:
             parser.error(
                 "the following arguments are required for --admit-execution/"
                 "--reject-execution: " + ", ".join(missing)
             )
+        _default_relevant_paths(("quarantine_store_path", "audit_log_path"))
     elif args.admit_cash_event is not None or args.reject_cash_event is not None:
         missing = [name for name, val in (
             ("--account-id", args.account_id),
-            ("--cash-quarantine-store-path", args.cash_quarantine_store_path),
-            ("--ledger-store-path", args.ledger_store_path),
         ) if val is None]
         if missing:
             parser.error(
                 "the following arguments are required for --admit-cash-event/"
                 "--reject-cash-event: " + ", ".join(missing)
             )
-    elif args.advance_mode_to is None:
+        _default_relevant_paths(("cash_quarantine_store_path", "ledger_store_path",
+                                 "audit_log_path"))
+    elif args.advance_mode_to is not None:
+        _default_relevant_paths(("mode_store_path", "audit_log_path"))
+    else:
         missing = [name for name, val in (
             ("--config", args.config), ("--account-id", args.account_id),
             ("--key-id", args.key_id), ("--secret-ref", args.secret_ref),
-            ("--ledger-store-path", args.ledger_store_path),
-            ("--quarantine-store-path", args.quarantine_store_path),
-            ("--cash-quarantine-store-path", args.cash_quarantine_store_path),
-            ("--fact-store-path", args.fact_store_path),
-            ("--cost-ledger-path", args.cost_ledger_path),
-            ("--extraction-cache-path", args.extraction_cache_path),
-            ("--analysis-result-store-path", args.analysis_result_store_path),
-            ("--approval-request-store-path", args.approval_request_store_path),
-            ("--opportunity-tracker-path", args.opportunity_tracker_path),
         ) if val is None]
         if missing:
             parser.error(
@@ -916,6 +993,7 @@ def _parse_args(argv: list[str] | None):
                 "--admit-execution/--reject-execution/--admit-cash-event/"
                 "--reject-cash-event is given: " + ", ".join(missing)
             )
+        _default_relevant_paths(tuple(_DEFAULT_STORE_FILENAMES))
     return args
 
 

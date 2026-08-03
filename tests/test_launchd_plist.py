@@ -36,13 +36,58 @@ def test_label_is_present_and_reverse_dns_shaped():
 
 
 def test_program_arguments_invoke_run_agent_with_every_required_flag():
+    """Launchd-deploy-broken follow-up (2026-08-03): `scripts/run_agent.py`
+    now only truly REQUIRES --config/--account-id/--key-id/--secret-ref --
+    every store/log path flag (--ledger-store-path, --mode-store-path,
+    --audit-log-path, etc.) has a real default via --data-dir, so this
+    assertion no longer names any of them individually (a template that
+    omits one of THOSE is no longer broken -- that was the whole point of
+    the fix). --data-dir itself is still asserted below: not because the
+    parser requires it (its own default is `./data`, unusable under
+    launchd -- see that test's own docstring), but because a real
+    deployment should always pin it to an explicit, absolute directory."""
     plist = load_plist()
     args = plist["ProgramArguments"]
     assert any("run_agent.py" in a for a in args)
-    for flag in ("--config", "--account-id", "--key-id", "--secret-ref",
-                "--ledger-store-path", "--quarantine-store-path",
-                "--mode-store-path", "--audit-log-path"):
+    for flag in ("--config", "--account-id", "--key-id", "--secret-ref"):
         assert flag in args, f"{flag} missing from ProgramArguments"
+
+
+def test_program_arguments_pin_an_explicit_data_dir_rather_than_the_relative_default():
+    """`--data-dir`'s own default (`./data`) resolves relative to whatever
+    directory the process happens to start in -- under launchd that is
+    unpredictable (no `WorkingDirectory` key is set here, deliberately: the
+    explicit --data-dir value makes one unnecessary). The checked-in
+    template must therefore always pass --data-dir explicitly, with an
+    absolute path, rather than ever relying on that relative default."""
+    plist = load_plist()
+    args = plist["ProgramArguments"]
+    assert "--data-dir" in args
+    value = args[args.index("--data-dir") + 1]
+    assert value.startswith("/"), (
+        f"--data-dir value {value!r} must be an absolute path, not left to "
+        "resolve relative to launchd's own (unpredictable) starting directory"
+    )
+
+
+def test_program_arguments_no_longer_enumerate_individual_store_paths():
+    """Regression guard for the actual defect: this template must never go
+    back to naming every durable store path individually -- that is
+    exactly the maintenance burden ('a required flag with no default, and
+    a template that fell behind it') this fix exists to remove. A single
+    --data-dir replaces all eleven."""
+    plist = load_plist()
+    args = plist["ProgramArguments"]
+    for flag in ("--ledger-store-path", "--quarantine-store-path",
+                "--cash-quarantine-store-path", "--fact-store-path",
+                "--cost-ledger-path", "--extraction-cache-path",
+                "--analysis-result-store-path", "--approval-request-store-path",
+                "--opportunity-tracker-path", "--mode-store-path",
+                "--audit-log-path"):
+        assert flag not in args, (
+            f"{flag} is enumerated individually in the checked-in template -- "
+            "it should be covered by --data-dir instead"
+        )
 
 
 def test_keep_alive_restarts_only_on_a_non_zero_exit():

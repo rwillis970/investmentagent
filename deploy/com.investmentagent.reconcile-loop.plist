@@ -12,6 +12,20 @@
   this file. secret-ref is a keychain account name, resolved by
   agent.secrets_provider.KeychainSecretsProvider at the point of use, never
   a value that belongs here.
+
+  THE DATA DIR FLAG, NOT ELEVEN SEPARATE STORE PATH FLAGS (launchd deploy
+  broken follow up, 2026-08-03). This template used to enumerate every
+  durable store path individually, and fell behind scripts/run_agent.py's
+  own argparse every time a new store was wired in: most recently, this
+  exact job crash looped in production because six (by the time every
+  prior gap was counted, eleven) of those flags had no default and this
+  file was never updated to match. The data dir flag (see scripts/
+  run_agent.py's own argparse help text for its exact spelling) is that
+  script's fix for the CLASS of that defect: every store/log path now
+  defaults to a fixed filename inside one directory, so this template only
+  ever needs to name the directory, never any individual file inside it.
+  An explicit override flag for a single store path is still accepted here
+  if you ever need one store to live somewhere else; ordinarily you won't.
 -->
 <plist version="1.0">
 <dict>
@@ -30,14 +44,10 @@
         <string>REPLACE_WITH_ALPACA_PAPER_KEY_ID</string>
         <string>--secret-ref</string>
         <string>REPLACE_WITH_KEYCHAIN_SECRET_REF</string>
-        <string>--ledger-store-path</string>
-        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/ledger.jsonl</string>
-        <string>--quarantine-store-path</string>
-        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/quarantine.jsonl</string>
-        <string>--mode-store-path</string>
-        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/mode_state.jsonl</string>
-        <string>--audit-log-path</string>
-        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state/audit.jsonl</string>
+        <string>--data-dir</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state</string>
+        <string>--account-type</string>
+        <string>TAXABLE</string>
     </array>
 
     <!-- Start when the job is loaded (e.g. at login, or immediately on

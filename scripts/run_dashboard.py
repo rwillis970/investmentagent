@@ -66,18 +66,71 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+#  --data-dir DEFAULTING (launchd-deploy-broken follow-up, 2026-08-03): the
+#  EXACT same defect shape as scripts/run_agent.py's own six-flags-with-no-
+#  default bug, just not yet exploited in production because no plist for
+#  THIS script existed at all until this same unit -- "there is no way to
+#  run the dashboard unattended today" (see deploy/README.md). Fixing the
+#  class here too, not only in run_agent.py: `--cost-ledger-path`/
+#  `--approval-request-store-path`/`--opportunity-tracker-path`/`--audit-
+#  log-path` all default to a named file inside `--data-dir` when not given
+#  explicitly. THE FILENAMES ARE THE IDENTICAL ONES `scripts/run_agent.py`'s
+#  own `_DEFAULT_STORE_FILENAMES` uses for these same four stores --
+#  deliberately, since this module's own docstring already promises "the
+#  same data directory a running run_agent.py process reads/writes can be
+#  pointed at directly": pointing this script's `--data-dir` at the SAME
+#  directory as a real run_agent.py deployment must resolve to the SAME
+#  four files, not a second, independently-named copy of them.
+_DEFAULT_STORE_FILENAMES = {
+    "cost_ledger_path": "cost_ledger.jsonl",
+    "approval_request_store_path": "approval_requests.jsonl",
+    "opportunity_tracker_path": "opportunity_events.jsonl",
+    "audit_log_path": "audit.jsonl",
+}
+
+
+def _parse_args(argv: list[str] | None):
+    """Split out from `main` so the `--data-dir` defaulting can be tested
+    directly (mirroring `scripts/run_agent.py`'s own `_parse_args`), with
+    no server started and no blocking `serve_forever()` call anywhere near
+    it."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="path to config.json")
     parser.add_argument("--account-id", default=None)
-    parser.add_argument("--cost-ledger-path", required=True)
-    parser.add_argument("--approval-request-store-path", required=True)
-    parser.add_argument("--opportunity-tracker-path", required=True)
-    parser.add_argument("--audit-log-path", required=True)
+    parser.add_argument("--data-dir", default="./data",
+                        help="base directory for the four store/log files below that "
+                             "aren't given an explicit override (resolved to an "
+                             "absolute path; created, mkdir -p, if it doesn't exist "
+                             "and at least one path below actually defaults into it). "
+                             "Point this at the SAME directory a running "
+                             "scripts/run_agent.py process uses to read/write the "
+                             "same durable state -- see this module's own docstring.")
+    parser.add_argument("--cost-ledger-path",
+                        help="defaults to <data-dir>/cost_ledger.jsonl")
+    parser.add_argument("--approval-request-store-path",
+                        help="defaults to <data-dir>/approval_requests.jsonl")
+    parser.add_argument("--opportunity-tracker-path",
+                        help="defaults to <data-dir>/opportunity_events.jsonl")
+    parser.add_argument("--audit-log-path",
+                        help="defaults to <data-dir>/audit.jsonl")
     parser.add_argument("--host", default="127.0.0.1",
                         help="must stay a loopback address (see agent.dashboard_server)")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
+
+    args.data_dir = str(Path(args.data_dir).resolve())
+    used_data_dir = False
+    for attr, filename in _DEFAULT_STORE_FILENAMES.items():
+        if getattr(args, attr) is None:
+            setattr(args, attr, str(Path(args.data_dir) / filename))
+            used_data_dir = True
+    if used_data_dir:
+        Path(args.data_dir).mkdir(parents=True, exist_ok=True)
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
 
     cfg = config_module.load(json.loads(Path(args.config).read_text()))
     runtime = build_dashboard_runtime(
