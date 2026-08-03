@@ -998,6 +998,13 @@ def main(argv: list[str] | None = None, *,
             expiration=timedelta(minutes=cfg.approval_expiration_minutes),
             min_display=timedelta(seconds=cfg.approval_min_display_seconds),
             max_per_day=cfg.max_approval_requests_per_day,
+            # Operator decision surface unit, 2026-08-03: `cfg.price_band_pct`
+            # is new this commit -- this construction used to omit it
+            # entirely, silently relying on `ApprovalService`'s own
+            # `price_band_pct: float = 1.0` default rather than a real,
+            # configured value (see that field's own comment in
+            # agent/config.py).
+            price_band_pct=cfg.price_band_pct,
         )
         pipeline = build_pipeline_runtime(
             cfg, account_id=args.account_id, credentials=credentials,

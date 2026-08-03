@@ -118,6 +118,26 @@ disagreement with what it would otherwise compute (see that method's own
 docstring); this function supplies `audit_log` through to it so that trace
 actually gets written when this bridge is the caller.
 
+MODIFY-WITHIN-BOUNDS AT APPROVAL TIME (§10; operator decision surface unit,
+2026-08-03). An operator may approve a SMALLER size, or a limit that moves
+ADVERSELY to the trade, without a fresh analysis -- the same §10 rule
+`agent.approval.verify_modification_within_bounds` already enforces at
+TOKEN CONSUMPTION, applied here at MINT time instead, against the
+REQUEST's own `proposal_snapshot` (there is no token yet to compare
+against). `qty_override`/`limit_price_override`, both optional, are
+validated by `_validate_modification` below before the fingerprint is even
+computed: a size larger than what was authorized, or a limit that moves
+FAVOURABLY (higher for a BUY, lower for a SELL/CLOSE), raises
+`ApprovalBridgeError` rather than silently clamping or minting for the
+unmodified order. On success, the OVERRIDE values -- not the snapshot's
+own -- are what get fingerprinted and passed to `ApprovalService.approve`,
+so the resulting token is bound to the order the operator actually
+authorized, not the one T4 originally proposed. This mirrors `verify_
+modification_within_bounds`'s own bounds logic deliberately (kept as a
+short, independent check here rather than manufacturing a fake token just
+to reuse that function) -- if the two ever need to diverge, that is itself
+a finding worth raising, not a refactor to do quietly.
+
 EARMARK HANDOFF (item 2). This module does not itself move an earmark
 anywhere -- there is nothing to move. The earmark lives on the REQUEST
 (`ApprovalRequest.earmark`, unchanged by this unit) for the request's
@@ -176,9 +196,53 @@ def _reject_compound_snapshot(proposal_snapshot: dict) -> None:
         )
 
 
+def _validate_modification(proposal: dict, *, qty_override: float | None,
+                           limit_price_override: float | None) -> None:
+    """§10 modify-within-bounds, checked against the REQUEST's own
+    `proposal_snapshot` (see module docstring). Raises `ApprovalBridgeError`
+    -- never clamps -- on a size increase or a favourable limit move."""
+    if qty_override is not None:
+        authorized_qty = proposal["authorized_qty"]
+        if qty_override <= 0:
+            raise ApprovalBridgeError(
+                f"qty_override {qty_override} must be positive"
+            )
+        if qty_override > authorized_qty + 1e-9:
+            raise ApprovalBridgeError(
+                f"qty_override {qty_override} exceeds the authorized qty "
+                f"{authorized_qty}; size may only be reduced without "
+                "re-analysis (§10)"
+            )
+    if limit_price_override is not None:
+        original_limit = proposal.get("limit_price")
+        if original_limit is None:
+            raise ApprovalBridgeError(
+                "limit_price_override was given but the approved order has "
+                "no limit_price to modify"
+            )
+        side = proposal["side"].upper()
+        if side == "BUY":
+            if limit_price_override > original_limit + 1e-9:
+                raise ApprovalBridgeError(
+                    f"limit_price_override {limit_price_override} is above "
+                    f"the approved {original_limit}; a BUY limit may only "
+                    "move down (adversely to the trade) without re-analysis (§10)"
+                )
+        else:
+            if limit_price_override < original_limit - 1e-9:
+                raise ApprovalBridgeError(
+                    f"limit_price_override {limit_price_override} is below "
+                    f"the approved {original_limit}; a SELL/CLOSE limit may "
+                    "only move up (adversely to the trade) without "
+                    "re-analysis (§10)"
+                )
+
+
 def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
                         service: ApprovalService, now: datetime,
-                        audit_log: AuditLog | None = None) -> ApprovalToken:
+                        audit_log: AuditLog | None = None,
+                        qty_override: float | None = None,
+                        limit_price_override: float | None = None) -> ApprovalToken:
     """Given a request_id and the store, mint the corresponding token (or
     raise `ApprovalBridgeError`). See module docstring for the guard order,
     the real-field passthrough, the shown_at-agreement tolerance, the
@@ -213,6 +277,8 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
 
     proposal = request.proposal_snapshot
     _reject_compound_snapshot(proposal)
+    _validate_modification(proposal, qty_override=qty_override,
+                           limit_price_override=limit_price_override)
 
     # The store's own recorded shown_at, ALWAYS -- never a value this
     # function's own caller supplies (see module docstring). The sanity
@@ -239,20 +305,26 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
             "approved this request."
         )
 
+    # The actually-authorized order: the override when one was given and
+    # validated above, else the proposal's own value unchanged.
+    final_qty = qty_override if qty_override is not None else proposal["authorized_qty"]
+    final_limit_price = (limit_price_override if limit_price_override is not None
+                         else proposal.get("limit_price"))
+
     token_id = f"tok-{request_id}"
     fingerprint = order_fingerprint(
         symbol=proposal["symbol"], side=proposal["side"],
-        qty=proposal["authorized_qty"], order_type=proposal["order_type"],
+        qty=final_qty, order_type=proposal["order_type"],
         time_in_force=proposal["time_in_force"],
-        limit_price=proposal.get("limit_price"), lot_id=proposal.get("lot_id"),
+        limit_price=final_limit_price, lot_id=proposal.get("lot_id"),
     )
     return service.approve(
         token_id=token_id, request_id=request_id, fingerprint=fingerprint,
         price_at_analysis=request.price_at_analysis, shown_at=request.shown_at,
         now=now, symbol=proposal["symbol"], side=proposal["side"],
-        qty=proposal["authorized_qty"], order_type=proposal["order_type"],
+        qty=final_qty, order_type=proposal["order_type"],
         time_in_force=proposal["time_in_force"],
-        limit_price=proposal.get("limit_price"), lot_id=proposal.get("lot_id"),
+        limit_price=final_limit_price, lot_id=proposal.get("lot_id"),
         decision_elapsed_ms=request.decision_elapsed_ms,
         price_band_low=request.price_band_low, price_band_high=request.price_band_high,
         audit_log=audit_log,

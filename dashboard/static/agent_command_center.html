@@ -1,0 +1,1404 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  body { margin: 0; background: #02050a; }
+  a { color: #5fd8f5; text-decoration: none; border-bottom: 1px solid #2b7d96; }
+  a:hover { color: #9fe9fb; border-bottom-color: #5fd8f5; }
+  @keyframes ringSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes ringSpinRev { from { transform: rotate(360deg); } to { transform: rotate(0deg); } }
+  @keyframes coreBreathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.022); } }
+  @keyframes plasma { 0%,100% { opacity: 0.82; transform: scale(1); } 42% { opacity: 1; transform: scale(1.09); } 68% { opacity: 0.88; transform: scale(0.97); } }
+  @keyframes sweep { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes flow { to { stroke-dashoffset: -120; } }
+  @keyframes scan { 0% { transform: translateX(-14px); } 100% { transform: translateX(100%); } }
+  @keyframes blip { 0%,100% { opacity: 1; } 50% { opacity: 0.28; } }
+  @keyframes sheen { 0%,100% { opacity: 0.3; } 50% { opacity: 0.62; } }
+</style>
+</helmet>
+
+<div style="width: 1600px; height: 900px; box-sizing: border-box; overflow: hidden; position: relative; background: radial-gradient(1100px 700px at 50% 34%, #071320 0%, #04090f 58%, #02050a 100%); font-family: 'Rajdhani', sans-serif; color: #cfe3ec;">
+
+  <svg width="1600" height="900" viewBox="0 0 1600 900" style="position: absolute; left: 0; top: 0; pointer-events: none;">
+    <g fill="none" stroke="#123243" stroke-width="1.4">
+      <path d="M652 147 H352"></path>
+      <path d="M677 347 H352"></path>
+      <path d="M720 380 H588 Q576 380 576 392 V535 Q576 547 564 547 H352"></path>
+      <path d="M948 147 H1248"></path>
+      <path d="M923 347 H1248"></path>
+      <path d="M880 380 H1012 Q1024 380 1024 392 V535 Q1024 547 1036 547 H1248"></path>
+      <path d="M690 360 H480 Q468 360 468 372 V640 Q468 652 480 652"></path>
+      <path d="M910 360 H1120 Q1132 360 1132 372 V640 Q1132 652 1120 652"></path>
+      <path d="M169 652 H1431"></path>
+      <path d="M169 652 V658 M484 652 V658 M800 652 V658 M1116 652 V658 M1431 652 V658"></path>
+    </g>
+    <g fill="none" stroke-width="1.4" stroke-dasharray="6 12" stroke-linecap="round">
+      <path d="M652 147 H352" stroke="{{ collectTrace }}" style="animation: flow 2.4s linear infinite; animation-play-state: {{ collectPlay }};"></path>
+      <path d="M677 347 H352" stroke="{{ screenTrace }}" style="animation: flow 2.4s linear infinite; animation-play-state: {{ screenPlay }};"></path>
+      <path d="M720 380 H588 Q576 380 576 392 V535 Q576 547 564 547 H352" stroke="{{ budgetTrace }}"></path>
+      <path d="M948 147 H1248" stroke="{{ analysisTrace }}" style="animation: flow 2.4s linear infinite; animation-play-state: {{ analysisPlay }};"></path>
+      <path d="M923 347 H1248" stroke="{{ gateTrace }}"></path>
+      <path d="M880 380 H1012 Q1024 380 1024 392 V535 Q1024 547 1036 547 H1248" stroke="{{ approvalTrace }}" style="animation: flow 3.2s linear infinite; animation-play-state: {{ ambientPlay }};"></path>
+      <path d="M690 360 H480 Q468 360 468 372 V640 Q468 652 480 652" stroke="{{ reconTrace }}" style="animation: flow 3s linear infinite; animation-play-state: {{ reconPlay }};"></path>
+      <path d="M910 360 H1120 Q1132 360 1132 372 V640 Q1132 652 1120 652" stroke="{{ execTrace }}"></path>
+      <path d="M169 652 H1431" stroke="{{ busTrace }}" style="animation: flow 5s linear infinite; animation-play-state: {{ ambientPlay }};"></path>
+    </g>
+    <g stroke="#04090f" stroke-width="1.4">
+      <circle cx="352" cy="147" r="3" fill="{{ collectTrace }}"></circle>
+      <circle cx="352" cy="347" r="3" fill="{{ screenTrace }}"></circle>
+      <circle cx="352" cy="547" r="3" fill="{{ budgetTrace }}"></circle>
+      <circle cx="1248" cy="147" r="3" fill="{{ analysisTrace }}"></circle>
+      <circle cx="1248" cy="347" r="3" fill="{{ gateTrace }}"></circle>
+      <circle cx="1248" cy="547" r="3" fill="{{ approvalTrace }}"></circle>
+      <circle cx="169" cy="652" r="3" fill="{{ reconTrace }}"></circle>
+      <circle cx="484" cy="652" r="3" fill="{{ busTrace }}"></circle>
+      <circle cx="800" cy="652" r="3" fill="{{ busTrace }}"></circle>
+      <circle cx="1116" cy="652" r="3" fill="{{ busTrace }}"></circle>
+      <circle cx="1431" cy="652" r="3" fill="{{ execTrace }}"></circle>
+    </g>
+  </svg>
+
+  <div style="position: absolute; left: 0; top: 0; width: 1600px; height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 22px; padding: 0 18px; border-bottom: 1px solid #123243; background: linear-gradient(180deg, rgba(10,24,36,0.92), rgba(4,10,17,0.7));">
+    <div style="display: flex; align-items: center; gap: 9px;">
+      <svg width="22" height="22" viewBox="0 0 22 22"><circle cx="11" cy="11" r="9.4" fill="none" stroke="#2b9fc4" stroke-width="1.2"></circle><circle cx="11" cy="11" r="3.2" fill="#5fd8f5"></circle><path d="M11 1.6 V6 M11 16 V20.4 M1.6 11 H6 M16 11 H20.4" stroke="#2b9fc4" stroke-width="1.2"></path></svg>
+      <div style="font-size: 17px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: #eaf6fb;">Investment agent</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; font-weight: 600; letter-spacing: 0.12em; color: #f5b942; border: 1px solid #7a5c19; padding: 2px 7px;">PAPER</div>
+    </div>
+    <div style="width: 1px; height: 20px; background: #123243;"></div>
+    <div style="font-size: 14px; font-weight: 500; letter-spacing: 0.06em; color: #7fa3b5;">Find asymmetric opportunities · preserve capital · improve every cycle</div>
+    <div style="flex: 1;"></div>
+    <div style="display: flex; align-items: center; gap: 7px;">
+      <div style="width: 6px; height: 6px; border-radius: 50%; background: #4ade8a; animation: blip 2.2s ease-in-out infinite; animation-play-state: {{ ambientPlay }};"></div>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.1em; color: #6a8798;">AGENT</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #4ade8a;">ACTIVE</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.1em; color: #6a8798;">SPEND MTD</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #cfe3ec;">$3.42<span style="color: #6a8798;"> / 20</span></span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.1em; color: #6a8798;">UTC</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #5fd8f5;">{{ clock }}</span>
+    </div>
+    <button type="button" style="font-family: 'Rajdhani', sans-serif; font-size: 12.5px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: #cfe3ec; background: none; border: 1px solid #2a4a58; padding: 5px 13px; cursor: pointer;" style-hover="border-color: #ff6b5a; color: #ff6b5a;">Pause</button>
+  </div>
+
+  <div style="position: absolute; left: 16px; top: 52px; width: 336px; height: 590px; display: flex; flex-direction: column; gap: 10px;">
+
+    <div onClick="{{ openP1 }}" style="flex: 1; padding: 1px; box-sizing: border-box; cursor: pointer; background: {{ collectFrame }}; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 12px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 9px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">01</span>
+          <span style="font-size: 14.5px; font-weight: 600; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">Data collection</span>
+          <div style="flex: 1;"></div>
+          <div style="width: 5px; height: 5px; border-radius: 50%; background: {{ collectDot }};"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: {{ collectFg }};">{{ collectStatus }}</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 5px;">
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <span style="font-size: 13.5px; font-weight: 500; color: #a8c6d6;">Market bars · Alpaca</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #5fd8f5;">{{ barsCount }}</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <span style="font-size: 13.5px; font-weight: 500; color: #a8c6d6;">Filings · SEC EDGAR</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #5fd8f5;">17 filings</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <span style="font-size: 13.5px; font-weight: 500; color: #4e6b7c;">News feed</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; color: #4e6b7c;">NOT BUILT</span>
+          </div>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="position: relative; height: 46px; border: 1px solid #102a38; overflow: hidden; background: rgba(4,12,20,0.6);">
+          <svg width="310" height="46" viewBox="0 0 310 46" style="position: absolute; left: 0; top: 0;">
+            <path d="M0 46 L0 33 L11 30 L22 35 L33 24 L44 28 L55 18 L66 23 L77 14 L88 21 L99 12 L110 18 L121 27 L132 20 L143 30 L154 23 L165 15 L176 22 L187 13 L198 20 L209 10 L220 17 L231 26 L242 19 L253 28 L264 21 L275 14 L286 22 L297 16 L310 20 L310 46 Z" fill="rgba(43,159,196,0.16)"></path>
+            <path d="M0 33 L11 30 L22 35 L33 24 L44 28 L55 18 L66 23 L77 14 L88 21 L99 12 L110 18 L121 27 L132 20 L143 30 L154 23 L165 15 L176 22 L187 13 L198 20 L209 10 L220 17 L231 26 L242 19 L253 28 L264 21 L275 14 L286 22 L297 16 L310 20" fill="none" stroke="#5fd8f5" stroke-width="1.2"></path>
+          </svg>
+          <div style="position: absolute; left: 0; top: 0; width: 14px; height: 100%; background: linear-gradient(90deg, rgba(0,0,0,0), rgba(95,216,245,0.42)); animation: scan 3.4s linear infinite; animation-play-state: {{ collectPlay }};"></div>
+          <div style="position: absolute; left: 6px; top: 4px; font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.09em; color: #4e6b7c;">INGESTION</div>
+          <div style="position: absolute; right: 6px; bottom: 4px; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: {{ collectFg }};">{{ ingestRate }}</div>
+        </div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP2 }}" style="flex: 1; padding: 1px; box-sizing: border-box; cursor: pointer; background: {{ screenFrame }}; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 12px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 9px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">02</span>
+          <span style="font-size: 14.5px; font-weight: 600; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">Materiality screen</span>
+          <div style="flex: 1;"></div>
+          <div style="width: 5px; height: 5px; border-radius: 50%; background: {{ screenDot }};"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: {{ screenFg }};">{{ screenStatus }}</span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: #102a38; border: 1px solid #102a38;">
+          <div style="background: rgba(6,16,25,0.9); padding: 6px 8px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.08em; color: #4e6b7c;">SCORED</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 500; color: #cfe3ec;">{{ scored }}</div>
+          </div>
+          <div style="background: rgba(6,16,25,0.9); padding: 6px 8px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.08em; color: #4e6b7c;">SUPPRESSED</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 500; color: #6a8798;">{{ suppressed }}</div>
+          </div>
+          <div style="background: rgba(6,16,25,0.9); padding: 6px 8px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.08em; color: #4e6b7c;">TRIGGERED</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 500; color: #f5b942;">3</div>
+          </div>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin: 9px 0 5px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.08em; color: #4e6b7c;">{{ heatLabel }}</span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; color: #4e6b7c;">THRESHOLD 0.62</span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(23, 1fr); gap: 2px;">
+          <sc-for list="{{ heatCells }}" as="h" hint-placeholder-count="43">
+            <div style="aspect-ratio: 1; background: {{ h.bg }};"></div>
+          </sc-for>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; gap: 12px; align-items: center;">
+          <div style="display: flex; align-items: center; gap: 5px;"><div style="width: 7px; height: 7px; background: #10202c;"></div><span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; color: #4e6b7c;">BELOW</span></div>
+          <div style="display: flex; align-items: center; gap: 5px;"><div style="width: 7px; height: 7px; background: #2b9fc4;"></div><span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; color: #4e6b7c;">NEAR</span></div>
+          <div style="display: flex; align-items: center; gap: 5px;"><div style="width: 7px; height: 7px; background: #f5b942;"></div><span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; color: #4e6b7c;">TRIGGERED</span></div>
+          <div style="flex: 1;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; color: #4e6b7c;">NO MODEL CALL</span>
+        </div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP3 }}" style="flex: 1; padding: 1px; box-sizing: border-box; cursor: pointer; background: #17414f; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 12px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">03</span>
+          <span style="font-size: 14.5px; font-weight: 600; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">Cost brake</span>
+          <div style="flex: 1;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: #f5b942;">ENGAGED</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 13px;">
+          <svg width="92" height="92" viewBox="0 0 92 92" style="flex: 0 0 auto;">
+            <circle cx="46" cy="46" r="35" fill="none" stroke="#0f2532" stroke-width="8"></circle>
+            <circle cx="46" cy="46" r="35" fill="none" stroke="#2b9fc4" stroke-width="8" stroke-dasharray="{{ budgetDash }}" transform="rotate(-90 46 46)"></circle>
+            <line x1="46" y1="4" x2="46" y2="15" stroke="#f5b942" stroke-width="1.6" transform="rotate(240 46 46)"></line>
+            <text x="46" y="43" text-anchor="middle" fill="#eaf6fb" style="font-family: 'IBM Plex Mono', monospace; font-size: 15px; font-weight: 500;">$3.42</text>
+            <text x="46" y="56" text-anchor="middle" fill="#4e6b7c" style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.09em;">MTD</text>
+          </svg>
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 13.5px; font-weight: 500; color: #a8c6d6;">Target</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #f5b942;">$20 · 17.1%</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 13.5px; font-weight: 500; color: #a8c6d6;">Hard stop</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #ff6b5a;">$30 · halts</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 13.5px; font-weight: 500; color: #6a8798;">Per analysis</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #6a8798;">$0.149</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 13.5px; font-weight: 500; color: #6a8798;">Today</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #6a8798;">4 of 8 cap</span>
+            </div>
+          </div>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; gap: 3px; height: 8px;">
+          <div style="flex: 4; background: #2b9fc4;"></div>
+          <div style="flex: 4; background: #1c5f78;"></div>
+          <div style="flex: 16; background: #0f2532;"></div>
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-top: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; color: #4e6b7c;">
+          <span>4 USED</span><span>4 REMAINING TODAY</span><span>PROJ $25.10</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div style="position: absolute; left: 585px; top: 52px; width: 430px; height: 430px; display: flex; align-items: center; justify-content: center;">
+    <div style="position: absolute; width: 424px; height: 424px; border-radius: 50%; border: 1px solid rgba(43,159,196,0.24); border-top-color: transparent; border-bottom-color: transparent; animation: ringSpin 34s linear infinite; animation-play-state: {{ ambientPlay }};"></div>
+    <svg width="392" height="392" viewBox="0 0 392 392" style="position: absolute; animation: ringSpinRev 26s linear infinite; animation-play-state: {{ ambientPlay }};">
+      <circle cx="196" cy="196" r="188" fill="none" stroke="rgba(43,159,196,0.2)" stroke-width="1"></circle>
+      <g stroke="rgba(95,216,245,0.42)" stroke-width="1.4">
+        <path d="M196 4 V16 M196 376 V388 M4 196 H16 M376 196 H388"></path>
+        <path d="M60 60 L68 68 M332 60 L324 68 M60 332 L68 324 M332 332 L324 324"></path>
+      </g>
+      <circle cx="196" cy="8" r="2.6" fill="#5fd8f5"></circle>
+      <circle cx="384" cy="196" r="2" fill="#2b9fc4"></circle>
+    </svg>
+    <div style="position: absolute; width: 356px; height: 356px; border-radius: 50%; border: 1px dashed rgba(245,185,66,0.16); animation: ringSpin 48s linear infinite; animation-play-state: {{ ambientPlay }};"></div>
+
+    <div style="position: absolute; top: 300px; width: 372px; height: 84px; border: 1px solid rgba(43,159,196,0.22); border-radius: 50%;"></div>
+    <div style="position: absolute; top: 316px; width: 282px; height: 62px; border: 1px solid rgba(245,185,66,0.14); border-radius: 50%;"></div>
+
+    <div style="position: absolute; top: 8px; width: 340px; height: 340px; border-radius: 50%; overflow: hidden; background: radial-gradient(circle at 40% 32%, #14314a 0%, #0b1d2e 52%, #050d16 100%); box-shadow: {{ coreGlow }}; animation: coreBreathe 6s ease-in-out infinite; animation-play-state: {{ ambientPlay }};">
+      <div style="position: absolute; left: 0; top: 0; right: 0; bottom: 0; background: conic-gradient(from 0deg, rgba(95,216,245,0) 0deg, rgba(95,216,245,0.16) 40deg, rgba(95,216,245,0) 90deg, rgba(95,216,245,0) 360deg); animation: sweep 9s linear infinite; animation-play-state: {{ ambientPlay }};"></div>
+      <div style="position: absolute; left: 50%; top: 47%; width: 96px; height: 96px; margin: -48px 0 0 -48px; border-radius: 50%; background: {{ coreCentre }}; filter: blur(20px); animation: plasma 4.4s ease-in-out infinite; animation-play-state: {{ ambientPlay }};"></div>
+      <svg viewBox="0 0 340 340" style="position: absolute; left: 0; top: 0; width: 100%; height: 100%; -webkit-mask-image: radial-gradient(circle, rgba(0,0,0,1) 48%, rgba(0,0,0,0) 92%); mask-image: radial-gradient(circle, rgba(0,0,0,1) 48%, rgba(0,0,0,0) 92%);">
+        <g fill="none" stroke="#5fd8f5" stroke-width="1" opacity="0.72">
+          <circle cx="170" cy="170" r="40" stroke-dasharray="52 16"></circle>
+          <circle cx="170" cy="170" r="58" stroke-dasharray="88 24"></circle>
+          <circle cx="170" cy="170" r="76" stroke-dasharray="34 18"></circle>
+          <circle cx="170" cy="170" r="96" stroke-dasharray="124 34"></circle>
+          <circle cx="170" cy="170" r="116" stroke-dasharray="22 14"></circle>
+          <circle cx="170" cy="170" r="138" stroke-dasharray="66 26"></circle>
+          <path d="M170 20 V56 M170 284 V320 M20 170 H56 M284 170 H320"></path>
+          <path d="M64 64 L96 96 M276 64 L244 96 M64 276 L96 244 M276 276 L244 244"></path>
+          <path d="M170 96 L214 96 L214 140 L250 140"></path>
+          <path d="M126 170 L126 214 L170 214 L170 252"></path>
+          <path d="M96 126 L60 126 L60 84"></path>
+          <path d="M244 200 L280 200 L280 244"></path>
+          <path d="M146 74 L146 46 L194 46"></path>
+          <path d="M200 266 L240 266 L240 292"></path>
+          <path d="M104 232 L76 232 L76 262"></path>
+          <path d="M232 104 L262 104 L262 76"></path>
+        </g>
+        <g fill="#9fe9fb" opacity="0.85">
+          <circle cx="214" cy="96" r="3"></circle>
+          <circle cx="250" cy="140" r="2.4"></circle>
+          <circle cx="126" cy="214" r="3"></circle>
+          <circle cx="60" cy="84" r="2.4"></circle>
+          <circle cx="280" cy="244" r="2.4"></circle>
+          <circle cx="194" cy="46" r="2.2"></circle>
+          <circle cx="170" cy="252" r="2.2"></circle>
+          <circle cx="96" cy="96" r="2.2"></circle>
+          <circle cx="240" cy="292" r="2"></circle>
+          <circle cx="76" cy="262" r="2"></circle>
+          <circle cx="262" cy="76" r="2"></circle>
+        </g>
+        <g fill="none" stroke="#ffd479" stroke-width="1.3" opacity="{{ goldTraceOpacity }}">
+          <path d="M170 96 L214 96 L214 140"></path>
+          <path d="M126 170 L126 214 L170 214"></path>
+          <circle cx="170" cy="170" r="58" stroke-dasharray="24 78"></circle>
+          <circle cx="170" cy="170" r="116" stroke-dasharray="16 92"></circle>
+        </g>
+      </svg>
+      <div style="position: absolute; left: 0; top: 0; right: 0; bottom: 0; background: {{ coreTintGradient }}; mix-blend-mode: screen; opacity: {{ coreTint }};"></div>
+      <div style="position: absolute; left: 0; top: 0; right: 0; bottom: 0; border-radius: 50%; box-shadow: inset 0 0 54px 14px rgba(2,7,13,0.82), inset 0 2px 1px rgba(200,240,255,0.3), inset 0 -22px 40px rgba(43,159,196,0.16);"></div>
+      <div style="position: absolute; left: 16%; top: 10%; width: 116px; height: 70px; border-radius: 50%; background: radial-gradient(ellipse at 50% 50%, rgba(255,255,255,0.4), rgba(255,255,255,0) 72%); filter: blur(4px); animation: sheen 7s ease-in-out infinite; animation-play-state: {{ ambientPlay }};"></div>
+    </div>
+
+    <div style="position: absolute; bottom: 4px; display: flex; flex-direction: column; align-items: center; gap: 3px;">
+      <div style="font-size: 21px; font-weight: 600; letter-spacing: 0.3em; text-transform: uppercase; color: #eaf6fb;">Agent core</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.14em; color: #4e6b7c;">OBSERVE · UNDERSTAND · DECIDE · IMPROVE</div>
+    </div>
+  </div>
+
+  <div onClick="{{ openCore }}" style="position: absolute; left: 520px; top: 492px; width: 560px; height: 150px; padding: 1px; box-sizing: border-box; cursor: pointer; background: {{ coreFrame }}; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+    <div style="height: 100%; box-sizing: border-box; padding: 10px 16px 12px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+      <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 9px;">
+        <span style="font-size: 14.5px; font-weight: 600; letter-spacing: 0.13em; text-transform: uppercase; color: #6a8798;">Core state</span>
+        <span style="font-size: 17px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: {{ coreStateFg }};">{{ coreState }}</span>
+        <div style="flex: 1;"></div>
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #4e6b7c;">{{ activeCount }} / 6 PROCESSES</span>
+      </div>
+      <div style="height: 9px; background: linear-gradient(90deg, #1e4a6e 0%, #2b9fc4 26%, #dff2fa 52%, #f5b942 78%, #ffd479 100%); position: relative;">
+        <div style="position: absolute; top: -4px; bottom: -4px; width: 2px; background: #ffffff; box-shadow: 0 0 8px rgba(255,255,255,0.9); left: {{ corePointer }};"></div>
+      </div>
+      <div style="display: flex; justify-content: space-between; margin-top: 6px; font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">
+        <span>SLEEP / LOW</span><span>MODERATE</span><span>HIGH</span><span>MAX</span>
+      </div>
+      <div style="flex: 1;"></div>
+      <div style="display: flex; align-items: center; gap: 10px; padding-top: 9px; border-top: 1px solid #102a38;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.08em; color: #7a6a3e;">GOLD = PROCESSING INTENSITY · NOT APPROVAL STATUS</span>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; align-items: center; gap: 6px;">
+          <div style="width: 5px; height: 5px; border-radius: 50%; background: #f5b942; animation: blip 1.7s ease-in-out infinite; animation-play-state: {{ ambientPlay }};"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #f5b942;">{{ waitingLabel }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="position: absolute; left: 1248px; top: 52px; width: 336px; height: 590px; display: flex; flex-direction: column; gap: 10px;">
+
+    <div onClick="{{ openP4 }}" style="flex: 1; padding: 1px; box-sizing: border-box; cursor: pointer; background: {{ analysisFrame }}; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 12px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">04</span>
+          <span style="font-size: 14.5px; font-weight: 600; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">Analysis</span>
+          <div style="flex: 1;"></div>
+          <div style="width: 5px; height: 5px; border-radius: 50%; background: {{ analysisDot }};"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: {{ analysisFg }};">{{ analysisStatus }}</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 13px;">
+          <svg width="82" height="82" viewBox="0 0 82 82" style="flex: 0 0 auto;">
+            <circle cx="41" cy="41" r="31" fill="none" stroke="#0f2532" stroke-width="6"></circle>
+            <circle cx="41" cy="41" r="31" fill="none" stroke="{{ analysisFg }}" stroke-width="6" stroke-dasharray="{{ analysisDash }}" transform="rotate(-90 41 41)"></circle>
+            <text x="41" y="39" text-anchor="middle" fill="#eaf6fb" style="font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 500;">{{ analysisProgress }}</text>
+            <text x="41" y="52" text-anchor="middle" fill="#4e6b7c" style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em;">READ</text>
+          </svg>
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 5px;">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 13.5px; font-weight: 500; color: #a8c6d6;">NTAP 8-K · 2.02</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #5fd8f5;">$0.148</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 13.5px; font-weight: 500; color: #6a8798;">Cache hits</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #6a8798;">6 · $0.00</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 13.5px; font-weight: 500; color: #6a8798;">Refused</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #6a8798;">1</span>
+            </div>
+          </div>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; gap: 1px; background: #102a38; border: 1px solid #102a38;">
+          <div style="flex: 1; background: rgba(6,16,25,0.9); padding: 5px 7px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em; color: #4e6b7c;">BEAR</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #ff6b5a;">3</div>
+          </div>
+          <div style="flex: 1; background: rgba(6,16,25,0.9); padding: 5px 7px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em; color: #4e6b7c;">CONTRA</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #a8c6d6;">2</div>
+          </div>
+          <div style="flex: 1; background: rgba(6,16,25,0.9); padding: 5px 7px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em; color: #4e6b7c;">BULL</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #4ade8a;">2</div>
+          </div>
+          <div style="flex: 1.3; background: rgba(6,16,25,0.9); padding: 5px 7px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em; color: #4e6b7c;">CITED</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #5fd8f5;">5 / 5</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP5 }}" style="flex: 1; padding: 1px; box-sizing: border-box; cursor: pointer; background: #1c4a3a; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 12px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1a1c 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">05</span>
+          <span style="font-size: 14.5px; font-weight: 600; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">Risk gates</span>
+          <div style="flex: 1;"></div>
+          <div style="width: 5px; height: 5px; border-radius: 50%; background: #4ade8a;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: #4ade8a;">ALL PASS</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <svg width="80" height="80" viewBox="0 0 80 80" style="flex: 0 0 auto;">
+            <circle cx="40" cy="40" r="30" fill="none" stroke="#0f2532" stroke-width="7"></circle>
+            <circle cx="40" cy="40" r="30" fill="none" stroke="#4ade8a" stroke-width="7" stroke-dasharray="{{ reserveDash }}" transform="rotate(-90 40 40)"></circle>
+            <line x1="40" y1="3" x2="40" y2="14" stroke="#ff6b5a" stroke-width="1.8" transform="rotate(144 40 40)"></line>
+            <text x="40" y="38" text-anchor="middle" fill="#eaf6fb" style="font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 500;">96.0%</text>
+            <text x="40" y="50" text-anchor="middle" fill="#4e6b7c" style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em;">CASH</text>
+          </svg>
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+            <sc-for list="{{ gates }}" as="g" hint-placeholder-count="4">
+              <div style="display: grid; grid-template-columns: 11px 1fr auto; gap: 7px; align-items: center;">
+                <svg width="11" height="11" viewBox="0 0 11 11"><circle cx="5.5" cy="5.5" r="5" fill="none" stroke="#4ade8a" stroke-width="1"></circle><path d="M3 5.6 L4.8 7.4 L8.2 3.8" fill="none" stroke="#4ade8a" stroke-width="1.3"></path></svg>
+                <span style="font-size: 12.5px; font-weight: 500; color: #a8c6d6;">{{ g.name }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #4ade8a;">{{ g.value }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid #10322a; background: rgba(6,20,18,0.7);">
+          <svg width="12" height="14" viewBox="0 0 12 14"><path d="M6 1 L11 3.4 V7.4 C11 10.4 8.8 12.4 6 13 C3.2 12.4 1 10.4 1 7.4 V3.4 Z" fill="none" stroke="#4ade8a" stroke-width="1"></path></svg>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.07em; color: #5f8f78;">ONE GATE REFUSES · THE ORDER DOES NOT EXIST · NO OVERRIDE</span>
+        </div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP6 }}" style="flex: 1; padding: 1px; box-sizing: border-box; cursor: pointer; background: #6b5216; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%); box-shadow: 0 0 24px rgba(245,185,66,0.16);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 12px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(245,185,66,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #1a1508 0%, #0a0d12 100%);">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #b8892a;">06</span>
+          <span style="font-size: 14.5px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: #ffd479;">Human approval</span>
+          <div style="flex: 1;"></div>
+          <div style="width: 5px; height: 5px; border-radius: 50%; background: #f5b942; animation: blip 1.6s ease-in-out infinite; animation-play-state: {{ ambientPlay }};"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: #f5b942;">3 WAITING</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 5px;">
+          <sc-for list="{{ queue }}" as="q" hint-placeholder-count="3">
+            <div style="display: grid; grid-template-columns: 34px 1fr auto auto; gap: 8px; align-items: center; padding: 5px 8px; background: {{ q.bg }}; border: 1px solid {{ q.border }};">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; font-weight: 600; color: {{ q.sideFg }};">{{ q.side }}</span>
+              <span style="font-size: 14px; font-weight: 600; color: #eaf6fb;">{{ q.symbol }}</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: {{ q.expiryFg }};">{{ q.expiry }}</span>
+              <button type="button" onClick="{{ q.open }}" style="font-family: 'Rajdhani', sans-serif; font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 10px; border: 1px solid #4a3d19; background: none; color: #ffd479; cursor: pointer;" style-hover="border-color: #f5b942; background: rgba(245,185,66,0.12);">Review</button>
+            </div>
+          </sc-for>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.08em; color: #8f7a45;">CASH EARMARKED</span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #ffd479;">$84.60 OF $280.00 FREE</span>
+        </div>
+        <div style="height: 8px; display: flex; gap: 1px; background: #1b1710;">
+          <div style="width: 12.9%; background: #f5b942;"></div>
+          <div style="width: 17.3%; background: #9c7a2a;"></div>
+          <div style="flex: 1; background: #221d13;"></div>
+        </div>
+        <div style="margin-top: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #8f7a45;">EACH PENDING BUY RESERVES ITS CASH · APPROVE IN ANY ORDER</div>
+      </div>
+    </div>
+
+  </div>
+
+  <div style="position: absolute; left: 16px; top: 658px; width: 1568px; height: 190px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px;">
+
+    <div onClick="{{ openP7 }}" style="padding: 1px; box-sizing: border-box; cursor: pointer; background: {{ reconFrame }}; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 11px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 7px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">07</span>
+          <span style="font-size: 13.5px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: #eaf6fb;">Reconcile</span>
+          <div style="flex: 1;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: {{ reconFg }};">{{ reconStatus }}</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 5px;">
+          <sc-for list="{{ reconRows }}" as="r" hint-placeholder-count="4">
+            <div style="display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: baseline; padding-bottom: 4px; border-bottom: 1px solid #0d1f2b;">
+              <span style="font-size: 12.5px; font-weight: 500; color: #a8c6d6;">{{ r.name }}</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #4ade8a;">{{ r.value }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; justify-content: space-between; align-items: baseline;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">NEXT CYCLE</span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #5fd8f5;">{{ nextCycle }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP8 }}" style="padding: 1px; box-sizing: border-box; cursor: pointer; background: #17414f; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 11px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 7px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">08</span>
+          <span style="font-size: 13.5px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: #eaf6fb;">Audit chain</span>
+          <div style="flex: 1;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4ade8a;">HASH OK</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <sc-for list="{{ auditRows }}" as="a" hint-placeholder-count="5">
+            <div style="display: grid; grid-template-columns: 40px 1fr; gap: 7px; align-items: baseline;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">{{ a.t }}</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #a8c6d6;">{{ a.what }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">APPEND-ONLY · FSYNC PER ROW</div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP9 }}" style="padding: 1px; box-sizing: border-box; cursor: pointer; background: #1b2b33; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 11px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.02) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #080f16 0%, #05090e 100%);">
+        <div style="display: flex; align-items: center; gap: 7px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #395a68;">09</span>
+          <span style="font-size: 13.5px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: #6a8798;">Improvement</span>
+          <div style="flex: 1;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">OFF</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 11px;">
+          <svg width="66" height="66" viewBox="0 0 66 66" style="flex: 0 0 auto;">
+            <circle cx="33" cy="33" r="25" fill="none" stroke="#132430" stroke-width="1.4" stroke-dasharray="5 6"></circle>
+            <path d="M33 8 A25 25 0 0 1 58 33" fill="none" stroke="#2f4b58" stroke-width="1.6"></path>
+            <path d="M55 30 L58 33 L55 36" fill="none" stroke="#2f4b58" stroke-width="1.6"></path>
+            <text x="33" y="30" text-anchor="middle" fill="#4e6b7c" style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em;">LEARN</text>
+            <text x="33" y="42" text-anchor="middle" fill="#395a68" style="font-family: 'IBM Plex Mono', monospace; font-size: 8px; letter-spacing: 0.08em;">DARK</text>
+          </svg>
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 12.5px; font-weight: 500; color: #6a8798;">Class A · reads</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">NO LABELS</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 12.5px; font-weight: 500; color: #6a8798;">Class B · picks</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">NO HISTORY</span>
+            </div>
+          </div>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">CANNOT PROMOTE UNTIL ATTRIBUTION EXISTS</div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP10 }}" style="padding: 1px; box-sizing: border-box; cursor: pointer; background: #1b2b33; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 11px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.02) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #080f16 0%, #05090e 100%);">
+        <div style="display: flex; align-items: center; gap: 7px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #395a68;">10</span>
+          <span style="font-size: 13.5px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: #6a8798;">Performance</span>
+          <div style="flex: 1;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">1 / 60</span>
+        </div>
+        <svg width="270" height="66" viewBox="0 0 270 66" style="width: 100%;">
+          <g stroke="#0f1f29" stroke-width="1">
+            <path d="M0 12 H270 M0 33 H270 M0 54 H270"></path>
+          </g>
+          <path d="M0 40 L8 39" fill="none" stroke="#395a68" stroke-width="1.4"></path>
+          <text x="14" y="43" fill="#395a68" style="font-family: 'IBM Plex Mono', monospace; font-size: 9px;">AWAITING CLOSED POSITIONS</text>
+        </svg>
+        <div style="flex: 1;"></div>
+        <div style="height: 6px; background: #101f28;">
+          <div style="width: 1.7%; height: 100%; background: #395a68;"></div>
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-top: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">
+          <span>1 SESSION</span><span>VS INDEX · NET OF TAX</span>
+        </div>
+      </div>
+    </div>
+
+    <div onClick="{{ openP11 }}" style="padding: 1px; box-sizing: border-box; cursor: pointer; background: {{ execFrame }}; clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);">
+      <div style="height: 100%; box-sizing: border-box; padding: 9px 11px 10px; display: flex; flex-direction: column; clip-path: polygon(0 11px, 11px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%); background: repeating-linear-gradient(0deg, rgba(95,216,245,0.03) 0 1px, rgba(0,0,0,0) 1px 5px), linear-gradient(158deg, #0a1622 0%, #060d15 100%);">
+        <div style="display: flex; align-items: center; gap: 7px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2b9fc4;">11</span>
+          <span style="font-size: 13.5px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: #eaf6fb;">Execution</span>
+          <div style="flex: 1;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #f5b942;">STANDBY</span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 5px;">
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <span style="font-size: 12.5px; font-weight: 500; color: #a8c6d6;">Broker</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #5fd8f5;">ALPACA PAPER</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <span style="font-size: 12.5px; font-weight: 500; color: #a8c6d6;">Open orders</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #4ade8a;">NONE</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <span style="font-size: 12.5px; font-weight: 500; color: #a8c6d6;">Funding</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #a8c6d6;">SETTLED · T+1</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <span style="font-size: 12.5px; font-weight: 500; color: #6a8798;">Unsettled cash</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #6a8798;">DISABLED</span>
+          </div>
+        </div>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; align-items: center; gap: 7px; padding: 5px 8px; border: 1px solid #3d3113; background: rgba(26,21,8,0.6);">
+          <div style="width: 5px; height: 5px; border-radius: 50%; background: #f5b942;"></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #b8892a;">NO ORDER WITHOUT A SIGNED TOKEN</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div style="position: absolute; left: 0; top: 858px; width: 1600px; height: 42px; box-sizing: border-box; display: flex; align-items: center; gap: 28px; padding: 0 18px; border-top: 1px solid #123243; background: linear-gradient(0deg, rgba(10,24,36,0.92), rgba(4,10,17,0.7));">
+    <div style="display: flex; align-items: baseline; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.11em; color: #4e6b7c;">CAPITAL</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #eaf6fb;">$500.00</span>
+    </div>
+    <div style="display: flex; align-items: baseline; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.11em; color: #4e6b7c;">SETTLED</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #eaf6fb;">$480.00</span>
+    </div>
+    <div style="display: flex; align-items: baseline; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.11em; color: #4e6b7c;">EARMARKED</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #f5b942;">$84.60</span>
+    </div>
+    <div style="display: flex; align-items: baseline; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.11em; color: #4e6b7c;">RESERVE</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #4ade8a;">96.0%<span style="color: #4e6b7c;"> · FLOOR 40%</span></span>
+    </div>
+    <div style="display: flex; align-items: baseline; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.11em; color: #4e6b7c;">MODE</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #f5b942;">PAPER · HUMAN APPROVAL ON EVERY ORDER</span>
+    </div>
+    <div style="flex: 1;"></div>
+    <div style="display: flex; align-items: baseline; gap: 7px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.11em; color: #4e6b7c;">KILL CRITERION</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #6a8798;">REVIEWED IN 11 MONTHS</span>
+    </div>
+  </div>
+
+  <sc-if value="{{ drawerOpen }}">
+    <div onClick="{{ closeDrawer }}" style="position: absolute; left: 0; top: 0; width: 1600px; height: 900px; background: rgba(2,5,10,0.72);"></div>
+    <div style="position: absolute; right: 0; top: 0; width: 560px; height: 900px; box-sizing: border-box; display: flex; flex-direction: column; border-left: 1px solid #2a6f86; background: linear-gradient(200deg, #0b1826 0%, #050b12 100%); box-shadow: -30px 0 70px rgba(2,5,10,0.8);">
+
+      <div style="padding: 15px 22px 13px; border-bottom: 1px solid #123243; display: flex; align-items: flex-start; gap: 14px;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #2b9fc4; padding-top: 3px;">{{ drawerNum }}</span>
+        <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+          <div style="font-size: 19px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #eaf6fb;">{{ drawerTitle }}</div>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">{{ drawerSource }}</div>
+        </div>
+        <button type="button" onClick="{{ closeDrawer }}" style="font-family: 'Rajdhani', sans-serif; font-size: 12px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; padding: 5px 12px; border: 1px solid #2a4a58; background: none; color: #6a8798; cursor: pointer;" style-hover="border-color: #cfe3ec; color: #cfe3ec;">Close</button>
+      </div>
+
+      <div style="flex: 1; overflow-y: auto; padding: 15px 22px 18px; display: flex; flex-direction: column; gap: 18px;">
+
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.1em; color: #4e6b7c;">CURRENT STATE</div>
+          <div style="display: flex; flex-direction: column; gap: 1px; background: #123243; border: 1px solid #123243;">
+            <sc-for list="{{ drawerRows }}" as="r" hint-placeholder-count="5">
+              <div style="display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: baseline; padding: 7px 11px; background: #0a1622;">
+                <span style="font-size: 13.5px; font-weight: 500; color: #a8c6d6;">{{ r.k }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: {{ r.fg }};">{{ r.v }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; align-items: baseline; gap: 10px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.1em; color: #4e6b7c;">CONFIGURATION</div>
+            <div style="flex: 1; height: 1px; background: #123243;"></div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">WRITES config.json</div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <sc-for list="{{ drawerFields }}" as="f" hint-placeholder-count="4">
+              <div style="padding: 9px 11px 10px; border: 1px solid {{ f.border }}; background: {{ f.bg }}; display: flex; flex-direction: column; gap: 7px;">
+                <div style="display: flex; align-items: baseline; gap: 9px;">
+                  <span style="font-size: 13.5px; font-weight: 600; color: #eaf6fb;">{{ f.label }}</span>
+                  <div style="flex: 1;"></div>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: {{ f.tagFg }};">{{ f.tag }}</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 9px;">
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 5px 10px; min-width: 92px; border: 1px solid #1e3d4c; background: rgba(3,9,15,0.8); color: {{ f.valueFg }};">{{ f.value }}</div>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">{{ f.key }}</span>
+                </div>
+                <div style="font-size: 12.5px; font-weight: 500; line-height: 1.45; color: #6a8798;">{{ f.note }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="padding: 10px 12px; border-left: 2px solid {{ drawerWarnBar }}; background: {{ drawerWarnBg }}; font-size: 13px; font-weight: 500; line-height: 1.5; color: {{ drawerWarnFg }};">{{ drawerWarn }}</div>
+
+      </div>
+
+      <div style="padding: 13px 22px 15px; border-top: 1px solid #123243; display: flex; align-items: center; gap: 12px;">
+        <button type="button" onClick="{{ closeDrawer }}" style="font-family: 'Rajdhani', sans-serif; font-size: 13px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; padding: 9px 18px; border: 1px solid #2a4a58; background: none; color: #a8c6d6; cursor: pointer;" style-hover="border-color: #cfe3ec; color: #cfe3ec;">Discard</button>
+        <div style="flex: 1; font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.07em; color: #4e6b7c;">{{ drawerFooter }}</div>
+        <button type="button" style="font-family: 'Rajdhani', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 9px 20px; border: 1.5px solid {{ drawerSaveBorder }}; background: {{ drawerSaveBg }}; color: {{ drawerSaveFg }}; cursor: pointer;">{{ drawerSaveLabel }}</button>
+      </div>
+
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ modalOpen }}" hint-placeholder-val="{{ true }}">
+    <div style="position: absolute; left: 0; top: 0; width: 1600px; height: 900px; background: rgba(2,5,10,0.9); display: flex; align-items: flex-start; justify-content: center; padding: 22px 0; box-sizing: border-box; overflow-y: auto;">
+      <div style="width: 940px; padding: 1px; box-sizing: border-box; background: #17414f; clip-path: polygon(0 16px, 16px 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%);">
+        <div style="clip-path: polygon(0 15px, 15px 0, 100% 0, 100% calc(100% - 15px), calc(100% - 15px) 100%, 0 100%); background: linear-gradient(168deg, #0a1622 0%, #050b12 100%);">
+
+          <div style="padding: 17px 24px 15px; border-bottom: 1px solid #123243;">
+            <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px;">
+              <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: baseline; gap: 11px;">
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; font-weight: 600; letter-spacing: 0.1em; color: #04090f; background: {{ cardSideBg }}; padding: 3px 8px;">{{ cardSide }}</div>
+                  <div style="font-size: 30px; font-weight: 700; letter-spacing: 0.04em; line-height: 1; color: #eaf6fb;">{{ cardSymbol }}</div>
+                  <div style="font-size: 14px; font-weight: 500; color: #6a8798;">{{ cardName }}</div>
+                  <div style="flex: 1;"></div>
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: #4e6b7c;">{{ cardProvenance }}</div>
+                </div>
+                <div style="font-size: 15px; font-weight: 500; line-height: 1.5; color: #a8c6d6; max-width: 50em;">{{ cardWhy }}</div>
+              </div>
+              <div style="flex: 0 0 176px; display: flex; flex-direction: column; gap: 5px; border-left: 1px solid #123243; padding-left: 18px;">
+                <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">NOTIONAL</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 600; color: #eaf6fb;">{{ notional }}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">QTY</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #cfe3ec;">{{ qty }}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">LIMIT</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #cfe3ec;">{{ limitPrice }}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: baseline; border-top: 1px solid #123243; padding-top: 5px; margin-top: 2px;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">TOKEN EXPIRES</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #f5b942;">{{ cardExpiry }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #123243; border-bottom: 1px solid #123243;">
+            <div style="background: #07121b; padding: 12px 24px 13px; display: flex; flex-direction: column; gap: 5px;">
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: #4e6b7c;">ANALYSIS CONFIDENCE</div>
+              <div style="display: flex; align-items: baseline; gap: 10px;">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 500; line-height: 1; color: #eaf6fb;">{{ cardConf }}</span>
+                <span style="font-size: 13px; font-weight: 500; color: #a8c6d6;">{{ cardConfNote }}</span>
+              </div>
+              <div style="font-size: 12.5px; font-weight: 500; line-height: 1.45; color: #6a8798;">How sure the model is that it read the filing correctly. <span style="color: #a8c6d6;">Not a probability of profit.</span> Uncalibrated until Class A scoring runs.</div>
+            </div>
+            <div style="background: #060f17; padding: 12px 24px 13px; display: flex; flex-direction: column; gap: 5px;">
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.09em; color: #4e6b7c;">EXPECTED RETURN</div>
+              <div style="display: flex; align-items: baseline; gap: 10px;">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 500; line-height: 1; color: #395a68;">—</span>
+                <span style="font-size: 13px; font-weight: 500; color: #6a8798;">not available, and not guessed</span>
+              </div>
+              <div style="font-size: 12.5px; font-weight: 500; line-height: 1.45; color: #6a8798;">Needs closed positions to calibrate against. <span style="color: #a8c6d6;">1 of 60 sessions recorded.</span> No honest number exists yet.</div>
+            </div>
+          </div>
+
+          <div style="background: linear-gradient(180deg, rgba(46,14,12,0.9), rgba(30,10,10,0.7)); border-bottom: 1px solid #5a2420; padding: 15px 24px 16px;">
+            <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 10px;">
+              <div style="width: 3px; height: 14px; background: #ff6b5a;"></div>
+              <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: #ff9b8c;">Bear case</div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #a05a4e;">READ THIS BEFORE THE ACTION BELOW</div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 9px;">
+              <sc-for list="{{ bearPoints }}" as="b" hint-placeholder-count="3">
+                <div style="font-size: 14.5px; font-weight: 500; line-height: 1.55; color: #f0dcd8;">{{ b.text }}<span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; vertical-align: super; margin-left: 4px; color: #d08878;">{{ b.cite }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="background: #07121b; border-bottom: 1px solid #123243; padding: 14px 24px 15px;">
+            <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 10px;">
+              <div style="width: 3px; height: 14px; background: #6a8798;"></div>
+              <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: #a8c6d6;">Evidence contradicting the recommendation</div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 9px;">
+              <sc-for list="{{ contraPoints }}" as="c" hint-placeholder-count="2">
+                <div style="font-size: 14.5px; font-weight: 500; line-height: 1.55; color: #cfe3ec;">{{ c.text }}<span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; vertical-align: super; margin-left: 4px; color: #6a8798;">{{ c.cite }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="padding: 14px 24px 15px; border-bottom: 1px solid #123243;">
+            <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 10px;">
+              <div style="width: 3px; height: 14px; background: #4ade8a;"></div>
+              <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: #4ade8a;">Bull case</div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 9px;">
+              <sc-for list="{{ bullPoints }}" as="u" hint-placeholder-count="2">
+                <div style="font-size: 14.5px; font-weight: 500; line-height: 1.55; color: #cfe3ec;">{{ u.text }}<span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; vertical-align: super; margin-left: 4px; color: #6a8798;">{{ u.cite }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="padding: 15px 24px 17px; border-bottom: 1px solid #123243; background: #07121b;">
+            <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 11px;">
+              <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">What will be true after this fills</div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">NOT WHAT IS TRUE NOW · NET OF EVERY EARMARK</div>
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; background: #123243; border: 1px solid #123243;">
+              <div style="background: #0b1825; padding: 9px 11px; display: flex; flex-direction: column; gap: 4px;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">CASH RESERVE</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600; color: #eaf6fb;">{{ postReserve }}</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">every earmark filled · floor 40%</div>
+              </div>
+              <div style="background: #0b1825; padding: 9px 11px; display: flex; flex-direction: column; gap: 4px;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">CONCENTRATION</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600; color: #eaf6fb;">{{ postConcentration }}</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">{{ cardSymbol }} · cap 25%</div>
+              </div>
+              <div style="background: #0b1825; padding: 9px 11px; display: flex; flex-direction: column; gap: 4px;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">INVESTED</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600; color: #eaf6fb;">{{ postSector }}</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">whole book · no sector source</div>
+              </div>
+              <div style="background: #0b1825; padding: 9px 11px; display: flex; flex-direction: column; gap: 4px;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">EARLIEST EXIT</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600; color: #eaf6fb;">{{ earliestExitShort }}</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">T+1 · 1 session hold</div>
+              </div>
+              <div style="background: #0b1825; padding: 9px 11px; display: flex; flex-direction: column; gap: 4px;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 8.5px; letter-spacing: 0.07em; color: #4e6b7c;">DAY TRADES</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600; color: #eaf6fb;">{{ postDayTrades }}</div>
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #4e6b7c;">{{ postDayTradesNote }}</div>
+              </div>
+            </div>
+            <div style="margin-top: 10px; padding: 8px 11px; background: rgba(26,21,8,0.8); border-left: 2px solid #f5b942; font-size: 13px; font-weight: 500; line-height: 1.45; color: #d8c69a;">Two other requests are also waiting, and the figures above already assume each of them fills. Approving this one changes nothing on their cards.</div>
+          </div>
+
+          <div style="padding: 14px 24px 15px; border-bottom: 1px solid #123243;">
+            <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px;">
+              <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">Tax implications</div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">TAXABLE CASH ACCOUNT · SHORT HOLDS ARE EXPENSIVE</div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 6px;">
+              <sc-for list="{{ taxNotes }}" as="n" hint-placeholder-count="3">
+                <div style="padding: 8px 11px; background: {{ n.bg }}; border-left: 2px solid {{ n.bar }}; font-size: 13.5px; font-weight: 500; line-height: 1.5; color: {{ n.fg }};">{{ n.text }}</div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="padding: 14px 24px 15px; border-bottom: 1px solid #123243;">
+            <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 11px;">
+              <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: #eaf6fb;">Modify within bounds</div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">SMALLER OR A WORSE PRICE ONLY</div>
+            </div>
+            <div style="display: flex; gap: 28px; align-items: flex-start;">
+              <div style="display: flex; flex-direction: column; gap: 6px;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">SIZE</div>
+                <div style="display: flex; gap: 5px;">
+                  <button type="button" onClick="{{ setFull }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 6px 12px; border: 1px solid {{ fullBorder }}; background: {{ fullBg }}; color: {{ fullFg }}; cursor: pointer;">100%</button>
+                  <button type="button" onClick="{{ setThreeQ }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 6px 12px; border: 1px solid {{ threeQBorder }}; background: {{ threeQBg }}; color: {{ threeQFg }}; cursor: pointer;">75%</button>
+                  <button type="button" onClick="{{ setHalf }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 6px 12px; border: 1px solid {{ halfBorder }}; background: {{ halfBg }}; color: {{ halfFg }}; cursor: pointer;">50%</button>
+                  <button type="button" onClick="{{ setQuarter }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 6px 12px; border: 1px solid {{ quarterBorder }}; background: {{ quarterBg }}; color: {{ quarterFg }}; cursor: pointer;">25%</button>
+                </div>
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 6px;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.08em; color: #4e6b7c;">LIMIT PRICE</div>
+                <div style="display: flex; gap: 7px; align-items: center;">
+                  <button type="button" onClick="{{ worsenLimit }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 6px 11px; border: 1px solid #2a4a58; background: none; color: #cfe3ec; cursor: pointer;" style-hover="border-color: #5fd8f5;">{{ worsenLabel }}</button>
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; min-width: 64px; color: #eaf6fb;">{{ limitPrice }}</div>
+                  <div style="font-size: 12.5px; font-weight: 500; color: #6a8798;">{{ worsenNote }}</div>
+                </div>
+              </div>
+            </div>
+            <div style="margin-top: 11px; font-size: 13px; font-weight: 500; line-height: 1.45; color: {{ modifiedNoteColor }};">{{ modifiedNote }}</div>
+          </div>
+
+          <div style="padding: 16px 24px 18px; display: flex; align-items: center; gap: 15px;">
+            <button type="button" onClick="{{ closeModal }}" style="font-family: 'Rajdhani', sans-serif; font-size: 13.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 11px 22px; border: 1.5px solid #cfe3ec; background: none; color: #cfe3ec; cursor: pointer;" style-hover="background: #cfe3ec; color: #050b12;">Reject</button>
+            <button type="button" onClick="{{ closeModal }}" style="font-family: 'Rajdhani', sans-serif; font-size: 13.5px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; padding: 11px 18px; border: 1px solid #2a4a58; background: none; color: #6a8798; cursor: pointer;" style-hover="border-color: #6a8798; color: #cfe3ec;">Defer to next session</button>
+            <div style="flex: 1;"></div>
+            <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 5px;">
+              <button type="button" disabled="{{ approveDisabled }}" style="font-family: 'Rajdhani', sans-serif; font-size: 13.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 11px 26px; border: 1.5px solid {{ approveBorder }}; background: {{ approveBg }}; color: {{ approveFg }}; cursor: {{ approveCursor }};">{{ approveLabel }}</button>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #4e6b7c;">{{ approveHint }}</div>
+            </div>
+          </div>
+
+          <div style="padding: 10px 24px 12px; border-top: 1px solid #123243; display: flex; justify-content: space-between; font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.07em; color: #4e6b7c;">
+            <div>SIGNED TOKEN REQUIRED · MODIFY-IN-BOUNDS VERIFIED AT SUBMIT</div>
+            <div>ON SCREEN {{ elapsedLabel }} · ESC AND CLICK-OUTSIDE DISABLED</div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1600,&quot;height&quot;:900},&quot;coreLoad&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;live&quot;,&quot;resting&quot;,&quot;moderate&quot;,&quot;high&quot;,&quot;max&quot;],&quot;default&quot;:&quot;live&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Core&quot;},&quot;minDisplaySeconds&quot;:{&quot;editor&quot;:&quot;int&quot;,&quot;default&quot;:45,&quot;tsType&quot;:&quot;number&quot;,&quot;min&quot;:0,&quot;max&quot;:180,&quot;unit&quot;:&quot;s&quot;,&quot;section&quot;:&quot;Friction&quot;}}">
+class Component extends DCLogic {
+  state = { t: 0, open: null, sizePct: 100, limitDelta: 0, cardShownAt: 0, drawer: null };
+
+  componentDidMount() {
+    this._i = setInterval(() => this.setState(s => ({ t: s.t + 1 })), 1000);
+  }
+  componentWillUnmount() { clearInterval(this._i); }
+
+  renderVals() {
+    const t = this.state.t;
+    const open = this.state.open;
+    const isOpen = open !== null;
+    const minSec = this.props.minDisplaySeconds ?? 45;
+
+    const collecting = t % 14 < 9;
+    const screening = t % 14 >= 7 && t % 14 < 11;
+    const analysing = t % 23 < 12;
+    const reconciling = t % 19 < 5;
+    const syncing = t % 19 >= 3 && t % 19 < 7;
+
+    const active = [collecting, screening, analysing, reconciling, syncing, false].filter(Boolean).length;
+    const waiting = 3;
+
+    // Core color follows PROCESSING LOAD only. Approval waiting never tints the core.
+    const forced = this.props.coreLoad ?? "live";
+    const loadMap = { resting: 0.08, moderate: 0.45, high: 0.75, max: 1 };
+    const lift = forced === "live" ? Math.min(active, 5) / 5 : loadMap[forced];
+
+    // Blue -> white -> gold, routed through low chroma so it never passes through green.
+    const hue = lift < 0.5 ? 232 : 82;
+    const chroma = (0.115 * Math.abs(lift - 0.5) * 2).toFixed(3);
+    const light = (0.62 + lift * 0.3).toFixed(3);
+    const glowPx = 46 + lift * 130;
+    const glowAlpha = (0.18 + lift * 0.34).toFixed(2);
+
+    const cyan = "#5fd8f5";
+    const cyanDim = "#1b4d5f";
+    const gold = "#f5b942";
+    const green = "#4ade8a";
+
+    const play = (on) => (on && !isOpen) ? "running" : "paused";
+    const frame = (on) => on ? "#2a6f86" : "#17414f";
+    const dot = (on) => on ? cyan : "#2a4a58";
+
+    const cards = [
+      {
+        symbol: "NTAP", name: "NetApp, Inc.", side: "BUY", expiry: "6:12",
+        why: "Q1 FY2027 results released after close on an 8-K item 2.02. Revenue and guidance both above the prior four-quarter trend; the move so far is 3.4 standard deviations of 20-day ATR on 6.1\u00d7 median volume.",
+        base: 36.2, price: 116.77, conf: "0.61", confNote: "reasoning is well supported by the filing",
+        bear: [
+          { text: "Guidance beat is driven by a hardware refresh cycle management itself describes as pull-forward demand, not expansion. The comparable quarter a year out faces that pulled-forward base.", cite: "EX-99.1 L142" },
+          { text: "Gross margin contracted 180bp year over year despite the revenue beat, attributed to component costs the filing does not describe as transitory.", cite: "EX-99.1 L211" },
+          { text: "The post-release move has already happened. Entering now buys the reaction, not the information \u2014 and the position cannot be exited before Wednesday.", cite: "" },
+        ],
+        contra: [
+          { text: "The same filing's cash-flow statement shows operating cash flow down 9% year over year, which does not support the growth reading the bull case rests on.", cite: "EX-99.1 L308" },
+          { text: "Two of the last three comparable item 2.02 releases for this issuer produced a same-direction move that fully reverted within four sessions.", cite: "" },
+        ],
+        bull: [
+          { text: "Revenue of $1.74bn exceeded the prior four-quarter trend by 6.2%, and the filing raises full-year guidance rather than reaffirming it.", cite: "EX-99.1 L88" },
+          { text: "All-flash array revenue grew 21% year over year, the segment the issuer has repeatedly identified as margin-accretive.", cite: "EX-99.1 L164" },
+        ],
+        tax: [
+          { text: "No realised gain or loss. This opens a new lot and starts its holding-period clock at fill.", cost: false },
+          { text: "No disallowed loss in NTAP inside the wash-sale window, so this purchase does not trigger one.", cost: false },
+          { text: "Sold before 2027-08-04 this is a short-term gain, taxed as ordinary income rather than at the long-term rate.", cost: true },
+        ],
+        prov: "EVENT 0F3A91C \u00b7 $0.148 \u00b7 T4-V1 \u00b7 5 CITATIONS RESOLVED",
+      },
+      {
+        symbol: "SPY", name: "SPDR S&P 500 ETF", side: "SELL", expiry: "12:40",
+        why: "Held lot has cleared its minimum hold and settled. Exit proposed on cash-reserve rebalancing, not on a thesis change \u2014 there is no new information about this position.",
+        base: 20.0, price: 738.42, conf: "0.44", confNote: "no new information; rationale is procedural",
+        bear: [
+          { text: "Selling realises a short-term gain taxed as ordinary income, and the position has been held four sessions. The tax cost may exceed the rebalancing benefit at this size.", cite: "" },
+          { text: "This is the only position in the account. Exiting it leaves the portfolio entirely in cash, which is a decision about market exposure disguised as a rebalance.", cite: "" },
+        ],
+        contra: [
+          { text: "Cash reserve is already at 96.0%, far above the 40% floor. The rebalancing rationale does not hold at the current posture.", cite: "" },
+        ],
+        bull: [
+          { text: "Realising the position now avoids carrying single-position concentration into an earnings-dense week.", cite: "" },
+        ],
+        tax: [
+          { text: "Realises a short-term gain of $0.41, taxed as ordinary income \u2014 roughly $0.13 at a 32% marginal rate.", cost: true },
+          { text: "Held 4 sessions. Long-term treatment on this lot begins 2027-07-28, 361 days away.", cost: true },
+          { text: "Closing at a gain, so no wash-sale exposure \u2014 repurchasing inside 30 days would not disallow anything.", cost: false },
+        ],
+        prov: "EVENT 7B2C04E \u00b7 $0.000 CACHE HIT \u00b7 T4-V1 \u00b7 0 CITATIONS",
+      },
+      {
+        symbol: "AVGO", name: "Broadcom Inc.", side: "BUY", expiry: "21:05",
+        why: "8-K item 1.01 \u2014 a material definitive agreement filed intraday. Volume 4.2\u00d7 median with a 2.1 sigma move against a flat peer group.",
+        base: 28.0, price: 342.15, conf: "0.52", confNote: "key exhibit terms are redacted",
+        bear: [
+          { text: "The agreement's financial terms are redacted in the filed exhibit, so the size and duration of the commitment cannot be established from the primary source.", cite: "EX-10.1 L44" },
+          { text: "Invested capital would reach 12.8% of equity once every outstanding earmark fills, from 4.0% today.", cite: "" },
+        ],
+        contra: [
+          { text: "The move began roughly forty minutes before the filing was accepted, which is consistent with the information already being priced.", cite: "" },
+        ],
+        bull: [
+          { text: "Item 1.01 agreements from this issuer have historically preceded upward revenue guidance revisions within two quarters.", cite: "" },
+        ],
+        tax: [
+          { text: "No realised gain or loss. Opens a new lot; broker disposal is FIFO, so this lot sits behind any earlier AVGO lot on a future sale.", cost: false },
+          { text: "No disallowed loss in AVGO inside the wash-sale window.", cost: false },
+        ],
+        prov: "EVENT C41E8A2 \u00b7 $0.151 \u00b7 T4-V1 \u00b7 3 CITATIONS RESOLVED",
+      },
+    ];
+
+    const c = isOpen ? cards[open] : cards[0];
+    const pct = this.state.sizePct;
+    const isSell = c.side === "SELL";
+    const limit = c.price - this.state.limitDelta * 0.05 * (isSell ? 1 : 1);
+    const notional = c.base * pct / 100;
+    const equity = 500.0;
+    const held = 20.0;
+    const invested = isSell ? Math.max(0, held - notional) : held + notional;
+    // Every OTHER pending buy's earmark is assumed filled, so no card's figures
+    // change when a sibling is approved.
+    const otherEarmarks = cards.reduce((sum, o, i) => sum + ((i !== open && o.side === "BUY") ? o.base : 0), 0);
+
+    const shown = isOpen ? t - this.state.cardShownAt : 0;
+    const remaining = Math.max(0, minSec - shown);
+    const ready = remaining === 0;
+    const mm = String(Math.floor(shown / 60)).padStart(2, "0");
+    const ss = String(shown % 60).padStart(2, "0");
+    const modified = pct !== 100 || this.state.limitDelta !== 0;
+
+    const selBg = (on) => on ? "#cfe3ec" : "none";
+    const selFg = (on) => on ? "#050b12" : "#a8c6d6";
+    const selBd = (on) => on ? "#cfe3ec" : "#2a4a58";
+
+    const clock = new Date(Date.UTC(2026, 7, 2, 15, 32, 42 + t)).toISOString().slice(11, 19);
+    const cycle = 300 - (t * 7) % 300;
+
+    const D = this.state.drawer;
+    const panels = {
+      p1: {
+        num: "01", title: "Data collection", source: "agent/collectors/ \u00b7 agent/pipeline_stage.py \u00b7 §3.1",
+        rows: [
+          { k: "Market bars ingested today", v: (1284 + (t % 9) * 3) + "", fg: "#cfe3ec" },
+          { k: "Filings seen today", v: "17", fg: "#cfe3ec" },
+          { k: "Deduped by accession number", v: "4 skipped", fg: "#6a8798" },
+          { k: "EDGAR rate limiter", v: "10 req/s ENFORCED", fg: "#4ade8a" },
+          { k: "Last collection cycle", v: "42s ago", fg: "#5fd8f5" },
+        ],
+        fields: [
+          { label: "Collection enabled", value: "TRUE", key: "data_collection_enabled", tag: "LIVE", note: "Master switch for the collection stage. Off means no bars and no filings enter the store." },
+          { label: "Collection interval", value: "300 s", key: "data_collection_interval_seconds", tag: "", note: "Wall-clock gap between cycles. The run loop is single-threaded, so cycles cannot overlap regardless of this value." },
+          { label: "Session gate", value: "IN SESSION ONLY", key: "(derived)", tag: "READ ONLY", note: "Collection runs only inside a real trading session, from market_calendar. Not configurable here." },
+          { label: "News feed", value: "NOT BUILT", key: "\u2014", tag: "ABSENT", note: "No news collector exists. Listed so the gap is visible rather than implied." },
+        ],
+        warn: "Raising the cadence increases EDGAR requests but not model spend \u2014 collection never calls a model.", tone: "info",
+        footer: "NO RESTART REQUIRED \u00b7 PICKED UP NEXT CYCLE", save: "Apply",
+      },
+      p2: {
+        num: "02", title: "Materiality screen", source: "agent/materiality.py \u00b7 agent/opportunity_event_tracker.py \u00b7 §3.2",
+        rows: [
+          { k: "Scored this session", v: (41 + (t % 5)) + "", fg: "#cfe3ec" },
+          { k: "Suppressed below threshold", v: (38 + (t % 5)) + "", fg: "#6a8798" },
+          { k: "Triggered analysis", v: "3", fg: "#f5b942" },
+          { k: "Dedup identity", v: "event_id", fg: "#cfe3ec" },
+          { k: "Deferred, eligible next session", v: "1 \u00b7 insufficient cash", fg: "#f5b942" },
+        ],
+        fields: [
+          { label: "Screen enabled", value: "TRUE", key: "materiality_screen_enabled", tag: "LIVE", note: "Scoring is free. Turning this off stops anything reaching analysis at all." },
+          { label: "Screen interval", value: "5 min", key: "opportunity_screen_interval_minutes", tag: "", note: "How often unhandled events are rescored. Converted to seconds at the call site." },
+          { label: "Materiality threshold", value: "0.62", key: "materiality_threshold", tag: "UNCALIBRATED", note: "The single number standing between a filing and paid analysis. Placeholder weights until ~60 sessions of outcomes exist." },
+          { label: "Filing weight table", value: "FLAT 1.0", key: "filing_weight", tag: "STUB", note: "§3.2 specifies a per-form table; the code returns 1.0 for every form. An 8-K and a 10-K currently score identically." },
+        ],
+        warn: "Lowering the threshold spends money: every extra trigger is a paid model call against the daily cap and the monthly budget.", tone: "warn",
+        footer: "TAKES EFFECT NEXT SCREEN CYCLE", save: "Apply",
+      },
+      p3: {
+        num: "03", title: "Cost brake", source: "agent/cost_ledger.py \u00b7 §4.3",
+        rows: [
+          { k: "Spent month to date", v: "$3.42", fg: "#cfe3ec" },
+          { k: "Analyses today", v: "4 of 8", fg: "#cfe3ec" },
+          { k: "Mean cost per analysis", v: "$0.149", fg: "#cfe3ec" },
+          { k: "Cache hits (free)", v: "6", fg: "#4ade8a" },
+          { k: "Projected at daily cap", v: "$25.10", fg: "#f5b942" },
+        ],
+        fields: [
+          { label: "T4 analysis enabled", value: "FALSE", key: "t4_analysis_enabled", tag: "SPEND SWITCH", note: "The only flag that causes money to be spent. False on this branch; you set it deliberately." },
+          { label: "Monthly target", value: "$20.00", key: "monthly_cost_target_usd", tag: "", note: "Soft line. Crossing it is reported, not enforced." },
+          { label: "Monthly hard stop", value: "$30.00", key: "monthly_cost_hard_stop_usd", tag: "HALTS AGENT", note: "At this figure the agent stops analysing entirely for the rest of the month. Not a warning." },
+          { label: "Analyses per day", value: "8", key: "max_model_analyses_per_day", tag: "", note: "Hard daily ceiling on paid calls, independent of the monthly figures." },
+        ],
+        warn: "Raising the hard stop removes the only automatic brake on model spend. The ledger is durable, so restarts do not reset it.", tone: "warn",
+        footer: "HARD STOP CHANGE REQUIRES RE-AUTH", save: "Re-auth and apply",
+      },
+      p4: {
+        num: "04", title: "Analysis", source: "agent/analysis.py \u00b7 agent/extraction_cache_store.py \u00b7 §5",
+        rows: [
+          { k: "Current document", v: "NTAP 8-K item 2.02", fg: "#cfe3ec" },
+          { k: "Cost of this call", v: "$0.148", fg: "#cfe3ec" },
+          { k: "Refused for unsupported claim", v: "1 today", fg: "#f5b942" },
+          { k: "Citations resolved", v: "5 of 5", fg: "#4ade8a" },
+          { k: "Prompt isolation", v: "FILING TEXT NEVER INSTRUCTIONS", fg: "#4ade8a" },
+        ],
+        fields: [
+          { label: "Model", value: "T4-V1", key: "analysis_model", tag: "", note: "Frontier model used for document reasoning. Changing it invalidates cached extractions." },
+          { label: "Require citations", value: "TRUE", key: "require_citations", tag: "INVARIANT", note: "Every claim must cite a line in the source document or the analysis is refused. Do not turn this off." },
+          { label: "Extraction cache", value: "SHARED", key: "--extraction-cache-path", tag: "CLI FLAG", note: "Shared across accounts, not per-account, consistent with the cost ledger. A cache hit costs nothing." },
+          { label: "Refuse on thin evidence", value: "TRUE", key: "refuse_unsupported", tag: "INVARIANT", note: "A refusal is a successful outcome. It is the behaviour that keeps the agent from inventing a thesis." },
+        ],
+        warn: "Citation and refusal requirements are the reason this agent can be trusted with primary sources. Treat them as structural, not tunable.", tone: "warn",
+        footer: "MODEL CHANGE CLEARS THE EXTRACTION CACHE", save: "Apply",
+      },
+      p5: {
+        num: "05", title: "Risk gates", source: "agent/risk.py \u00b7 agent/gatekeeper.py \u00b7 §6",
+        rows: [
+          { k: "Cash reserve", v: "96.0% \u00b7 floor 40%", fg: "#4ade8a" },
+          { k: "Max position", v: "25% of equity", fg: "#cfe3ec" },
+          { k: "Day trades used", v: "0 of 3", fg: "#4ade8a" },
+          { k: "Minimum hold", v: "1 session \u00b7 T+1 settled", fg: "#cfe3ec" },
+          { k: "Gate composition", v: "ALL MUST PASS \u00b7 NO OVERRIDE", fg: "#4ade8a" },
+        ],
+        fields: [
+          { label: "Cash reserve floor", value: "40%", key: "min_cash_reserve_pct", tag: "GATE", note: "Orders are resized to respect this, and refused outright if the full request will not fit." },
+          { label: "Max position size", value: "25%", key: "max_position_pct", tag: "GATE", note: "Ceiling per symbol as a share of equity. Resizing happens on this dimension." },
+          { label: "Risk preset", value: "MODERATE", key: "risk_preset", tag: "", note: "CONSERVATIVE, MODERATE, or AGGRESSIVE. AGGRESSIVE is unloadable under pilot defaults: its 4-hour hold is sub-day and the cash posture forbids it." },
+          { label: "Override behaviour", value: "REJECT", key: "(code)", tag: "READ ONLY", note: "An override beyond platform maximum is rejected, never clamped. §6 previously said clamped; the code was right." },
+        ],
+        warn: "Loosening a gate cannot be undone for orders already authorised. Every gate change requires re-auth and is written to the audit chain.", tone: "danger",
+        footer: "REQUIRES RE-AUTH \u00b7 AUDITED \u00b7 NO SILENT WIDENING", save: "Re-auth and apply",
+      },
+      p6: {
+        num: "06", title: "Human approval", source: "agent/approval_request_store.py \u00b7 agent/approval_bridge.py \u00b7 §10",
+        rows: [
+          { k: "Waiting for you", v: "3", fg: "#f5b942" },
+          { k: "Decided today", v: "0 of 4 cap", fg: "#cfe3ec" },
+          { k: "Cash earmarked", v: "$84.60 of $280.00 free", fg: "#f5b942" },
+          { k: "Deferred for cash", v: "1 \u00b7 AVGO", fg: "#6a8798" },
+          { k: "Sibling invalidation", v: "REMOVED \u00b7 EARMARKS INSTEAD", fg: "#4ade8a" },
+        ],
+        fields: [
+          { label: "Approval requests enabled", value: "TRUE", key: "approval_request_enabled", tag: "LIVE", note: "Off means analyses complete but no card is ever raised. Nothing can reach the broker." },
+          { label: "Decisions per day", value: "4", key: "max_approval_requests_per_day", tag: "", note: "Counts decided requests only \u2014 approved and rejected. Expired and deferred cards spend no attention and do not count." },
+          { label: "Minimum display time", value: "45 s", key: "approval_min_display_seconds", tag: "FRICTION", note: "Enforced at token consumption from a server-minted timestamp, not by this UI. A caller cannot shorten it." },
+          { label: "Token expiry", value: "30 min", key: "approval_token_ttl_minutes", tag: "", note: "After this the card is void, not repriced. The filing stays eligible for a fresh analysis." },
+        ],
+        warn: "Approval is the last gate before real money. Lowering the display time or raising the daily cap both work against the friction that makes review real.", tone: "danger",
+        footer: "REQUIRES RE-AUTH \u00b7 AUDITED", save: "Re-auth and apply",
+      },
+      p7: {
+        num: "07", title: "Reconciliation", source: "agent/reconcile.py \u00b7 §8.1",
+        rows: [
+          { k: "Positions", v: "SPY 0.0271", fg: "#cfe3ec" },
+          { k: "Settled cash", v: "$480.00", fg: "#cfe3ec" },
+          { k: "Open orders", v: "NONE", fg: "#4ade8a" },
+          { k: "Day-trade count", v: "0 \u00b7 BROKER FIGURE UNKNOWN", fg: "#f5b942" },
+          { k: "Last result", v: "4 of 4 CLEAN", fg: "#4ade8a" },
+        ],
+        fields: [
+          { label: "Reconcile interval", value: "300 s", key: "reconciliation_cycle_interval_seconds", tag: "", note: "Broker truth is pulled on this cadence and always wins over local state." },
+          { label: "On divergence", value: "HALT AND REPORT", key: "reconcile_on_divergence", tag: "INVARIANT", note: "The agent stops rather than trading against a position it cannot confirm." },
+          { label: "Broker", value: "ALPACA PAPER", key: "broker_env", tag: "PAPER", note: "Switching to live is a mode transition, not a config edit. It requires re-auth and explicit confirmation." },
+        ],
+        warn: "The broker's own day-trade count is not exposed by the paper API, so the local figure is a lower bound. Treat 0 of 3 as unverified.", tone: "warn",
+        footer: "NO RESTART REQUIRED", save: "Apply",
+      },
+      p8: {
+        num: "08", title: "Audit chain", source: "agent/audit_log.py \u00b7 §8.2",
+        rows: [
+          { k: "Rows today", v: "148", fg: "#cfe3ec" },
+          { k: "Hash chain", v: "VERIFIED TO GENESIS", fg: "#4ade8a" },
+          { k: "Write mode", v: "APPEND-ONLY \u00b7 FSYNC PER ROW", fg: "#4ade8a" },
+          { k: "Truncated-tail handling", v: "UNSTARTABLE \u00b7 KNOWN DEFECT", fg: "#ff6b5a" },
+          { k: "Retention", v: "FOREVER \u00b7 NEVER PRUNED", fg: "#cfe3ec" },
+        ],
+        fields: [
+          { label: "Verify on startup", value: "TRUE", key: "audit_verify_on_start", tag: "INVARIANT", note: "The whole chain is rehashed at boot. A broken link stops the agent before it can trade." },
+          { label: "Log path", value: "data/audit.jsonl", key: "--audit-log-path", tag: "CLI FLAG", note: "One file, append-only. Never edit it by hand \u2014 any edit breaks the chain and the agent will refuse to start." },
+        ],
+        warn: "A partially written final line currently makes the process permanently unstartable. Three stores share this defect; it is queued as its own unit of work.", tone: "danger",
+        footer: "READ ONLY FROM THIS SURFACE", save: "Apply",
+      },
+      p9: {
+        num: "09", title: "Improvement loop", source: "§12 \u00b7 not implemented",
+        rows: [
+          { k: "Class A \u00b7 reading quality", v: "NO LABELS YET", fg: "#6a8798" },
+          { k: "Class B \u00b7 decision quality", v: "NO CLOSED POSITIONS", fg: "#6a8798" },
+          { k: "Sessions recorded", v: "1 of 60", fg: "#6a8798" },
+          { k: "Promotion gate", v: "BLOCKED ON ATTRIBUTION", fg: "#f5b942" },
+        ],
+        fields: [
+          { label: "Loop enabled", value: "FALSE", key: "improvement_loop_enabled", tag: "NOT BUILT", note: "No code path exists behind this flag yet. Shown so the gap is legible from the dashboard." },
+          { label: "Minimum sample", value: "60 sessions", key: "improvement_min_sessions", tag: "", note: "Below this, any weight change is fitting noise. The figure is a judgement, not a derivation." },
+        ],
+        warn: "This is the difference between an agent that improves and one that merely runs. It is downstream of attribution, which is also unbuilt \u2014 build that first.", tone: "info",
+        footer: "NOTHING TO APPLY YET", save: "Apply",
+      },
+      p10: {
+        num: "10", title: "Performance evaluation", source: "§13 \u00b7 not implemented",
+        rows: [
+          { k: "Closed positions", v: "0", fg: "#6a8798" },
+          { k: "Sessions", v: "1 of 60", fg: "#6a8798" },
+          { k: "Benchmark", v: "VS INDEX \u00b7 NET OF TAX", fg: "#cfe3ec" },
+          { k: "Attribution layer", v: "ABSENT", fg: "#ff6b5a" },
+        ],
+        fields: [
+          { label: "Benchmark symbol", value: "SPY", key: "benchmark_symbol", tag: "", note: "Beating this net of tax and fees is the only success criterion that matters." },
+          { label: "Kill criterion", value: "REVIEWED IN 11 MONTHS", key: "kill_review_date", tag: "", note: "Set at pilot start. Underperforming the benchmark at review means the pilot ends \u2014 that is the point of naming it in advance." },
+        ],
+        warn: "Until this panel reports real numbers the agent cannot tell you whether any decision it made was good. This is the highest-value thing left to build.", tone: "warn",
+        footer: "NOTHING TO APPLY YET", save: "Apply",
+      },
+      p11: {
+        num: "11", title: "Execution", source: "agent/broker/base.py \u00b7 §7",
+        rows: [
+          { k: "Broker", v: "ALPACA PAPER", fg: "#5fd8f5" },
+          { k: "Open orders", v: "NONE", fg: "#4ade8a" },
+          { k: "Funding", v: "SETTLED CASH \u00b7 T+1", fg: "#cfe3ec" },
+          { k: "Unsettled cash funding", v: "DISABLED", fg: "#6a8798" },
+          { k: "Token requirement", v: "SIGNED TOKEN OR NO ORDER", fg: "#4ade8a" },
+        ],
+        fields: [
+          { label: "Funding source", value: "SETTLED_CASH", key: "funding_source", tag: "GATE", note: "Cash account. Sale proceeds are unsettled for one session, so a sell cannot fund a same-day buy." },
+          { label: "Order type", value: "LIMIT", key: "default_order_type", tag: "", note: "Market orders are not used. The limit is what the price band is enforced against." },
+          { label: "Price band", value: "\u00b10.85%", key: "price_band_pct", tag: "GATE", note: "Price leaving this band voids the token rather than repricing it. Currently recomputed at mint instead of inherited from the request \u2014 open defect." },
+          { label: "Cancel and replace", value: "TOKEN REQUIRED", key: "(code)", tag: "READ ONLY", note: "CANCEL, CLOSE and REPLACE are order kinds through the gatekeeper. There is no ungated write path to the broker." },
+        ],
+        warn: "Widening the price band means approving a figure further from the one you actually read. The band is the link between the analysis and the fill.", tone: "danger",
+        footer: "REQUIRES RE-AUTH \u00b7 AUDITED", save: "Re-auth and apply",
+      },
+      core: {
+        num: "\u2014", title: "Core state", source: "agent/run_loop.py \u00b7 agent/mode.py \u00b7 §9",
+        rows: [
+          { k: "Mode", v: "PAPER", fg: "#f5b942" },
+          { k: "Processes active", v: active + " of 6", fg: "#cfe3ec" },
+          { k: "Core colour follows", v: "PROCESSING LOAD ONLY", fg: "#5fd8f5" },
+          { k: "Loop cadence", v: "SINGLE-THREADED \u00b7 NO OVERLAP", fg: "#4ade8a" },
+          { k: "Uptime", v: "1 session", fg: "#cfe3ec" },
+        ],
+        fields: [
+          { label: "Mode", value: "PAPER", key: "mode", tag: "5 STATES", note: "RESEARCH, PAPER, PRODUCTION_PENDING, PAUSED, PRODUCTION_ACTIVE. Resuming from PAUSED to PRODUCTION_ACTIVE requires re-auth: resuming is starting live trading." },
+          { label: "Loop interval", value: "60 s", key: "run_loop_interval_seconds", tag: "", note: "Outer cadence. Each stage has its own interval inside it." },
+          { label: "Kill switch", value: "ARMED", key: "(operator)", tag: "ALWAYS ON", note: "Pause halts the loop between cycles. It never interrupts a submitted order \u2014 that is the broker's to resolve." },
+        ],
+        warn: "Gold in the core means the agent is working hard, not that it needs you. Human attention is signalled by the amber frame on panel 06 alone.", tone: "info",
+        footer: "MODE TRANSITION REQUIRES RE-AUTH AND CONFIRMATION", save: "Re-auth and apply",
+      },
+    };
+    const d = D ? panels[D] : null;
+    const toneMap = {
+      info: { bar: "#2b9fc4", bg: "rgba(11,24,37,0.8)", fg: "#a8c6d6" },
+      warn: { bar: "#f5b942", bg: "rgba(26,21,8,0.8)", fg: "#e6d5ad" },
+      danger: { bar: "#ff6b5a", bg: "rgba(38,12,10,0.8)", fg: "#f0c4bc" },
+    };
+    const tone = d ? toneMap[d.tone] : toneMap.info;
+    const gatedTag = (tag) => tag === "GATE" || tag === "INVARIANT" || tag === "SPEND SWITCH" || tag === "HALTS AGENT" || tag === "FRICTION";
+    const openDrawer = (k) => (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.setState({ drawer: k }); };
+
+    return {
+      clock,
+      ambientPlay: (isOpen || D) ? "paused" : "running",
+
+      drawerOpen: D !== null,
+      closeDrawer: () => this.setState({ drawer: null }),
+      openP1: openDrawer("p1"), openP2: openDrawer("p2"), openP3: openDrawer("p3"),
+      openP4: openDrawer("p4"), openP5: openDrawer("p5"), openP6: openDrawer("p6"),
+      openP7: openDrawer("p7"), openP8: openDrawer("p8"), openP9: openDrawer("p9"),
+      openP10: openDrawer("p10"), openP11: openDrawer("p11"), openCore: openDrawer("core"),
+      drawerNum: d ? d.num : "",
+      drawerTitle: d ? d.title : "",
+      drawerSource: d ? d.source : "",
+      drawerRows: d ? d.rows : [],
+      drawerFields: d ? d.fields.map(f => ({
+        label: f.label, value: f.value, key: f.key, note: f.note,
+        tag: f.tag,
+        tagFg: gatedTag(f.tag) ? "#f5b942" : (f.tag === "READ ONLY" || f.tag === "ABSENT" || f.tag === "STUB" || f.tag === "NOT BUILT" ? "#6a8798" : "#2b9fc4"),
+        border: gatedTag(f.tag) ? "#3d3113" : "#132b38",
+        bg: gatedTag(f.tag) ? "rgba(22,18,8,0.6)" : "rgba(7,17,26,0.7)",
+        valueFg: (f.tag === "READ ONLY" || f.tag === "ABSENT" || f.tag === "STUB" || f.tag === "NOT BUILT") ? "#6a8798" : "#eaf6fb",
+      })) : [],
+      drawerWarn: d ? d.warn : "",
+      drawerWarnBar: tone.bar, drawerWarnBg: tone.bg, drawerWarnFg: tone.fg,
+      drawerFooter: d ? d.footer : "",
+      drawerSaveLabel: d ? d.save : "Apply",
+      drawerSaveBg: d && d.tone === "danger" ? "#f5b942" : "#cfe3ec",
+      drawerSaveFg: "#050b12",
+      drawerSaveBorder: d && d.tone === "danger" ? "#f5b942" : "#cfe3ec",
+
+      coreGlow: `0 0 ${glowPx}px oklch(${light} ${chroma} ${hue} / ${glowAlpha}), inset 0 0 80px rgba(3,9,16,0.7)`,
+      coreTintGradient: `radial-gradient(circle at 50% 47%, rgba(0,0,0,0) 0%, oklch(0.4 ${chroma} ${hue} / 0.08) 32%, oklch(${light} ${chroma} ${hue} / 0.3) 60%, oklch(${light} ${chroma} ${hue} / 0.58) 84%, oklch(${Math.min(0.92, Number(light) + 0.1)} ${chroma} ${hue} / 0.66) 100%)`,
+      coreTint: (0.5 + lift * 0.3).toFixed(2),
+      coreCentre: `oklch(${(0.84 + lift * 0.12).toFixed(3)} ${(Number(chroma) * 0.5).toFixed(3)} ${lift < 0.5 ? 226 : 88} / ${(0.52 + lift * 0.3).toFixed(2)})`,
+      goldTraceOpacity: (0.06 + lift * 0.7).toFixed(2),
+      coreFrame: lift > 0.72 ? "#6b5216" : "#17414f",
+      coreState: lift < 0.2 ? "RESTING" : (lift < 0.5 ? "OBSERVING" : (lift < 0.8 ? "PROCESSING" : "PROCESSING HIGH")),
+      coreStateFg: lift < 0.5 ? cyan : gold,
+      corePointer: (6 + lift * 88).toFixed(1) + "%",
+      activeCount: active,
+      waitingLabel: waiting + " AWAITING REVIEW",
+
+      collectTrace: collecting ? cyan : cyanDim,
+      screenTrace: screening ? cyan : cyanDim,
+      analysisTrace: analysing ? cyan : cyanDim,
+      reconTrace: reconciling ? cyan : cyanDim,
+      budgetTrace: "#1f6a80",
+      gateTrace: "#2a7a5c",
+      approvalTrace: gold,
+      execTrace: "#1f6a80",
+      busTrace: "#1f6a80",
+
+      collectStatus: collecting ? "INGESTING" : "IDLE",
+      collectFg: collecting ? cyan : "#4e6b7c",
+      collectDot: dot(collecting), collectFrame: frame(collecting), collectPlay: play(collecting),
+      barsCount: (1284 + (t % 9) * 3) + " bars",
+      ingestRate: collecting ? (34 + (t % 7) * 3) + " /min" : "0 /min",
+
+      screenStatus: screening ? "SCORING" : "IDLE",
+      screenFg: screening ? cyan : "#4e6b7c",
+      screenDot: dot(screening), screenFrame: frame(screening), screenPlay: play(screening),
+      scored: 41 + (t % 5),
+      suppressed: 38 + (t % 5),
+      heatLabel: "LAST " + (41 + (t % 5)) + " SCORED \u00b7 3 TRIGGERED",
+      heatCells: (() => {
+        const n = 41 + (t % 5);
+        const goldAt = [6, 19, Math.min(n - 4, 33)];
+        return Array.from({ length: n }, (_, i) => {
+          if (goldAt.indexOf(i) !== -1) return { bg: gold };
+          const seed = (i * 37 + Math.floor(t / 4) * 11) % 97;
+          return { bg: seed > 66 ? "#2b9fc4" : "#10202c" };
+        });
+      })(),
+
+      budgetDash: (2 * Math.PI * 35 * 0.114).toFixed(1) + " " + (2 * Math.PI * 35).toFixed(1),
+      reserveDash: (2 * Math.PI * 30 * 0.96).toFixed(1) + " " + (2 * Math.PI * 30).toFixed(1),
+
+      analysisStatus: analysing ? "READING" : "IDLE",
+      analysisFg: analysing ? cyan : "#4e6b7c",
+      analysisDot: dot(analysing), analysisFrame: frame(analysing), analysisPlay: play(analysing),
+      analysisProgress: analysing ? (30 + (t * 7) % 65) + "%" : "\u2014",
+      analysisDash: (2 * Math.PI * 31 * (analysing ? (30 + (t * 7) % 65) / 100 : 0)).toFixed(1) + " " + (2 * Math.PI * 31).toFixed(1),
+
+      gates: [
+        { name: "Cash reserve", value: "96.0%" },
+        { name: "Capability", value: "US EQUITY" },
+        { name: "Holding period", value: "FIFO 1 LOT" },
+        { name: "Day-trade limit", value: "0 OF 3" },
+      ],
+
+      reconStatus: reconciling ? "RUNNING" : "CLEAN",
+      reconFg: reconciling ? cyan : green,
+      reconFrame: frame(reconciling), reconPlay: play(reconciling),
+      execFrame: "#17414f",
+      reconRows: [
+        { name: "Positions", value: "SPY 0.0271" },
+        { name: "Settled cash", value: "$480.00" },
+        { name: "Open orders", value: "NONE" },
+        { name: "Day trades", value: "0 · UNKNOWN" },
+      ],
+      nextCycle: String(Math.floor(cycle / 60)) + ":" + String(cycle % 60).padStart(2, "0"),
+
+      auditRows: [
+        { t: clock.slice(0, 5), what: "materiality_screened" },
+        { t: "15:31", what: "analysis_completed NTAP" },
+        { t: "15:29", what: "approval_requested AVGO" },
+        { t: "15:26", what: "cash_adjustment FEE" },
+        { t: "15:20", what: "reconcile 4/4 clean" },
+      ],
+
+      queue: cards.map((q, i) => ({
+        symbol: q.symbol, side: q.side, expiry: "EXP " + q.expiry,
+        sideFg: q.side === "BUY" ? green : "#f5a04a",
+        expiryFg: i === 0 ? gold : "#8f7a45",
+        bg: i === 0 ? "rgba(245,185,66,0.1)" : "rgba(6,13,21,0.7)",
+        border: i === 0 ? "#6b5216" : "#22303a",
+        open: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.setState({ open: i, sizePct: 100, limitDelta: 0, cardShownAt: this.state.t, drawer: null }); },
+      })),
+
+      modalOpen: isOpen,
+      closeModal: () => this.setState({ open: null }),
+
+      cardConf: c.conf, cardConfNote: c.confNote,
+      cardSymbol: c.symbol, cardName: c.name, cardSide: c.side, cardWhy: c.why,
+      cardExpiry: c.expiry, cardProvenance: c.prov,
+      cardSideBg: isSell ? "#f5a04a" : green,
+      bearPoints: c.bear, contraPoints: c.contra, bullPoints: c.bull,
+      taxNotes: c.tax.map(n => ({
+        text: n.text,
+        bar: n.cost ? gold : "#2a4a58",
+        fg: n.cost ? "#e6d5ad" : "#cfe3ec",
+        bg: n.cost ? "rgba(26,21,8,0.75)" : "rgba(11,24,37,0.75)",
+      })),
+
+      notional: "$" + notional.toFixed(2),
+      qty: (notional / limit).toFixed(4) + " sh",
+      limitPrice: "$" + limit.toFixed(2),
+      postReserve: (100 * (equity - invested - otherEarmarks) / equity).toFixed(1) + "%",
+      postConcentration: (100 * (isSell ? invested : notional) / equity).toFixed(1) + "%",
+      postSector: (100 * (invested + otherEarmarks) / equity).toFixed(1) + "%",
+      earliestExitShort: isSell ? "n/a" : "Wed 09:30",
+      postDayTrades: isSell ? "1 / 3" : "0 / 3",
+      postDayTradesNote: isSell ? "this sell counts" : "unchanged · buy only",
+
+      worsenLabel: "\u2212 $0.05",
+      worsenNote: isSell ? "lowering your sell limit is adverse — allowed" : "raising it would void the card",
+      worsenLimit: () => this.setState(s => ({ limitDelta: s.limitDelta + 1 })),
+
+      fullBg: selBg(pct === 100), fullFg: selFg(pct === 100), fullBorder: selBd(pct === 100),
+      threeQBg: selBg(pct === 75), threeQFg: selFg(pct === 75), threeQBorder: selBd(pct === 75),
+      halfBg: selBg(pct === 50), halfFg: selFg(pct === 50), halfBorder: selBd(pct === 50),
+      quarterBg: selBg(pct === 25), quarterFg: selFg(pct === 25), quarterBorder: selBd(pct === 25),
+      setFull: () => this.setState({ sizePct: 100 }),
+      setThreeQ: () => this.setState({ sizePct: 75 }),
+      setHalf: () => this.setState({ sizePct: 50 }),
+      setQuarter: () => this.setState({ sizePct: 25 }),
+
+      modifiedNote: modified
+        ? "Modified: size " + pct + "% of proposed, limit $" + limit.toFixed(2)
+          + ". Within bounds \u2014 the original analysis still stands, no re-analysis needed."
+        : "Unmodified. Reducing size or moving the limit adversely keeps this card valid; anything else voids it.",
+      modifiedNoteColor: modified ? "#e6d5ad" : "#6a8798",
+
+      approveDisabled: !ready,
+      approveLabel: ready ? "Approve this order" : "Approve",
+      approveBg: ready ? "#cfe3ec" : "#0d1a24",
+      approveFg: ready ? "#050b12" : "#2f4b58",
+      approveBorder: ready ? "#cfe3ec" : "#1a2c38",
+      approveCursor: ready ? "pointer" : "not-allowed",
+      approveHint: ready ? "IRREVERSIBLE · NO KEYBOARD SHORTCUT" : "ENABLES IN " + remaining + "S \u2014 READ THE BEAR CASE",
+      elapsedLabel: mm + ":" + ss,
+    };
+  }
+}
+
+</script>
+</body>
+</html>

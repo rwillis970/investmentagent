@@ -284,3 +284,91 @@ def test_no_legs_key_at_all_is_todays_ordinary_single_order_shape(tmp_path):
     svc = service()
     tok = mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT)
     assert tok.original_symbol == "AAPL"
+
+
+# --------------------------------------- modify-within-bounds at mint time
+# (operator decision surface unit, 2026-08-03) -- snapshot() defaults to
+# side="BUY", authorized_qty=0.5, limit_price=100.0.
+
+def test_qty_override_reduces_the_minted_tokens_own_qty(tmp_path):
+    store, req = make(tmp_path)
+    svc = service()
+    tok = mint_approval_token(req.request_id, store=store, service=svc,
+                              now=DECIDE_AT, qty_override=0.25)
+    assert tok.original_qty == pytest.approx(0.25)
+
+
+def test_qty_override_above_authorized_is_refused(tmp_path):
+    store, req = make(tmp_path)
+    svc = service()
+    with pytest.raises(ApprovalBridgeError, match="exceeds the authorized qty"):
+        mint_approval_token(req.request_id, store=store, service=svc,
+                            now=DECIDE_AT, qty_override=0.51)
+
+
+def test_qty_override_of_zero_or_negative_is_refused(tmp_path):
+    store, req = make(tmp_path)
+    svc = service()
+    with pytest.raises(ApprovalBridgeError, match="must be positive"):
+        mint_approval_token(req.request_id, store=store, service=svc,
+                            now=DECIDE_AT, qty_override=0.0)
+
+
+def test_limit_price_override_lower_for_a_buy_is_accepted(tmp_path):
+    store, req = make(tmp_path)   # BUY, limit_price=100.0
+    svc = service()
+    tok = mint_approval_token(req.request_id, store=store, service=svc,
+                              now=DECIDE_AT, limit_price_override=99.0)
+    assert tok.original_limit_price == pytest.approx(99.0)
+
+
+def test_limit_price_override_higher_for_a_buy_is_refused(tmp_path):
+    store, req = make(tmp_path)   # BUY, limit_price=100.0
+    svc = service()
+    with pytest.raises(ApprovalBridgeError, match="may only move down"):
+        mint_approval_token(req.request_id, store=store, service=svc,
+                            now=DECIDE_AT, limit_price_override=101.0)
+
+
+def test_limit_price_override_higher_for_a_sell_is_accepted(tmp_path):
+    sell_snapshot = snapshot(side="SELL", limit_price=100.0)
+    store, req = make(tmp_path, proposal=sell_snapshot)
+    svc = service()
+    tok = mint_approval_token(req.request_id, store=store, service=svc,
+                              now=DECIDE_AT, limit_price_override=101.0)
+    assert tok.original_limit_price == pytest.approx(101.0)
+
+
+def test_limit_price_override_lower_for_a_sell_is_refused(tmp_path):
+    sell_snapshot = snapshot(side="SELL", limit_price=100.0)
+    store, req = make(tmp_path, proposal=sell_snapshot)
+    svc = service()
+    with pytest.raises(ApprovalBridgeError, match="may only move up"):
+        mint_approval_token(req.request_id, store=store, service=svc,
+                            now=DECIDE_AT, limit_price_override=99.0)
+
+
+def test_limit_price_override_against_a_market_order_is_refused(tmp_path):
+    no_limit_snapshot = snapshot(limit_price=None)
+    store, req = make(tmp_path, proposal=no_limit_snapshot)
+    svc = service()
+    with pytest.raises(ApprovalBridgeError, match="no limit_price to modify"):
+        mint_approval_token(req.request_id, store=store, service=svc,
+                            now=DECIDE_AT, limit_price_override=99.0)
+
+
+def test_a_valid_modification_is_what_the_fingerprint_actually_binds(tmp_path):
+    """The minted token's fingerprint reflects the MODIFIED order, not the
+    originally-proposed one -- consuming it later must match the reduced
+    qty/limit, not the pre-modification values."""
+    from agent.approval import order_fingerprint
+
+    store, req = make(tmp_path)
+    svc = service()
+    tok = mint_approval_token(req.request_id, store=store, service=svc,
+                              now=DECIDE_AT, qty_override=0.25,
+                              limit_price_override=99.0)
+    expected_fp = order_fingerprint(symbol="AAPL", side="BUY", qty=0.25,
+                                    order_type="LIMIT", time_in_force="DAY",
+                                    limit_price=99.0, lot_id=None)
+    assert tok.order_fingerprint == expected_fp

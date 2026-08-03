@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  body { margin: 0; background: #e9e6e1; }
+  a { color: oklch(0.48 0.09 248); text-decoration: none; border-bottom: 1px solid oklch(0.82 0.03 248); }
+  a:hover { color: oklch(0.38 0.11 248); border-bottom-color: oklch(0.48 0.09 248); }
+</style>
+</helmet>
+
+<div style="width: 1160px; box-sizing: border-box; background: #f2f0ec; font-family: 'IBM Plex Sans', sans-serif; color: #16150f; padding-bottom: 56px;">
+
+  <div style="background: #16150f; color: #f2f0ec; padding: 13px 32px; display: flex; align-items: center; gap: 28px;">
+    <div style="display: flex; align-items: baseline; gap: 9px;">
+      <div style="font-size: 13px; font-weight: 600; letter-spacing: -0.01em;">Investment agent</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.09em; color: oklch(0.72 0.13 62); border: 1px solid oklch(0.55 0.11 62); padding: 2px 6px;">PAPER</div>
+    </div>
+    <div style="flex: 1;"></div>
+    <div style="display: flex; gap: 26px; align-items: baseline;">
+      <div style="display: flex; align-items: baseline; gap: 7px;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.06em; color: #8a857e;">RECONCILED</span>
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: oklch(0.74 0.12 155);">4 / 4 · 19:58 UTC</span>
+      </div>
+      <div style="display: flex; align-items: baseline; gap: 7px;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.06em; color: #8a857e;">SPEND MTD</span>
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;">$3.42 <span style="color: #8a857e;">/ $20 · stop $30</span></span>
+      </div>
+      <button type="button" style="font-family: 'IBM Plex Sans', sans-serif; font-size: 11.5px; font-weight: 600; color: #f2f0ec; background: none; border: 1px solid #4a463f; padding: 5px 11px; cursor: pointer;" style-hover="border-color: oklch(0.62 0.17 28); color: oklch(0.78 0.14 28);">Pause agent</button>
+    </div>
+  </div>
+
+  <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; background: #ddd9d2; border-bottom: 1px solid #ddd9d2;">
+    <div style="background: #faf9f7; padding: 11px 16px 12px; display: flex; flex-direction: column; gap: 3px;">
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.07em; color: #7a746b;">CASH RESERVE</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 19px; font-weight: 500;">96.0<span style="font-size: 12px; color: #5c574f;">%</span></div>
+      <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #7a746b;">floor 40% · $480.00</div>
+    </div>
+    <div style="background: #faf9f7; padding: 11px 16px 12px; display: flex; flex-direction: column; gap: 3px;">
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.07em; color: #7a746b;">DAY TRADES</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 19px; font-weight: 500;">0<span style="font-size: 12px; color: #5c574f;"> / 3</span></div>
+      <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #7a746b;">rolling 5 sessions</div>
+    </div>
+    <div style="background: #faf9f7; padding: 11px 16px 12px; display: flex; flex-direction: column; gap: 3px;">
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.07em; color: #7a746b;">ST GAINS MTD</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 19px; font-weight: 500;">$0.00</div>
+      <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #7a746b;">realised, short-term</div>
+    </div>
+    <div style="background: #faf9f7; padding: 11px 16px 12px; display: flex; flex-direction: column; gap: 3px;">
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.07em; color: #7a746b;">WASH-SALE</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 19px; font-weight: 500;">$0.00</div>
+      <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #7a746b;">losses disallowed</div>
+    </div>
+    <div style="background: #faf9f7; padding: 11px 16px 12px; display: flex; flex-direction: column; gap: 3px;">
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.07em; color: #7a746b;">APPROVALS TODAY</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 19px; font-weight: 500;">1<span style="font-size: 12px; color: #5c574f;"> / 4</span></div>
+      <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #7a746b;">cap resets 00:00 ET</div>
+    </div>
+    <div style="background: #faf9f7; padding: 11px 16px 12px; display: flex; flex-direction: column; gap: 3px;">
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.07em; color: #7a746b;">DECISION TIME</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 19px; font-weight: 500;">2:14</div>
+      <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #7a746b;">median · 31% approved</div>
+    </div>
+  </div>
+
+  <div style="max-width: 880px; margin: 0 auto; padding: 30px 0 0;">
+    <div style="display: flex; align-items: baseline; gap: 12px; margin-bottom: 11px;">
+      <div style="font-size: 12.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;">Pending decisions</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a746b;">2</div>
+      <div style="flex: 1; height: 1px; background: #d6d2ca;"></div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">settled $480.00 · floor $200.00 · earmarked $84.60 · available $195.40</div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 13px;">
+      <div style="text-align: left; font-family: 'IBM Plex Sans', sans-serif; background: #ffffff; border: 1px solid #c8c3ba; border-left: 3px solid #16150f; padding: 11px 14px 12px; display: flex; flex-direction: column; gap: 5px;">
+        <div style="display: flex; align-items: baseline; gap: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; font-weight: 600; letter-spacing: 0.07em; color: oklch(0.45 0.11 155);">BUY</span>
+          <span style="font-size: 15px; font-weight: 600; letter-spacing: -0.01em; color: #16150f;">NTAP</span>
+          <span style="flex: 1;"></span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 600; color: #16150f;">$36.20</span>
+        </div>
+        <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #5c574f;">shown below · earmarked</div>
+      </div>
+      <div style="text-align: left; font-family: 'IBM Plex Sans', sans-serif; background: #faf9f7; border: 1px solid #ddd9d2; border-left: 3px solid #b5afa5; padding: 11px 14px 12px; display: flex; flex-direction: column; gap: 5px;">
+        <div style="display: flex; align-items: baseline; gap: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; font-weight: 600; letter-spacing: 0.07em; color: oklch(0.45 0.11 155);">BUY</span>
+          <span style="font-size: 15px; font-weight: 600; letter-spacing: -0.01em; color: #16150f;">MU</span>
+          <span style="flex: 1;"></span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 600; color: #16150f;">$48.40</span>
+        </div>
+        <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #5c574f;">awaiting decision · earmarked</div>
+      </div>
+    </div>
+    <div style="font-family: 'IBM Plex Serif', serif; font-size: 12.5px; line-height: 1.5; color: #7a746b; margin-bottom: 26px;">Each pending buy earmarks the settled cash it would consume, and every card below is costed against cash net of all outstanding earmarks — so these two can be approved in any order, or both, or neither, and no figure on either card changes as a result. Approving one never invalidates the other.</div>
+
+    <div style="display: flex; align-items: baseline; gap: 12px; margin-bottom: 11px;">
+      <div style="font-size: 12.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #5c574f;">Deferred to next session</div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a746b;">1</div>
+      <div style="flex: 1; height: 1px; background: #e0dcd5;"></div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">suppressed at creation · no request, no token, nothing to decide</div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 13px;">
+      <div style="text-align: left; font-family: 'IBM Plex Sans', sans-serif; background: #f4f2ee; border: 1px solid #e0dcd5; border-left: 3px solid #ddd9d2; padding: 11px 14px 12px; display: flex; flex-direction: column; gap: 5px;">
+        <div style="display: flex; align-items: baseline; gap: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; font-weight: 600; letter-spacing: 0.07em; color: #8a857e;">BUY</span>
+          <span style="font-size: 15px; font-weight: 600; letter-spacing: -0.01em; color: #7a746b;">AVGO</span>
+          <span style="flex: 1;"></span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 600; color: #7a746b;">$220.00</span>
+        </div>
+        <div style="font-family: 'IBM Plex Serif', serif; font-size: 11.5px; color: #7a746b;">needs $220.00 · $195.40 available</div>
+      </div>
+    </div>
+    <div style="font-family: 'IBM Plex Serif', serif; font-size: 12.5px; line-height: 1.5; color: #7a746b; margin-bottom: 30px;">Screened, analysed and refused a request because the cash isn't there today — not rejected, and not marked handled. The filing stays eligible and is re-costed next session against whatever has settled by then.</div>
+
+    <div style="display: flex; align-items: baseline; gap: 12px; margin-bottom: 13px;">
+      <div style="font-size: 12.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;">Approval request</div>
+      <div style="flex: 1; height: 1px; background: #d6d2ca;"></div>
+      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #7a746b;">token expires in {{ tokenExpiry }}</div>
+    </div>
+
+    <div style="background: #ffffff; border: 1px solid #d6d2ca;">
+
+      <div style="padding: 22px 26px 20px; border-bottom: 1px solid #eae7e2;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 28px;">
+          <div style="display: flex; flex-direction: column; gap: 9px; flex: 1;">
+            <div style="display: flex; align-items: baseline; gap: 11px;">
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: #ffffff; background: oklch(0.45 0.11 155); padding: 3px 8px;">BUY</div>
+              <div style="font-size: 27px; font-weight: 600; letter-spacing: -0.02em; line-height: 1;">NTAP</div>
+              <div style="font-family: 'IBM Plex Serif', serif; font-size: 14px; color: #5c574f;">NetApp, Inc.</div>
+            </div>
+            <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.55; color: #2c2a24; max-width: 44em;">Q1 FY2027 results released after close on an 8-K item 2.02. Revenue and guidance both above the prior four-quarter trend; the move so far is 3.4 standard deviations of 20-day ATR on 6.1× median volume.</div>
+          </div>
+          <div style="flex: 0 0 190px; display: flex; flex-direction: column; gap: 7px; border-left: 1px solid #eae7e2; padding-left: 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7a746b;">NOTIONAL</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 600;">{{ notional }}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7a746b;">QTY</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px;">{{ qty }}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7a746b;">LIMIT</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px;">{{ limitPrice }}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: baseline; border-top: 1px solid #eae7e2; padding-top: 6px; margin-top: 2px;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7a746b;">CONFIDENCE</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px;">0.61</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="background: oklch(0.97 0.012 30); border-bottom: 1px solid oklch(0.88 0.04 30); padding: 20px 26px 21px;">
+        <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 11px;">
+          <div style="width: 3px; height: 13px; background: oklch(0.52 0.16 28);"></div>
+          <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: oklch(0.42 0.15 28);">Bear case</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 11px;">
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.6; color: #2c2a24;">Guidance beat is driven by a one-time hardware refresh cycle that management itself describes as pull-forward demand, not expansion. The comparable quarter a year out faces that pulled-forward base.<a href="#c1" style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; vertical-align: super; margin-left: 3px; border: 0;">EX-99.1 L142</a></div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.6; color: #2c2a24;">Gross margin contracted 180bp year over year despite the revenue beat, and the filing attributes it to component costs that are not described as transitory.<a href="#c2" style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; vertical-align: super; margin-left: 3px; border: 0;">EX-99.1 L211</a></div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.6; color: #2c2a24;">The post-release move has already occurred. Entering now buys the reaction, not the information — and the position cannot be exited before {{ earliestExit }} under the minimum-hold policy.</div>
+        </div>
+      </div>
+
+      <div style="background: #fbfaf8; border-bottom: 1px solid #eae7e2; padding: 19px 26px 20px;">
+        <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 11px;">
+          <div style="width: 3px; height: 13px; background: #7a746b;"></div>
+          <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #4a463f;">Evidence contradicting the recommendation</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.6; color: #2c2a24;">The same filing's cash-flow statement shows operating cash flow down 9% year over year, which does not support the growth reading the bull case rests on.<a href="#c3" style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; vertical-align: super; margin-left: 3px; border: 0;">EX-99.1 L308</a></div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.6; color: #2c2a24;">Two of the last three comparable item 2.02 releases for this issuer produced a same-direction move that fully reverted within four sessions.</div>
+        </div>
+      </div>
+
+      <div style="padding: 19px 26px 20px; border-bottom: 1px solid #eae7e2;">
+        <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 11px;">
+          <div style="width: 3px; height: 13px; background: oklch(0.48 0.11 155);"></div>
+          <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: oklch(0.38 0.1 155);">Bull case</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.6; color: #2c2a24;">Revenue of $1.74bn exceeded the prior four-quarter trend by 6.2%, and the filing raises full-year guidance rather than reaffirming it.<a href="#c4" style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; vertical-align: super; margin-left: 3px; border: 0;">EX-99.1 L88</a></div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 14.5px; line-height: 1.6; color: #2c2a24;">All-flash array revenue grew 21% year over year, the segment the issuer has repeatedly identified as its margin-accretive line.<a href="#c5" style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; vertical-align: super; margin-left: 3px; border: 0;">EX-99.1 L164</a></div>
+        </div>
+      </div>
+
+      <div style="padding: 20px 26px 22px; border-bottom: 1px solid #eae7e2; background: #fafaf9;">
+        <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 13px;">
+          <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;">What will be true after this fills</div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 12.5px; font-style: italic; color: #7a746b;">not what is true now</div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; background: #e0dcd5; border: 1px solid #e0dcd5;">
+          <div style="background: #ffffff; padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 5px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; color: #7a746b;">CASH RESERVE</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600;">{{ postReserve }}</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">every earmark filled · floor 40%</div>
+          </div>
+          <div style="background: #ffffff; padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 5px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; color: #7a746b;">CONCENTRATION</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600;">{{ postConcentration }}</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">NTAP · cap 25%</div>
+          </div>
+          <div style="background: #ffffff; padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 5px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; color: #7a746b;">SECTOR</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600;">{{ postSector }}</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">whole book · no sector source</div>
+          </div>
+          <div style="background: #ffffff; padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 5px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; color: #7a746b;">EARLIEST EXIT</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600;">{{ earliestExitShort }}</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">T+1 settle · 1 session hold</div>
+          </div>
+          <div style="background: #ffffff; padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 5px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; color: #7a746b;">DAY TRADES</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600;">0 / 3</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">unchanged · buy only</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="padding: 18px 26px 19px; border-bottom: 1px solid #eae7e2;">
+        <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px;">
+          <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;">Modify within bounds</div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 12.5px; font-style: italic; color: #7a746b;">smaller or a worse price only — anything else needs a fresh decision</div>
+        </div>
+        <div style="display: flex; gap: 32px; align-items: flex-start;">
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.06em; color: #7a746b;">SIZE</div>
+            <div style="display: flex; gap: 6px;">
+              <button type="button" onClick="{{ setFull }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 6px 13px; border: 1px solid #16150f; background: {{ fullBg }}; color: {{ fullFg }}; cursor: pointer;">100%</button>
+              <button type="button" onClick="{{ setThreeQ }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 6px 13px; border: 1px solid #c8c3ba; background: {{ threeQBg }}; color: {{ threeQFg }}; cursor: pointer;" style-hover="border-color: #16150f;">75%</button>
+              <button type="button" onClick="{{ setHalf }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 6px 13px; border: 1px solid #c8c3ba; background: {{ halfBg }}; color: {{ halfFg }}; cursor: pointer;" style-hover="border-color: #16150f;">50%</button>
+              <button type="button" onClick="{{ setQuarter }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 6px 13px; border: 1px solid #c8c3ba; background: {{ quarterBg }}; color: {{ quarterFg }}; cursor: pointer;" style-hover="border-color: #16150f;">25%</button>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 7px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.06em; color: #7a746b;">LIMIT PRICE</div>
+            <div style="display: flex; gap: 6px; align-items: center;">
+              <button type="button" onClick="{{ lowerLimit }}" style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 6px 12px; border: 1px solid #c8c3ba; background: #ffffff; cursor: pointer;" style-hover="border-color: #16150f;">− $0.05</button>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; padding: 6px 4px; min-width: 68px;">{{ limitPrice }}</div>
+              <div style="font-family: 'IBM Plex Serif', serif; font-size: 12px; color: #7a746b; font-style: italic;">raising it would invalidate the card</div>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top: 13px; font-family: 'IBM Plex Serif', serif; font-size: 13px; line-height: 1.5; color: {{ modifiedNoteColor }};">{{ modifiedNote }}</div>
+      </div>
+
+      <sc-if value="{{ isLive }}" hint-placeholder-val="{{ true }}">
+      <div style="padding: 21px 26px 23px; display: flex; align-items: center; gap: 18px;">
+        <button type="button" style="font-family: 'IBM Plex Sans', sans-serif; font-size: 13.5px; font-weight: 600; padding: 12px 26px; border: 1.5px solid #16150f; background: #ffffff; color: #16150f; cursor: pointer;" style-hover="background: #16150f; color: #ffffff;">Reject</button>
+        <button type="button" style="font-family: 'IBM Plex Sans', sans-serif; font-size: 13.5px; font-weight: 500; padding: 12px 20px; border: 1px solid #d6d2ca; background: none; color: #5c574f; cursor: pointer;" style-hover="border-color: #16150f; color: #16150f;">Defer to next session</button>
+        <div style="flex: 1;"></div>
+        <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
+          <button type="button" disabled="{{ approveDisabled }}" style="font-family: 'IBM Plex Sans', sans-serif; font-size: 13.5px; font-weight: 600; padding: 12px 30px; border: 1.5px solid {{ approveBorder }}; background: {{ approveBg }}; color: {{ approveFg }}; cursor: {{ approveCursor }};">{{ approveLabel }}</button>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">{{ approveHint }}</div>
+        </div>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isInvalidated }}">
+      <div style="padding: 20px 26px 22px; background: oklch(0.97 0.012 30); display: flex; align-items: flex-start; gap: 20px;">
+        <div style="flex: 1; display: flex; flex-direction: column; gap: 7px;">
+          <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: oklch(0.42 0.15 28);">Void — price left the approved band</div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 13.5px; line-height: 1.55; color: #2c2a24; max-width: 46em;">NTAP traded at $118.94, above the $117.94 top of the band this analysis was priced against. The figures above described a $116.77 entry and no longer describe anything you can act on, so the token is void rather than repriced. Nothing was submitted. The filing is still eligible — the next cycle will re-analyse it at the current price and raise a fresh card.</div>
+        </div>
+        <button type="button" style="font-family: 'IBM Plex Sans', sans-serif; font-size: 13.5px; font-weight: 600; padding: 12px 26px; border: 1.5px solid #16150f; background: #ffffff; color: #16150f; cursor: pointer; flex: 0 0 auto;" style-hover="background: #16150f; color: #ffffff;">Dismiss</button>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isExpired }}">
+      <div style="padding: 20px 26px 22px; background: #f4f2ee; display: flex; align-items: flex-start; gap: 20px;">
+        <div style="flex: 1; display: flex; flex-direction: column; gap: 7px;">
+          <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #4a463f;">Expired undecided — 30 minutes</div>
+          <div style="font-family: 'IBM Plex Serif', serif; font-size: 13.5px; line-height: 1.55; color: #2c2a24; max-width: 46em;">This card reached its expiry without a decision. It does not count against today's approval cap — the cap exists to protect your attention, and this one never spent any. Its $36.20 earmark has been released back to available cash.</div>
+        </div>
+        <button type="button" style="font-family: 'IBM Plex Sans', sans-serif; font-size: 13.5px; font-weight: 600; padding: 12px 26px; border: 1.5px solid #16150f; background: #ffffff; color: #16150f; cursor: pointer; flex: 0 0 auto;" style-hover="background: #16150f; color: #ffffff;">Dismiss</button>
+      </div>
+      </sc-if>
+
+    </div>
+
+    <div style="display: flex; justify-content: space-between; align-items: baseline; margin-top: 13px; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7a746b;">
+      <div>event 0f3a91c · analysis $0.148 · sonnet-5 · prompt t4-v1 · 5 citations resolved</div>
+      <div>on screen {{ elapsedLabel }}</div>
+    </div>
+
+  </div>
+
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1160,&quot;height&quot;:1400},&quot;cardState&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;live&quot;,&quot;invalidated&quot;,&quot;expired&quot;],&quot;default&quot;:&quot;live&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Request state&quot;},&quot;minDisplaySeconds&quot;:{&quot;editor&quot;:&quot;int&quot;,&quot;default&quot;:45,&quot;tsType&quot;:&quot;number&quot;,&quot;min&quot;:0,&quot;max&quot;:180,&quot;unit&quot;:&quot;s&quot;,&quot;section&quot;:&quot;Friction&quot;}}">
+class Component extends DCLogic {
+  state = { elapsed: 0, sizePct: 100, limitCents: 11677 };
+
+  componentDidMount() {
+    this._t = setInterval(() => this.setState(s => ({ elapsed: s.elapsed + 1 })), 1000);
+  }
+  componentWillUnmount() { clearInterval(this._t); }
+
+  renderVals() {
+    const minSec = this.props.minDisplaySeconds ?? 45;
+    const remaining = Math.max(0, minSec - this.state.elapsed);
+    const ready = remaining === 0;
+    const pct = this.state.sizePct;
+    const baseNotional = 36.2;
+    const notional = baseNotional * pct / 100;
+    const limit = this.state.limitCents / 100;
+    const qty = notional / limit;
+    const equity = 500.0;
+    const invested = 20.0 + notional;
+    // MU's pending request holds its own earmark; this card is costed as if
+    // that one also fills, so both cards' figures stay true simultaneously.
+    const otherEarmarks = 48.4;
+
+    const mm = String(Math.floor(this.state.elapsed / 60)).padStart(2, "0");
+    const ss = String(this.state.elapsed % 60).padStart(2, "0");
+
+    const modified = pct !== 100 || this.state.limitCents !== 11677;
+    const sel = (on) => on ? "#16150f" : "#ffffff";
+    const selFg = (on) => on ? "#ffffff" : "#2c2a24";
+
+    const cardState = this.props.cardState ?? "live";
+
+    return {
+      isLive: cardState === "live",
+      isInvalidated: cardState === "invalidated",
+      isExpired: cardState === "expired",
+      notional: "$" + notional.toFixed(2),
+      qty: qty.toFixed(4) + " sh",
+      limitPrice: "$" + limit.toFixed(2),
+      postReserve: (100 * (equity - invested - otherEarmarks) / equity).toFixed(1) + "%",
+      postConcentration: (100 * notional / equity).toFixed(1) + "%",
+      postSector: (100 * (invested + otherEarmarks) / equity).toFixed(1) + "%",
+      earliestExit: "Wed 5 Aug, 09:30 ET",
+      earliestExitShort: "Wed 09:30",
+      tokenExpiry: "6:12",
+      elapsedLabel: mm + ":" + ss,
+      approveDisabled: !ready,
+      approveLabel: ready ? "Approve this order" : "Approve",
+      approveBg: ready ? "#16150f" : "#f0eeea",
+      approveFg: ready ? "#ffffff" : "#a09a91",
+      approveBorder: ready ? "#16150f" : "#ddd9d2",
+      approveCursor: ready ? "pointer" : "not-allowed",
+      approveHint: ready
+        ? "irreversible · no keyboard shortcut"
+        : "enables in " + remaining + "s — read the bear case",
+      modifiedNote: modified
+        ? "Modified: size " + pct + "% of proposed, limit $" + limit.toFixed(2)
+          + ". Within bounds — the original analysis still stands, no re-analysis needed."
+        : "Unmodified. Reducing size or lowering the limit keeps this card valid; increasing either voids it.",
+      modifiedNoteColor: modified ? "#2c2a24" : "#7a746b",
+      fullBg: sel(pct === 100), fullFg: selFg(pct === 100),
+      threeQBg: sel(pct === 75), threeQFg: selFg(pct === 75),
+      halfBg: sel(pct === 50), halfFg: selFg(pct === 50),
+      quarterBg: sel(pct === 25), quarterFg: selFg(pct === 25),
+      setFull: () => this.setState({ sizePct: 100 }),
+      setThreeQ: () => this.setState({ sizePct: 75 }),
+      setHalf: () => this.setState({ sizePct: 50 }),
+      setQuarter: () => this.setState({ sizePct: 25 }),
+      lowerLimit: () => this.setState(s => ({ limitCents: s.limitCents - 5 })),
+    };
+  }
+}
+</script>
+</body>
+</html>

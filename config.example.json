@@ -22,6 +22,7 @@
   "approval_request_enabled": false,
   "approval_expiration_minutes": 30,
   "approval_min_display_seconds": 10,
+  "price_band_pct": 1.0,
   "max_model_analyses_per_day": 8,
   "max_approval_requests_per_day": 4,
   "max_new_positions_per_day": 3,

@@ -38,6 +38,11 @@ MAX_POSITION_CEILING = 15.0
 MAX_SECTOR_CEILING = 35.0
 MAX_DRAWDOWN_CEILING = 20.0
 MIN_DECISION_INTERVAL_MINUTES = 15
+# ADDED THIS COMMIT alongside `price_band_pct` itself (see that field's own
+# comment) -- 10% is a generous platform ceiling for how wide an approval's
+# price band may ever be; the pilot's own real default (1.0%) is far
+# narrower, and this is a maximum, never a target.
+MAX_PRICE_BAND_CEILING = 10.0
 
 ONE_DAY = timedelta(days=1)
 AGGRESSIVE_MIN_HOLD = timedelta(hours=4)
@@ -148,6 +153,18 @@ class Config:
 
     approval_expiration_minutes: int = 30
     approval_min_display_seconds: int = 10
+    # `agent.approval.ApprovalService`'s own price-band-percent config (§10),
+    # ADDED THIS COMMIT (operator decision surface unit, 2026-08-03) -- before
+    # this field, nothing in `agent.config.Config` named it at all;
+    # `scripts/run_agent.py` constructed `ApprovalService` without ever
+    # passing `price_band_pct`, silently relying on that class's own
+    # `price_band_pct: float = 1.0` default instead of a value read from
+    # config (§9.1's own same-commit rule: "a cadence read from config must
+    # never be hardcoded in the code that reads it" -- the identical defect,
+    # for a risk-relevant number rather than a cadence). `scripts/run_agent.
+    # py`'s `main()` now passes `price_band_pct=cfg.price_band_pct` into
+    # that construction; see this unit's own report.
+    price_band_pct: float = 1.0
     max_model_analyses_per_day: int = 8
     max_approval_requests_per_day: int = 4
     max_new_positions_per_day: int = 3
@@ -593,6 +610,8 @@ def validate(cfg: Config) -> None:
         err.append(f"drawdown_pause_pct must be in (0, {MAX_DRAWDOWN_CEILING}]")
     if cfg.routine_decision_interval_minutes < MIN_DECISION_INTERVAL_MINUTES:
         err.append(f"routine_decision_interval_minutes below floor {MIN_DECISION_INTERVAL_MINUTES}")
+    if not 0 < cfg.price_band_pct <= MAX_PRICE_BAND_CEILING:
+        err.append(f"price_band_pct must be in (0, {MAX_PRICE_BAND_CEILING}]")
 
     for name in ("data_collection_interval_seconds", "event_feed_interval_minutes",
                  "opportunity_screen_interval_minutes", "approval_expiration_minutes",
