@@ -126,6 +126,8 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         return _serve_static("agent_command_center.html")
     if method == "GET" and path == "/approval-card":
         return _serve_static("approval_card.html")
+    if method == "GET" and path == "/dashboard_bind.js":
+        return _serve_static("dashboard_bind.js")
 
     return _json_result(404, {"error": f"no route for {method} {path}"})
 
@@ -196,6 +198,12 @@ def _parse_json_body(body: bytes | None) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+_STATIC_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+}
+
+
 def _serve_static(filename: str) -> RouteResult:
     """Byte-identical to the uploaded design file -- never rewritten,
     restyled, or reinterpreted.
@@ -206,11 +214,19 @@ def _serve_static(filename: str) -> RouteResult:
     missing. `approval_card.html` is UNCHANGED from the original upload and
     STILL depends on a `support.js` this codebase does not have -- its
     `{{ }}`/`sc-for` bindings will not populate in a browser until it gets
-    the same standalone treatment (see this unit's own report)."""
+    the same standalone treatment (see this unit's own report).
+
+    CONTENT-TYPE IS SUFFIX-AWARE (dashboard_bind.js unit, 2026-08-03) -- this
+    function used to hand back `text/html` unconditionally, correct for its
+    only two callers at the time. `dashboard_bind.js` is the first non-HTML
+    asset served here; `_STATIC_CONTENT_TYPES` maps a known suffix to its
+    real type, defaulting to `text/html` for anything else (i.e. every
+    caller before this one keeps its exact prior behavior unchanged)."""
     path = STATIC_DIR / filename
     if not path.exists():
         return _json_result(404, {"error": f"static asset {filename!r} not found"})
-    return RouteResult(200, "text/html; charset=utf-8", path.read_bytes())
+    content_type = _STATIC_CONTENT_TYPES.get(path.suffix, "text/html; charset=utf-8")
+    return RouteResult(200, content_type, path.read_bytes())
 
 
 class _Handler(BaseHTTPRequestHandler):

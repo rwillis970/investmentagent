@@ -250,6 +250,34 @@ def test_dashboard_path_serves_the_same_file_as_root(tmp_path):
     assert result.body == (STATIC_DIR / "agent_command_center.html").read_bytes()
 
 
+def test_dashboard_bind_js_is_reachable_through_serve_static(tmp_path):
+    """dashboard_bind.js (data-wiring unit, 2026-08-03) -- served the same
+    way as the two HTML files, byte-identical to the checked-in file."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/dashboard_bind.js")
+    assert result.status == 200
+    assert result.body == (STATIC_DIR / "dashboard_bind.js").read_bytes()
+
+
+def test_dashboard_bind_js_is_served_as_javascript_not_html(tmp_path):
+    """_serve_static used to hardcode text/html unconditionally -- correct
+    for the two HTML files it originally served, wrong for a .js file. A
+    classic (non-module) <script src> tag isn't strict about this in most
+    browsers, but serving JS as text/html is still simply incorrect."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/dashboard_bind.js")
+    assert result.content_type == "text/javascript; charset=utf-8"
+
+
+def test_existing_html_routes_keep_their_content_type(tmp_path):
+    """Guards the content-type fix from ever regressing the two existing
+    HTML routes while making _serve_static suffix-aware."""
+    runtime, _ = make_runtime(tmp_path)
+    for path in ("/", "/dashboard", "/approval-card"):
+        result = route_request(runtime, method="GET", path=path)
+        assert result.content_type == "text/html; charset=utf-8", path
+
+
 def test_approval_card_path_serves_the_approval_card_html(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(runtime, method="GET", path="/approval-card")
@@ -268,6 +296,55 @@ def test_command_center_html_has_no_support_js_reference(tmp_path):
     result = route_request(runtime, method="GET", path="/")
     html = result.body.decode("utf-8")
     assert "support.js" not in html
+
+
+def test_command_center_html_is_the_real_generated_build_not_the_turn_3_mock(tmp_path):
+    """Follow-up unit, 2026-08-06 ('bring the real command center live'):
+    `agent_command_center.html` was replaced byte for byte with the
+    designer's own generated standalone build
+    (`agent_command_center.new.html`, 689,729 bytes, sha256
+    26c248d1c12603bdaa0f7d2685267c9a6be625bc4bcab6aea4eced0053633857).
+    The prior file -- a hand-integrated combination of the original
+    pre-integration mock plus this codebase's own Turn-3
+    agent-core-zones/energy-connectors inlining -- is gone entirely, not
+    merged forward (see this unit's own report). `customElements.
+    define("agent-core-zones", AgentCoreZones)` was that Turn-3 file's own
+    literal registration call and cannot appear in the new build, which
+    wires its core visual through `<x-import component-from-global-scope=
+    "agent-core-zones" ...>` instead -- a real difference in mechanism,
+    not just a re-save of the same bytes under a new name."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+    assert 'customElements.define("agent-core-zones", AgentCoreZones)' not in html
+    assert "window.AgentCoreZones = AgentCoreZones" not in html
+
+
+def test_command_center_html_registers_the_real_agent_command_center_contract(tmp_path):
+    """The whole point of this unit: the served page must be the build that
+    actually defines `window.AgentCommandCenter` in componentDidMount (the
+    contract `dashboard/static/dashboard_bind.js` was written against, given
+    inline by the page's own author -- see that file's own module
+    docstring), not one of the four stale exports that lacked it entirely."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+    assert "window.AgentCommandCenter = { applyState: ok, applyStateError: bad };" in html
+
+
+def test_command_center_html_has_exactly_one_dashboard_bind_script_tag_immediately_before_closing_body(tmp_path):
+    """The one permitted edit to the generated file (see this unit's own
+    report): a single `<script src="dashboard_bind.js"></script>` inserted
+    right before the real, outer document's closing `</body>` -- not the
+    escaped `<\\/body>` that appears as inert text inside the
+    `__bundler/template` JSON string, and not anywhere else in the file."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+    assert html.count('<script src="dashboard_bind.js"></script>') == 1
+    assert html.rstrip().endswith(
+        '<script src="dashboard_bind.js"></script>\n</body>\n</html>'
+    )
 
 
 def test_command_center_html_makes_no_live_external_script_fetch(tmp_path):
