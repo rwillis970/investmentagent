@@ -63,6 +63,39 @@ This store is the durable side of that fix -- a new "token_minted" event,
 replayed the same generic way `_load_into` already replays "decided"/
 "invalidated" (no special-casing needed there).
 
+DURABLE TOKEN-CONSUMPTION RECORD (durable-consumption unit, 2026-08-09). `record_token_consumed`
+closes the gap `record_token_minted` (above) deliberately left open --
+`agent.approval_bridge`'s own "CONSUMPTION IS STILL NOT DURABLE" section and
+`tests/test_approval_bridge.py::test_disclosed_gap_...` both named it: a
+token reconstructed from `token_snapshot` after a real restart always
+reported `consumed_at=None`, even if the original in-memory object was
+already spent, because nothing durably recorded consumption independent of
+whether an order resulted. This method is that record -- called by `agent.
+broker.base.BrokerAdapter.submit()`'s own consumption sink
+(`attach_token_consumption_sink`, wired by `agent.approval_execution.
+execute_approved_request`), immediately after the in-memory `ApprovalToken.
+consume()` call succeeds and before the broker is ever contacted. A new
+"token_consumed" event, replayed the same generic way `_load_into` already
+replays every event other than "created"/"decided" -- no special-casing
+needed there, same as "token_minted" before it.
+
+UNLIKE `record_token_minted`, THIS OVERWRITES RATHER THAN REFUSING A SECOND
+CALL. `record_token_minted` refuses to overwrite an existing snapshot
+because a second mint for the same request would be a genuinely new,
+independently-spendable token -- exactly the bug that method exists to
+prevent. `record_token_consumed` instead REPLACES the request's
+`token_snapshot` with the token's current, post-consumption state
+(`agent.approval_bridge.encode_token`); the caller is `submit()`'s own
+`consume()` call site, which already refuses a real second consumption in
+memory (`ApprovalToken.consume` raises `TokenConsumed`), so this method has
+no independent double-spend to guard against -- only the ordinary case of
+recording what `consume()` just did. It does require that a token was
+already durably minted (`current.token_snapshot is not None`): consuming a
+token that was never durably minted cannot happen through the real
+`mint_approval_token`/`submit()` path, but is refused here defensively
+rather than silently recorded, matching this store's posture everywhere
+else in this file.
+
 `count_decided_on` (renamed from `count_created_on`, earmarking unit,
 2026-08-02) COUNTS DECIDED REQUESTS ONLY -- APPROVED or REJECTED --
 NOT EVERY REQUEST CREATED. `max_approval_requests_per_day` exists to
@@ -198,6 +231,39 @@ class ApprovalRequestStore:
         self._current[request_id] = updated
         if persist:
             self._append_event("token_minted", self._account_of[request_id], updated)
+        return updated
+
+    def record_token_consumed(self, request_id: str, *, token_snapshot: dict,
+                              now: datetime, persist: bool = True) -> ApprovalRequest:
+        """Durably records that `request_id`'s token was CONSUMED
+        (durable-consumption unit, 2026-08-09) -- see module docstring's own "DURABLE TOKEN-CONSUMPTION
+        RECORD" section for the full reasoning. Called ONLY by `agent.
+        broker.base.BrokerAdapter.submit()`'s consumption sink, via `agent.
+        approval_execution.execute_approved_request`'s wiring, immediately
+        after `ApprovalToken.consume()` succeeds and before the broker is
+        contacted. `now` is accepted for signature symmetry with `decide()`/
+        `record_token_minted()` but is not itself stored -- the token's own
+        `consumed_at`, inside `token_snapshot`, already carries the
+        consumption instant.
+
+        REQUIRES a prior `record_token_minted` call (refuses if
+        `token_snapshot` is not already set) -- a token cannot be consumed
+        before it was durably minted through the real path. UNLIKE
+        `record_token_minted`, THIS OVERWRITES rather than refusing a second
+        call; see module docstring for why that is safe here (the caller's
+        own `consume()` call site already refuses a genuine double-
+        consumption in memory)."""
+        current = self._require(request_id)
+        if current.token_snapshot is None:
+            raise ApprovalRequestStoreError(
+                f"request {request_id} has no recorded token mint; cannot "
+                "record a token consumption for a token that was never "
+                "durably minted"
+            )
+        updated = replace(current, token_snapshot=token_snapshot)
+        self._current[request_id] = updated
+        if persist:
+            self._append_event("token_consumed", self._account_of[request_id], updated)
         return updated
 
     def invalidate(self, request_id: str, *, reason: str, now: datetime,

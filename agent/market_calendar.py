@@ -142,14 +142,25 @@ def exercises_calendar(mode: str) -> bool:
     return mode in _CALENDAR_EXERCISING_MODES
 
 
-# Full-day closures, MIN_YEAR-MAX_YEAR inclusive. New Year's Day, Independence
-# Day and Christmas Day are shifted under the observed-day rule (a Saturday
-# holiday observed the preceding Friday, a Sunday holiday the following
-# Monday) -- note 2027-12-31, which is the OBSERVED New Year's Day holiday
-# for 2028 (January 1, 2028 is a Saturday) landing in the prior calendar
-# year; this table is a flat set of dates for exactly that reason, not a
-# dict keyed by year, which would have to decide which year 2027-12-31
-# "belongs" to.
+# Full-day closures, MIN_YEAR-MAX_YEAR inclusive. Independence Day and
+# Christmas Day are shifted under the observed-day rule (a Saturday holiday
+# observed the preceding Friday, a Sunday holiday the following Monday);
+# New Year's Day is too, EXCEPT when the shift would fall in the PRIOR
+# calendar year -- NYSE does not observe a Saturday January 1st on the
+# preceding December 31st. January 1, 2028 is a Saturday, so 2028 simply has
+# no observed New Year's holiday at all; December 31, 2027 is a normal full
+# trading session (confirmed against NYSE's real calendar: January 1, 2022
+# was also a Saturday, and December 31, 2021 was a full trading day, not a
+# closure). An EARLIER version of this table wrongly added date(2027, 12,
+# 31) here on the mistaken belief that New Year's followed the same
+# preceding-Friday rule as every other holiday -- it does not, and no entry
+# should ever be added for a Saturday January 1st. See
+# `tests/test_market_calendar.py::test_new_years_day_on_a_saturday_has_no_observed_holiday_in_the_prior_year`.
+# This table is still a flat set of dates, not a dict keyed by year, because
+# Independence Day and Christmas CAN legitimately shift across a month
+# boundary within the same year (e.g. a Sunday July 4th observed the
+# following Monday) -- a year-keyed structure would have to decide which
+# year each of those "belongs" to for no real benefit.
 _HOLIDAYS = frozenset({
     # 2024
     date(2024, 1, 1), date(2024, 1, 15), date(2024, 2, 19), date(2024, 3, 29),
@@ -163,11 +174,12 @@ _HOLIDAYS = frozenset({
     date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
     date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
     date(2026, 11, 26), date(2026, 12, 25),
-    # 2027 (includes 2027-12-31: observed New Year's Day 2028)
+    # 2027
     date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
     date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
-    date(2027, 11, 25), date(2027, 12, 24), date(2027, 12, 31),
-    # 2028
+    date(2027, 11, 25), date(2027, 12, 24),
+    # 2028 -- no New Year's Day entry: January 1, 2028 is a Saturday, and
+    # NYSE does not shift it to December 31, 2027 (see comment above).
     date(2028, 1, 17), date(2028, 2, 21), date(2028, 4, 14), date(2028, 5, 29),
     date(2028, 6, 19), date(2028, 7, 4), date(2028, 9, 4), date(2028, 11, 23),
     date(2028, 12, 25),

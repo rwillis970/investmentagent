@@ -36,6 +36,42 @@ Account posture is DETECTED from the broker, never declared in config: config
 may assert a posture, and a mismatch halts trading rather than proceeding on an
 assumption.
 
+DURABLE TOKEN CONSUMPTION (durable-consumption unit, 2026-08-09). `ApprovalToken.consume()`
+(called below, inside `submit()`) mutates its in-memory object only --
+`agent.approval_bridge`'s own "CONSUMPTION IS STILL NOT DURABLE" section
+disclosed that a token reconstructed from `token_snapshot` after a real
+process restart always reported `consumed_at=None`, even if the original
+was already spent, and that closing it would mean threading persistence
+through this exact call site. This is that unit. `attach_token_consumption_sink`
+(below) lets a caller wire an optional `Callable[[ApprovalToken], None]`
+that `submit()` invokes IMMEDIATELY AFTER `approval_token.consume(...)`
+succeeds and BEFORE `_submit_impl` is ever called -- never before
+`consume()` (a `PriceOutOfBand`/`TokenExpired`/`OrderMismatch` refusal
+does not consume the token at all -- see `ApprovalToken.consume`'s own
+guard order -- and durably burning it anyway would turn a retriable
+refusal into a permanent one) and never after `_submit_impl` (which would
+make durability depend on broker reachability -- exactly the dependency
+this unit closes). If the sink itself raises, that exception propagates
+OUT of `submit()` uncaught, so `_submit_impl` never runs: a durable-write
+failure is safety-equivalent to "the process died before the broker call,"
+and the next retry (a freshly reconstructed token) is a clean, honest first
+attempt, not a distinct failure mode needing its own handling. See
+`agent.approval_execution.execute_approved_request`'s own docstring for the
+real sink (a closure over `agent.approval_request_store.
+ApprovalRequestStore.record_token_consumed`) and the full "which way does
+this fail" reasoning -- this base class only provides the hook, never
+requires it (unlike `attach_staging_key`/`attach_capability_policy`,
+neither `submit()` nor `cancel()` raises a `*Unset` error when no sink is
+attached): making it mandatory here would force every ad hoc token built
+directly in this codebase's own tests, with no backing store, to wire up a
+dummy sink for no safety benefit -- the real production path attaches a
+real one unconditionally, which is what actually matters. `get_by_client_id()`,
+checked by that same caller BEFORE this token is touched at all, remains
+in place unchanged as defense-in-depth against the broker having actually
+accepted an order this process never confirmed -- not superseded by this
+mechanism, which answers a different question (was this approval already
+spent, independent of whether an order resulted).
+
 MULTI-ACCOUNT ADDENDUM: one adapter instance exists per account_id, each
 holding its own `BrokerCredentials` (a reference, never the secret itself).
 `submit`/`cancel` refuse a StagedOrder whose account_id doesn't match this
@@ -48,6 +84,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from typing import Callable
 
 from ..accounts import BrokerCredentials, CrossAccountError
 from ..approval import (ApprovalToken, verify_minimum_display_time,
@@ -297,6 +334,7 @@ class BrokerAdapter(ABC):
         "account", "positions", "open_orders", "get_by_client_id", "sessions",
         "submit", "cancel", "clock", "posture", "supported_matrix", "fills",
         "non_fill_activities", "attach_capability_policy", "attach_staging_key",
+        "attach_token_consumption_sink",
     })
 
     def __init_subclass__(cls, **kwargs) -> None:
@@ -349,6 +387,11 @@ class BrokerAdapter(ABC):
         self._credentials = credentials
         self._capability_policy = capability_policy
         self._staging_key = staging_key
+        # Durable token consumption (durable-consumption unit, 2026-08-09) -- see module
+        # docstring's own section. Optional, unlike `_staging_key`/
+        # `_capability_policy`: no `*Unset` error guards `submit()` on this
+        # being attached.
+        self._token_consumed_sink: Callable[[ApprovalToken], None] | None = None
 
     # -- policy -----------------------------------------------------------
     @property
@@ -367,6 +410,23 @@ class BrokerAdapter(ABC):
         this, `submit`/`cancel` refuse every StagedOrder — there is no default
         key."""
         self._staging_key = key
+
+    def attach_token_consumption_sink(
+        self, sink: Callable[[ApprovalToken], None]
+    ) -> None:
+        """Wire a durable-consumption callback (durable-consumption unit, 2026-08-09) -- see
+        module docstring. `submit()` calls `sink(approval_token)` exactly
+        once, immediately after `approval_token.consume(...)` succeeds and
+        before `_submit_impl` runs. OPTIONAL: unattached, `submit()` simply
+        does not durably record consumption (the pre-Unit-3 behaviour) --
+        there is no `*Unset` refusal here the way there is for
+        `attach_staging_key`/`attach_capability_policy`, deliberately, so
+        that the many existing ad hoc tokens built directly in this
+        codebase's tests (with no backing `ApprovalRequestStore` at all)
+        are not forced to wire up a dummy sink. The one caller that matters
+        (`agent.approval_execution.execute_approved_request`) attaches a
+        real one unconditionally, every time."""
+        self._token_consumed_sink = sink
 
     def clock(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -516,6 +576,16 @@ class BrokerAdapter(ABC):
         # (see agent.approval.ApprovalToken.consume's own docstring).
         approval_token.consume(fingerprint=approval_token.order_fingerprint,
                                price=price, now=now)
+        # DURABLE, BEFORE THE BROKER IS EVER CONTACTED (durable-consumption unit, 2026-08-09).
+        # See module docstring's "DURABLE TOKEN CONSUMPTION" section for the
+        # full placement argument: after consume() (so a retriable refusal
+        # above never durably burns the token) and before _submit_impl (so
+        # durability never depends on broker reachability). A raising sink
+        # propagates uncaught, which prevents _submit_impl from running --
+        # deliberate; see that same section for why that failure direction
+        # is the safe one.
+        if self._token_consumed_sink is not None:
+            self._token_consumed_sink(approval_token)
 
         return self._submit_impl(staged)
 

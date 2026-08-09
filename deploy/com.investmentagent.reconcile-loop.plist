@@ -47,7 +47,7 @@
         <string>--secret-ref</string>
         <string>REPLACE_WITH_KEYCHAIN_SECRET_REF</string>
         <string>--signing-key-secret-ref</string>
-        <string>REPLACE_WITH_SIGNING_KEY_SECRET_REF</string>
+        <string>gatekeeper-signing-key</string>
         <string>--data-dir</string>
         <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state</string>
         <string>--account-type</string>

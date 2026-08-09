@@ -74,13 +74,21 @@ def test_christmas_on_saturday_shifts_to_the_preceding_friday():
     assert is_trading_day(date(2027, 12, 23)) is True
 
 
-def test_new_year_shift_can_spill_into_the_prior_calendar_year():
-    """January 1, 2028 is a Saturday -- NYSE observes New Year's Day on the
-    preceding Friday, December 31, 2027. The holiday lands in a different
-    calendar year than the one it's 'for', and the table has to get that
-    right rather than bucketing purely by year."""
-    assert is_trading_day(date(2027, 12, 31)) is False
+def test_new_years_day_on_a_saturday_has_no_observed_holiday_in_the_prior_year():
+    """January 1, 2028 is a Saturday. Unlike Independence Day and Christmas,
+    NYSE does NOT observe a Saturday New Year's Day on the preceding Friday
+    -- that Friday belongs to the PRIOR calendar year, and the exchange
+    stays open. Confirmed against NYSE's real calendar: January 1, 2022 was
+    also a Saturday, and December 31, 2021 was a full trading session, not
+    a closure. December 31, 2027 must therefore be a trading day, and 2028
+    has no observed New Year's holiday at all. Do not re-add a
+    date(2027, 12, 31) or a date(2028, 1, ...) entry to _HOLIDAYS for this --
+    see agent/market_calendar.py's own comment above _HOLIDAYS for the
+    prior, incorrect version of this table this test replaced."""
+    assert is_trading_day(date(2027, 12, 31)) is True
     assert is_trading_day(date(2027, 12, 30)) is True
+    assert is_trading_day(date(2028, 1, 1)) is False   # Saturday -- just a weekend
+    assert is_trading_day(date(2028, 1, 3)) is True    # the following Monday is ordinary
 
 
 # --------------------------------------------------------------- early closes

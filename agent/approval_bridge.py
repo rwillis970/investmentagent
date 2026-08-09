@@ -200,6 +200,24 @@ that is deliberately left for whatever unit next touches the execution
 path (also review `_submit_impl`'s own idempotency-by-client_order_id
 promise, which is the one existing durable defense against a double-
 consumed reconstructed token producing a double-submitted order today).
+
+SUPERSEDED (durable-consumption unit, 2026-08-09). The gap this section describes is closed.
+`agent.broker.base.BrokerAdapter.submit()` now accepts an optional
+consumption sink (`attach_token_consumption_sink`) that it calls
+immediately after `ApprovalToken.consume()` succeeds and before the broker
+is ever contacted; `agent.approval_execution.execute_approved_request`
+wires a real one, backed by `agent.approval_request_store.
+ApprovalRequestStore.record_token_consumed`, unconditionally. That call
+REPLACES the request's `token_snapshot` with the token's post-consumption
+state, so `_token_from_snapshot` (below), reached via this function's own
+`request.token_snapshot` fallback for a fresh `ApprovalService` instance,
+now reconstructs `consumed_at` correctly instead of always `None`. `_encode_
+token` was renamed to `encode_token` (public) the same commit, so `agent.
+approval_execution` can call it directly to build the sink's closure. See
+that unit's own delivery report for the full "which way does a mid-submit
+crash resolve" reasoning -- the paragraphs above are kept, uncorrected in
+place, as the record of what was true before this unit, per this
+codebase's own convention for a disclosed gap that is later closed.
 """
 from __future__ import annotations
 
@@ -299,14 +317,20 @@ _TOKEN_FIELDS = (
 )
 
 
-def _encode_token(token: ApprovalToken) -> dict:
-    """Every mint-time `ApprovalToken` field, verbatim -- see this module's
+def encode_token(token: ApprovalToken) -> dict:
+    """Every current `ApprovalToken` field, verbatim -- see this module's
     own "A DECIDED REQUEST MINTS EXACTLY ONE SPENDABLE TOKEN" docstring
-    section for why. `consumed_at`/`swept_at` are always `None` at the
-    instant this is called (a token is encoded immediately after `service.
-    approve()` mints it, before anything could have consumed or swept it) --
-    encoded anyway, verbatim, rather than hardcoded, so this function has
-    exactly one job (serialize whatever the token says) and no implicit
+    section for the mint-time use, and "SUPERSEDED (durable-consumption unit, 2026-08-09)" for
+    the consumption-time one. RENAMED from `_encode_token` (durable-consumption unit) --
+    public because `agent.approval_execution.execute_approved_request` now
+    calls it directly to build `record_token_consumed`'s closure, not just
+    this module's own `mint_approval_token`. At mint time, `consumed_at`/
+    `swept_at` are always `None` (a token is encoded immediately after
+    `service.approve()` mints it, before anything could have consumed or
+    swept it); at consumption time (the new caller) `consumed_at` is
+    whatever `ApprovalToken.consume()` just set. Encoded verbatim either
+    way, rather than hardcoded, so this function has exactly one job
+    (serialize whatever the token currently says) and no implicit
     assumption about when it runs."""
     encoded = {name: getattr(token, name) for name in _TOKEN_FIELDS}
     encoded["price_band"] = list(encoded["price_band"])
@@ -464,5 +488,5 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
     # so the VERY NEXT call for this request_id -- same process or a fresh
     # one -- finds it via the `request.token_snapshot` check above instead
     # of reaching `service.approve()` a second time.
-    store.record_token_minted(request_id, token_snapshot=_encode_token(tok), now=now)
+    store.record_token_minted(request_id, token_snapshot=encode_token(tok), now=now)
     return tok

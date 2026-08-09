@@ -67,23 +67,33 @@ with the now-durable key from that point on. A request still PENDING
 (undecided) at cutover is unaffected either way -- nothing has been signed
 for it yet.
 
-NEVER RESUBMIT TO FIND OUT (`agent.broker.base.BrokerAdapter.
-get_by_client_id`'s own docstring). Checked FIRST, before the token is ever
-touched: if an order for `staged.client_order_id` already exists at the
-broker, it is returned as-is -- no re-verification, no token consumption
-attempt. This is the resolution mechanism for the genuine ambiguous-retry
-case Unit 2's own report named as unsolved: `ApprovalToken.consume()` is
-called BEFORE `_submit_impl` inside `BrokerAdapter.submit` (agent/
-broker/base.py:510-520), so a submit that failed AFTER consuming the token
-but before (or during) the broker call leaves the token permanently
-unconsumable a second time -- retrying `submit()` with the same token would
-raise `TokenConsumed`, never reaching `_submit_impl`'s own idempotency-by-
-`client_order_id` promise. Checking `get_by_client_id` here, before ever
-calling `submit()` again, means a retry after an ambiguous failure resolves
-via the DURABLE, broker-side idempotency key -- exactly what that
-docstring's "never resubmit to find out" already promises -- rather than
-needing a new human decision (which `ApprovalRequestStore.decide()` would
-refuse to grant anyway, per Unit 2's own design).
+NEVER RESUBMIT TO FIND OUT -- NOW DEFENSE-IN-DEPTH, NOT THE MECHANISM
+(`agent.broker.base.BrokerAdapter.get_by_client_id`'s own docstring;
+demoted by the durable-consumption unit, 2026-08-09, item 3 of that unit's
+own instructions: "keep the existing get_by_client_id() pre-check. It
+stays as defence in depth, not as the mechanism"). Checked FIRST, before
+the token is ever touched: if an order for `staged.client_order_id`
+already exists at the broker, it is returned as-is -- no re-verification,
+no token consumption attempt. Before the durable-consumption unit, this
+was the ONLY mitigation for the ambiguous-retry case Unit 2's own report
+named as unsolved: `ApprovalToken.consume()` is called BEFORE
+`_submit_impl` inside `BrokerAdapter.submit` (agent/broker/base.py), so a
+submit that failed AFTER consuming the token but before (or during) the
+broker call left the token permanently unconsumable a second time --
+retrying `submit()` with the same token raised `TokenConsumed`, never
+reaching `_submit_impl`'s own idempotency-by-`client_order_id` promise.
+That mitigation depended on the broker being reachable and answering
+correctly -- a real gap, since this check itself calls the broker. The
+durable-consumption unit closes the underlying gap independent of broker
+reachability (see `adapter.attach_token_consumption_sink(...)` below and
+`agent.broker.base.BrokerAdapter`'s own "DURABLE TOKEN CONSUMPTION"
+docstring section): a token's consumed state is now known-spent, durably,
+across a restart, without consulting the broker at all. This check is kept
+UNCHANGED, still run FIRST, still exactly as valuable as before for the
+one case it was always suited to (a genuine, already-placed order this
+process lost track of) -- it answers "does an order already exist," a
+different question than "was this approval already spent," and both
+answers matter.
 
 DRIFT CHECKS -- SUFFICIENCY, NOT RE-SIZING (invariant #1: risk is applied
 to the target weight vector before any order exists, never per-order after
@@ -114,10 +124,61 @@ NOT DONE HERE, ON PURPOSE (per this unit's own instructions): does not
 build a dashboard route, does not wire into `agent.run_loop.run_loop` or
 the unattended scheduled loop, and is operator-invoked only via
 `scripts/run_agent.py --submit-approved` this unit.
+
+TOKEN CONSUMPTION IS NOW DURABLE, WIRED HERE (durable-consumption unit,
+2026-08-09). Immediately before `adapter.submit(...)` (alongside the
+existing `attach_staging_key` call), this function now also calls
+`adapter.attach_token_consumption_sink(...)` with a closure over `store.
+record_token_consumed`. `BrokerAdapter.submit()` invokes that sink
+immediately after its own in-memory `approval_token.consume(...)` succeeds
+and BEFORE the broker is ever contacted (see that method's own docstring
+for the exact placement argument) -- so by the time `_submit_impl` runs,
+the fact that this specific approval has been spent is already fsynced to
+`store`'s file, independent of whether the broker call that follows
+succeeds, times out ambiguously, or never happens because this process
+dies first.
+
+WHICH WAY A MID-SUBMIT CRASH RESOLVES, AND WHY THAT DIRECTION IS SAFE. If
+this process dies between the durable consume (the sink above) and the
+broker actually accepting the order, the token is DURABLY, PERMANENTLY
+consumed -- an order may or may not exist at the broker. On restart, this
+function's caller re-derives a token via `agent.approval_bridge.
+mint_approval_token`, which (per that module's own now-corrected
+"CONSUMPTION IS STILL NOT DURABLE" section) reconstructs it FROM the
+durable snapshot this sink just wrote, so the reconstructed copy already
+reports the correct `consumed_at`. Two cases follow: (1) an order DOES
+exist at the broker -- `get_by_client_id` (above, checked first, kept as
+defense-in-depth) finds it and returns it as-is, no token touched a second
+time; (2) an order does NOT exist -- `get_by_client_id` returns `None`,
+this function falls through toward `adapter.submit(...)` again, and
+`ApprovalToken.consume()` immediately raises `TokenConsumed` (its guard
+order checks "already consumed" first) before the broker is ever
+contacted a second time. That second case is a HARD STOP with no order
+placed: the specific approval is permanently spent, unrecoverable, and the
+operator must `ApprovalRequestStore.invalidate()` this request and let the
+underlying opportunity be re-screened and re-staged -- the exact same
+operator remedy the CUTOVER section above already prescribes for a
+pre-cutover signature that can never verify. THIS IS THE SAFE DIRECTION:
+the alternative (treating an uncertain mid-submit crash as "not yet
+consumed," so a retry is free to try again) risks a genuine double-submit
+if the first attempt's broker call actually landed but this process never
+saw the acknowledgement -- exactly the failure Appendix E's fail-safe-to-
+NO-TRADE bias exists to prevent. Losing one approval's worth of
+opportunity to a hard stop is the acceptable cost; a duplicate live order
+is not. This composes with, rather than conflicts with, the existing
+ambiguous-submit retry path (item 3 of this unit's own instructions,
+`get_by_client_id`, above): the two mechanisms answer different questions
+-- broker-truth ("does an order exist") and authorization-truth ("was this
+approval spent") -- and a caller needs both, checked in that order, to
+resolve every case safely. No conflict was found between durable
+consumption and that retry path; the "stop and report a conflict rather
+than resolving it yourself" escape hatch this unit's instructions offered
+was not needed.
 """
 from __future__ import annotations
 
 from .approval import ApprovalToken, verify_modification_within_bounds
+from .approval_bridge import encode_token
 from .approval_request_store import ApprovalRequestStore
 from .approval_trigger import staged_order_from_snapshot
 from .broker.base import BrokerAdapter, BrokerOrder
@@ -262,5 +323,18 @@ def execute_approved_request(
     # attached at all (see `attach_staging_key`'s own docstring); this is
     # not a re-sign, `staged` itself is submitted unmodified below.
     adapter.attach_staging_key(gatekeeper.signing_key)
+
+    # Durable consumption (module docstring's "TOKEN CONSUMPTION IS NOW
+    # DURABLE" section). `submit()` calls this sink immediately after its
+    # own in-memory `consume()` succeeds and before the broker is ever
+    # contacted -- the closure captures `request_id` and `store`, and reads
+    # `tok.consumed_at` (set by that same `consume()` call, always
+    # non-None by the time the sink runs) rather than `now`, so the
+    # durably-recorded instant is the token's own, not this function's.
+    adapter.attach_token_consumption_sink(
+        lambda tok: store.record_token_consumed(
+            request_id, token_snapshot=encode_token(tok), now=tok.consumed_at,
+        )
+    )
 
     return adapter.submit(staged, approval_token=token, reference_price=reference_price)

@@ -239,9 +239,23 @@ def test_a_second_call_after_a_successful_submit_returns_the_same_order_not_a_re
 
 
 def test_a_retry_never_reaches_the_token_when_the_order_already_exists(tmp_path):
-    """Explicit proof of the mechanism: even a token this function has never
-    seen consumed still short-circuits on the existing broker order --
-    get_by_client_id is checked before the token is touched at all."""
+    """Explicit proof of the mechanism: even a token durably reconstructed
+    as ALREADY consumed still short-circuits on the existing broker order
+    before consume() is ever attempted on it -- get_by_client_id is checked
+    before the token is touched at all.
+
+    UPDATED (durable-consumption unit, 2026-08-09): before this unit, a
+    re-mint after a simulated restart produced a token that (wrongly)
+    reported `consumed_at=None` -- the disclosed gap this same unit closed
+    (see tests/test_approval_bridge.py). `fresh_token`, below, now
+    correctly reconstructs as ALREADY spent, because the first
+    `execute_approved_request` call durably recorded that consumption via
+    its own attached sink. The interesting assertion is no longer "it
+    reads as unconsumed" (that would now be a REGRESSION, not a proof of
+    isolation) but that this second call succeeds at all without raising
+    TokenConsumed -- which `ApprovalToken.consume()` would raise
+    immediately if `submit()` ever attempted to touch this already-spent
+    token. It doesn't, because get_by_client_id wins first."""
     gk = gatekeeper()
     s, result = make_buy(tmp_path, gk=gk)
     token = token_for(s, result.request.request_id)
@@ -251,16 +265,21 @@ def test_a_retry_never_reaches_the_token_when_the_order_already_exists(tmp_path)
                              token=token, reference_price=100.0)
     assert token.consumed_at is not None
 
-    # A fresh token object with the SAME client_order_id-bearing staged
-    # order (simulating a re-mint after a restart, Unit 2's own durable
-    # replay) still must not attempt consume() -- the existing order wins.
+    # A fresh token object reconstructed from the store, simulating a
+    # re-mint after a restart (Unit 2's own durable replay). Per the
+    # durable-consumption unit, this now correctly reports as already
+    # spent -- proof the gap tests/test_approval_bridge.py names is closed.
     fresh_token = token_for(s, result.request.request_id, now=DECIDE_AT + timedelta(minutes=1))
+    assert fresh_token.consumed_at is not None   # durably known-spent, not falsely fresh
+
     order = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=fresh_token,
         reference_price=100.0,
     )
     assert order.client_order_id == result.staged.client_order_id
-    assert fresh_token.consumed_at is None   # never touched
+    # No TokenConsumed was raised above -- proof consume() was never
+    # attempted on fresh_token in THIS call either; get_by_client_id alone
+    # resolved it.
 
 
 # --------------------------------------------------------------------- guards

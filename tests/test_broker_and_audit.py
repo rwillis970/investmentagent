@@ -380,6 +380,79 @@ def test_live_order_consumes_its_token_exactly_once():
         b.submit(s2, approval_token=tok)
 
 
+# ------------------------------------------------- durable token consumption
+# (durable-consumption unit, 2026-08-09). See `agent.broker.base.
+# BrokerAdapter`'s own "DURABLE TOKEN CONSUMPTION" docstring section for the
+# placement argument (after consume() succeeds, before _submit_impl runs) and
+# `agent.approval_execution`'s own "WHICH WAY A MID-SUBMIT CRASH RESOLVES"
+# section for the full fail-direction reasoning these two tests exist to
+# back up mechanically. `tests/test_approval_bridge.py` covers the durable-
+# STORE half (a snapshot written this way is what a restarted process reads
+# back); these two cover the SINK-INVOCATION half, at the adapter itself.
+
+def test_submit_calls_the_attached_consumption_sink_with_the_consumed_token():
+    b, gk = broker()
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc)
+    seen = []
+    b.attach_token_consumption_sink(seen.append)
+    order = b.submit(staged(gk), approval_token=tok)
+    assert seen == [tok]
+    assert tok.consumed_at is not None
+    assert order.status == "filled"
+
+
+def test_no_sink_attached_is_unchanged_behaviour():
+    """`attach_token_consumption_sink` is OPTIONAL (module docstring) --
+    submit() must work exactly as before when nothing is attached, which
+    every other test in this file already exercises implicitly; this test
+    names that explicitly as a real assertion rather than leaving it
+    merely implied."""
+    b, gk = broker()
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc)
+    order = b.submit(staged(gk), approval_token=tok)
+    assert order.status == "filled"
+    assert tok.consumed_at is not None
+
+
+def test_a_raising_consumption_sink_prevents_the_broker_from_ever_being_contacted():
+    """Item 2's own safety property, tested directly: if the durable write
+    itself fails, `_submit_impl` must never run -- a durable-write failure
+    is safety-equivalent to the process dying before the broker call, not a
+    distinct failure mode requiring its own handling. The token is already
+    consumed IN MEMORY by the time the sink runs (consume() happens BEFORE
+    the sink is invoked, deliberately -- see `agent.broker.base`'s own
+    "DURABLE TOKEN CONSUMPTION" docstring section), so a same-token retry
+    still raises TokenConsumed; the durable side of that (a token
+    reconstructed after a real restart also seeing consumed_at set) is
+    exercised in tests/test_approval_bridge.py, not here -- this test only
+    proves the adapter-level half: the exception propagates, and no order
+    exists afterward."""
+    b, gk = broker()
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc)
+
+    class SinkFailure(Exception):
+        pass
+
+    def failing_sink(consumed_token):
+        raise SinkFailure("durable write failed")
+
+    b.attach_token_consumption_sink(failing_sink)
+    with pytest.raises(SinkFailure):
+        b.submit(staged(gk), approval_token=tok)
+
+    # consume() already ran -- irreversible in memory, same as any other
+    # successful consumption -- but the broker was never contacted:
+    assert tok.consumed_at is not None
+    assert b.get_by_client_id("c1") is None
+    assert b.positions() == []
+
+
 def test_live_order_diverging_from_the_approved_size_is_refused():
     b, gk = broker(live=True)
     svc = ApprovalService(expiration=timedelta(minutes=30),

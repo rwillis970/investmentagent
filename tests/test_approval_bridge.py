@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agent.approval import ApprovalService, verify_modification_within_bounds
-from agent.approval_bridge import ApprovalBridgeError, mint_approval_token
+from agent.approval_bridge import ApprovalBridgeError, encode_token, mint_approval_token
 from agent.approval_request_store import ApprovalRequestStore
 
 ACCT = "acct-1"
@@ -432,17 +432,31 @@ def test_a_consumed_token_is_not_re_mintable_within_the_same_service(tmp_path):
                          now=DECIDE_AT + timedelta(seconds=3))
 
 
-def test_disclosed_gap_a_reconstructed_token_after_a_restart_does_not_know_it_was_consumed(tmp_path):
-    """NOT a passing feature -- a documented, disclosed limitation (see
-    `agent.approval_bridge`'s own "CONSUMPTION IS STILL NOT DURABLE"
-    docstring section). `token_snapshot` is written once, at MINT time;
-    `ApprovalToken.consume()` mutates the in-memory object only and is
-    never persisted (closing that would thread a store dependency through
-    `consume()`, called from `agent.broker.base.BrokerAdapter.submit` --
-    the execution path, out of scope this unit). A token reconstructed from
-    the durable snapshot after a real restart therefore always reports
-    `consumed_at=None`, even if the original was already spent. This test
-    exists so the gap is visible, not silently assumed closed."""
+def test_durable_consumption_a_reconstructed_token_after_a_restart_now_knows_it_was_consumed(tmp_path):
+    """REWRITTEN, not deleted (durable-consumption unit, 2026-08-09) -- this
+    test used to be named `test_disclosed_gap_...` and proved the OPPOSITE
+    of what it proves now: a documented, disclosed limitation where a token
+    reconstructed from `token_snapshot` after a real restart always
+    reported `consumed_at=None`, even if the original was already spent,
+    because `ApprovalToken.consume()` mutated the in-memory object only.
+    See `agent.approval_bridge`'s own "SUPERSEDED" correction to its
+    "CONSUMPTION IS STILL NOT DURABLE" docstring section for the full
+    story of what closed it: `agent.broker.base.BrokerAdapter.submit()`
+    now calls an attached consumption sink immediately after `consume()`
+    succeeds, and `agent.approval_execution.execute_approved_request`
+    wires that sink to `store.record_token_consumed`. This test exercises
+    the durable-STORE half directly, at the level this bridge module
+    actually operates -- `tests/test_broker_and_audit.py` exercises the
+    sink itself, end-to-end through a real `submit()` call.
+
+    Consume the token, record that consumption exactly the way the real
+    sink does (`store.record_token_consumed(..., token_snapshot=
+    encode_token(tok), ...)`), then simulate a real restart (a fresh
+    `ApprovalService`, empty `_tokens`) and confirm `mint_approval_token`'s
+    existing `request.token_snapshot` fallback -- unchanged by this unit --
+    now reconstructs a token whose `consumed_at` is correct, because the
+    snapshot it reads was overwritten with the post-consumption state
+    rather than still holding the stale, mint-time one."""
     store, req = make(tmp_path)
     svc1 = service()
     tok = mint_approval_token(req.request_id, store=store, service=svc1, now=DECIDE_AT)
@@ -450,9 +464,17 @@ def test_disclosed_gap_a_reconstructed_token_after_a_restart_does_not_know_it_wa
                now=DECIDE_AT + timedelta(seconds=1))
     assert tok.consumed_at is not None   # truly consumed, in svc1's memory
 
+    # What agent.broker.base.BrokerAdapter.submit()'s consumption sink does
+    # to this same store, in production -- exercised directly here rather
+    # than through a full submit() call, which test_broker_and_audit.py
+    # already covers end-to-end.
+    store.record_token_consumed(req.request_id, token_snapshot=encode_token(tok),
+                                now=tok.consumed_at)
+
     svc2 = service()   # simulated restart -- svc1's mutation is gone with it
     reconstructed = mint_approval_token(req.request_id, store=store, service=svc2,
                                         now=DECIDE_AT + timedelta(minutes=1))
     assert reconstructed.token_id == tok.token_id
-    # The gap: the reconstructed copy does NOT know it was already spent.
-    assert reconstructed.consumed_at is None
+    # The gap is closed: the reconstructed copy DOES know it was already
+    # spent, at the exact instant the original was -- never None here.
+    assert reconstructed.consumed_at == tok.consumed_at
