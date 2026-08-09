@@ -318,22 +318,57 @@ def test_approval_card_html_has_no_support_js_reference(tmp_path):
     assert "support.js" not in html
 
 
+def test_command_center_html_has_no_relative_asset_reference_that_would_404(tmp_path):
+    """The defect class this unit closes (core-image-inlined unit,
+    2026-08-09), not just the one instance already fixed. The build this
+    replaced had `asset="./agent-core-original.png"` on its `<x-import>`
+    core-visual element -- a relative path the bundler never inlined and
+    this server has no route for (`_serve_static` only knows `/`,
+    `/dashboard`, `/approval-card`, `/dashboard_bind.js`; nothing resolves a
+    bare `.png`), so the core visual rendered as a broken-image placeholder.
+    That single reference is now a `data:image/png` URI instead (see
+    `test_command_center_html_is_the_real_generated_build_not_the_turn_3_
+    mock`'s own docstring) -- but this test does not merely check for the
+    ABSENCE of that one string; it checks for the absence of the whole
+    CLASS: any HTML/custom-element attribute (not just `src`/`href` --
+    `asset` is not a standard HTML attribute, which is exactly how the
+    original defect slipped past a narrower `src=`/`href=` check) whose
+    value starts with `./`, anywhere in the served markup, escaped-quote
+    form included (`asset=\\"./...`, as it actually appears here: the
+    `<x-import>` markup is itself embedded as an escaped string literal
+    inside the page's own bundled JSON/template data, not raw HTML)."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+    relative_asset_refs = re.findall(r'''[a-zA-Z_:-]+=\\?["']\./[^"'\\]*''', html)
+    assert relative_asset_refs == []
+
+
 def test_command_center_html_is_the_real_generated_build_not_the_turn_3_mock(tmp_path):
     """Follow-up unit, 2026-08-06 ('bring the real command center live'),
-    superseded 2026-08-09 ('swap in the corrected command center build'):
-    `agent_command_center.html` was replaced byte for byte with the
-    designer's own generated standalone build (`agent_command_center.
-    new.html`, 692,044 bytes before the dashboard_bind.js insertion, sha256
-    ce388210c57afdcd9eeca41c1a01696013010fbcbc1eef0850b88fd927dae4d4). The
-    prior file -- a hand-integrated combination of the original
-    pre-integration mock plus this codebase's own Turn-3
-    agent-core-zones/energy-connectors inlining -- is gone entirely, not
-    merged forward (see this unit's own report). `customElements.
-    define("agent-core-zones", AgentCoreZones)` was that Turn-3 file's own
-    literal registration call and cannot appear in the new build, which
-    wires its core visual through `<x-import component-from-global-scope=
-    "agent-core-zones" ...>` instead -- a real difference in mechanism,
-    not just a re-save of the same bytes under a new name."""
+    superseded 2026-08-09 ('swap in the corrected command center build'),
+    superseded again 2026-08-09 ('swap in the command center build with the
+    core image inlined'): `agent_command_center.html` was replaced byte for
+    byte with the designer's own regenerated standalone build
+    (`agent_command_center_new.html`, 1,059,361 bytes before the
+    dashboard_bind.js insertion, sha256
+    ffd5e7daf7feaa2226ee8a22659087a080d1e445dbdf2393eb43af1fd19f3630) --
+    LARGER than the 692,044-byte build it replaces because the core visual's
+    `agent-core-original.png` is now inlined as a `data:image/png` URI
+    rather than referenced by the `asset="./agent-core-original.png"`
+    relative path the earlier build shipped (which 404s against this
+    server: `_serve_static` has no route for a bare `.png` file, and even if
+    it did, the browser would resolve `./` against the served document's own
+    URL, not the repo's file layout). The prior file -- a hand-integrated
+    combination of the original pre-integration mock plus this codebase's
+    own Turn-3 agent-core-zones/energy-connectors inlining -- is gone
+    entirely, not merged forward (see this unit's own report).
+    `customElements.define("agent-core-zones", AgentCoreZones)` was that
+    Turn-3 file's own literal registration call and cannot appear in the new
+    build, which wires its core visual through `<x-import
+    component-from-global-scope="agent-core-zones" ...>` instead -- a real
+    difference in mechanism, not just a re-save of the same bytes under a
+    new name."""
     runtime, _ = make_runtime(tmp_path)
     result = route_request(runtime, method="GET", path="/")
     html = result.body.decode("utf-8")
