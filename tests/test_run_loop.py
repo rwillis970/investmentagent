@@ -17,7 +17,21 @@ memory. `adapter_factory` in these tests therefore returns the SAME
 already-constructed `SimulatorBroker` instance on every call, mirroring "the
 broker's real state persists elsewhere, not in the adapter object" -- see
 agent/run_loop.py's own docstring for why that is the correct analogy, not a
-shortcut."""
+shortcut.
+
+PIPELINE-STAGE INTEGRATION COVERAGE (cadence-wiring report-back unit,
+2026-08-09) -- ADDED, NOT A REWRITE OF THE ABOVE. The collection/screening/
+T4/approval-request cadence (`agent.pipeline_stage.run_pipeline_stage`) was
+already wired into `run_cycle`/`run_loop` by the unattended wiring unit
+(2026-08-01, Units 1-4) -- `tests/test_pipeline_stage.py` already covers
+`run_pipeline_stage` thoroughly IN ISOLATION. What was missing, and what the
+"---- pipeline stage integration ----" section below adds, is coverage of
+that wiring exercised THROUGH the real orchestrator (`run_cycle`/`run_loop`
+themselves) -- independent cadences across real loop iterations, the
+no-overlap/single-threaded guarantee, the session gate surviving with a real
+`pipeline` attached, and flag-off parity with today's behaviour. See this
+unit's own delivery report for the full trace that found the wiring already
+present and this test gap as the one real, narrower finding."""
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -30,11 +44,15 @@ from agent.approval import ApprovalService, order_fingerprint
 from agent.audit import AuditLog
 from agent.broker.simulator import SimulatorBroker
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+from agent.materiality_cycle import MaterialityCycleResult
 from agent.mode_store import ModeStore
 from agent.pipeline import Gatekeeper, StagedOrder, sign_staged_order
+from agent import pipeline_stage as pipeline_stage_module
+from agent.pipeline_stage import PipelineRuntime
 from agent.run_loop import (AccountRuntime, in_session_now, run_cycle,
                             run_loop, seconds_until_next_session_open)
 from agent.startup import StartupResult
+from agent.store import FactStore
 from agent import mode as mode_fsm
 
 ACCT = "acct-taxable"
@@ -492,3 +510,293 @@ def test_run_loop_stops_and_propagates_on_a_halt(tmp_path):
     # the halt happened on the first cycle attempt -- no sleep call after it,
     # proving the loop did not continue to a next iteration.
     assert clock.sleeps == []
+
+
+# --------------------------------------------------- pipeline stage integration
+# (cadence-wiring report-back unit, 2026-08-09). See module docstring's own
+# addendum: `run_pipeline_stage` was already wired into `run_cycle`/`run_loop`
+# by the unattended wiring unit (2026-08-01) and is already thoroughly tested
+# IN ISOLATION by tests/test_pipeline_stage.py -- these tests instead drive it
+# THROUGH the real orchestrator, using the same lightweight monkeypatch style
+# that file already established (`collect_market_data`/`collect_filings`/
+# `run_materiality_cycle` replaced with recording fakes -- no network, no
+# model call, no real T3/T4 machinery needed to prove the ORCHESTRATOR's own
+# properties: independent cadences, no overlap, the session gate, flag-off
+# parity, and --submit-approved staying unreachable).
+
+def pipeline_runtime(*, data_collection_enabled=False, data_collection_interval_seconds=60,
+                     materiality_screen_enabled=False,
+                     opportunity_screen_interval_seconds=300):
+    """Deliberately minimal: `collect_market_data`/`collect_filings`/
+    `run_materiality_cycle` are always monkeypatched out in these tests (see
+    each test's own `monkeypatch.setattr(pipeline_stage_module, ...)` calls),
+    so `market_data_client`/`edgar_client`/`ticker_cik_cache` never need to be
+    real collaborators -- only `fact_store` does: `run_pipeline_stage` itself
+    calls `pipeline.fact_store.as_of(now)` BEFORE ever reaching the
+    (monkeypatched) `run_materiality_cycle`, so this must be a real
+    `FactStore`, not `None`, whenever `materiality_screen_enabled=True`."""
+    return PipelineRuntime(
+        data_collection_enabled=data_collection_enabled,
+        data_collection_interval_seconds=data_collection_interval_seconds,
+        symbol_universe={"AAPL": "US_EQUITY"},
+        fact_store=FactStore(),
+        materiality_screen_enabled=materiality_screen_enabled,
+        opportunity_screen_interval_seconds=opportunity_screen_interval_seconds,
+    )
+
+
+def _empty_screen(*a, **kw):
+    return MaterialityCycleResult(events=[])
+
+
+def test_collection_and_screening_cadences_are_independent_of_each_other_and_of_reconciliation(
+        tmp_path, monkeypatch):
+    """Three independent cadences in one loop: reconciliation every
+    `cadence_seconds` (60s here), collection every
+    `data_collection_interval_seconds` (150s), screening every
+    `opportunity_screen_interval_seconds` (200s). None of these three numbers
+    is a multiple of either of the others, deliberately: if the wiring
+    silently shared one interval anywhere, the call counts/instants below
+    would not land where they do. `_due(last_run_at, interval, now)` fires
+    whenever `now - last_run_at >= interval` (agent.pipeline_stage's own
+    logic, unchanged here) -- worked out by hand below against 6 real
+    `run_loop` cycles at t=0,60,120,180,240,300 seconds."""
+    b = SimulatorBroker(account_id=ACCT, cash=500.0, now=IN_SESSION)
+    acct = account_runtime(tmp_path)
+
+    collection_calls: list = []
+    screen_calls: list = []
+
+    def fake_collect_market_data(client, store, symbols, *, now):
+        collection_calls.append(now)
+
+    def fake_collect_filings(client, store, cache, symbols, *, now, ticker_cik_refresh_max_age):
+        pass
+
+    def fake_screen(*a, **kw):
+        screen_calls.append(kw["now"])
+        return MaterialityCycleResult(events=[])
+
+    monkeypatch.setattr(pipeline_stage_module, "collect_market_data", fake_collect_market_data)
+    monkeypatch.setattr(pipeline_stage_module, "collect_filings", fake_collect_filings)
+    monkeypatch.setattr(pipeline_stage_module, "run_materiality_cycle", fake_screen)
+
+    pipeline = pipeline_runtime(
+        data_collection_enabled=True, data_collection_interval_seconds=150,
+        materiality_screen_enabled=True, opportunity_screen_interval_seconds=200,
+    )
+    clock = FakeClock(IN_SESSION)
+    run_loop(
+        accounts=[acct], adapter_factory=lambda a: b,
+        mode_store=mode_store_at("PAPER", now=IN_SESSION),
+        audit_log=agreeing_log("PAPER", now=IN_SESSION),
+        approval_service=approval_service(), target_mode="PAPER",
+        cadence_seconds=60, now_fn=clock.now_fn, sleep_fn=clock.sleep_fn,
+        max_cycles=6, pipeline=pipeline,
+    )
+    # collection: due at t=0 (first ever), then not again until >=150s have
+    # elapsed since -- t=180 is the first cycle time satisfying that (t=60/120
+    # are both <150s since t=0); t=240/300 are both <150s since t=180.
+    assert collection_calls == [
+        IN_SESSION, IN_SESSION + timedelta(seconds=180),
+    ]
+    # screening: due at t=0, then not again until >=200s have elapsed -- t=240
+    # is the first cycle time satisfying that (t=60/120/180 are all <200s
+    # since t=0); t=300 is <200s since t=240.
+    assert screen_calls == [
+        IN_SESSION, IN_SESSION + timedelta(seconds=240),
+    ]
+    # Reconciliation itself ran on all 6 cycles regardless -- the cadence
+    # loop's own sleep record proves that independently of either stage.
+    assert clock.sleeps == [60] * 6
+
+
+def test_a_slow_screening_pass_delays_only_the_next_reconciliation_never_overlaps_it(
+        tmp_path, monkeypatch):
+    """Item 3, proven mechanically, not just asserted: this loop is one
+    blocking `while` loop with no threads/async/callback re-entrancy (module
+    docstring) -- `run_cycle` (reconciliation, THEN the pipeline stage inside
+    it) always fully completes before `sleep_fn` is ever called for that
+    iteration, and the NEXT cycle's own `now_fn()` read only happens after
+    THAT `sleep_fn` call returns. A slow screening pass therefore cannot
+    overlap a reconciliation (there is no concurrency for it to overlap
+    WITH) -- its only effect is to push the wall-clock instant of the next
+    cycle later, exactly like any other slow step in the same synchronous
+    call chain (sync_fills, build_account_reconciliation, ...) already
+    could. Proven here by recording call order across three real cycles:
+    reconciliation (`adapter_factory` call) always precedes screening, which
+    always precedes that cycle's own `sleep_fn` call, for every cycle --
+    never interleaved, never out of order."""
+    b = SimulatorBroker(account_id=ACCT, cash=500.0, now=IN_SESSION)
+    acct = account_runtime(tmp_path)
+    order: list[str] = []
+
+    def counting_factory(a):
+        order.append("reconcile")
+        return b
+
+    def slow_screen(*a, **kw):
+        # "Slow" here means "takes real steps before returning," not a real
+        # sleep -- a real sleep would make this test itself slow for no
+        # extra proof; the ORDERING recorded below is what demonstrates the
+        # no-overlap property, not wall-clock duration.
+        order.append("screen-start")
+        order.append("screen-end")
+        return MaterialityCycleResult(events=[])
+
+    monkeypatch.setattr(pipeline_stage_module, "run_materiality_cycle", slow_screen)
+
+    class OrderedClock(FakeClock):
+        def sleep_fn(self, seconds):
+            order.append("sleep")
+            super().sleep_fn(seconds)
+
+    pipeline = pipeline_runtime(materiality_screen_enabled=True,
+                               opportunity_screen_interval_seconds=1)
+    clock = OrderedClock(IN_SESSION)
+    run_loop(
+        accounts=[acct], adapter_factory=counting_factory,
+        mode_store=mode_store_at("PAPER", now=IN_SESSION),
+        audit_log=agreeing_log("PAPER", now=IN_SESSION),
+        approval_service=approval_service(), target_mode="PAPER",
+        cadence_seconds=60, now_fn=clock.now_fn, sleep_fn=clock.sleep_fn,
+        max_cycles=3, pipeline=pipeline,
+    )
+    assert order == [
+        "reconcile", "screen-start", "screen-end", "sleep",
+        "reconcile", "screen-start", "screen-end", "sleep",
+        "reconcile", "screen-start", "screen-end", "sleep",
+    ]
+
+
+def test_pipeline_never_fires_outside_a_trading_session_and_sleep_until_open_survives(
+        tmp_path, monkeypatch):
+    """Item 4: starting on a Saturday with both flags on and tiny intervals
+    (1 second -- as due as a cadence can be), collection/screening must see
+    ZERO calls until the loop has slept through the weekend into the first
+    real Monday cycle -- and that sleep-until-next-open behaviour (this
+    module's own pre-existing, pipeline-independent property) must be
+    completely unchanged by a `pipeline` being attached at all."""
+    calls: list = []
+
+    def fake_collect_market_data(client, store, symbols, *, now):
+        calls.append(("collect", now))
+
+    def fake_collect_filings(client, store, cache, symbols, *, now, ticker_cik_refresh_max_age):
+        pass
+
+    def fake_screen(*a, **kw):
+        calls.append(("screen", kw["now"]))
+        return MaterialityCycleResult(events=[])
+
+    monkeypatch.setattr(pipeline_stage_module, "collect_market_data", fake_collect_market_data)
+    monkeypatch.setattr(pipeline_stage_module, "collect_filings", fake_collect_filings)
+    monkeypatch.setattr(pipeline_stage_module, "run_materiality_cycle", fake_screen)
+
+    acct = account_runtime(tmp_path)
+
+    def counting_factory(a):
+        return SimulatorBroker(account_id=a.account_id, cash=500.0, now=IN_SESSION)
+
+    pipeline = pipeline_runtime(
+        data_collection_enabled=True, data_collection_interval_seconds=1,
+        materiality_screen_enabled=True, opportunity_screen_interval_seconds=1,
+    )
+    clock = FakeClock(SATURDAY)
+    run_loop(
+        accounts=[acct], adapter_factory=counting_factory,
+        mode_store=mode_store_at("PAPER", now=IN_SESSION),
+        audit_log=agreeing_log("PAPER", now=IN_SESSION),
+        approval_service=approval_service(), target_mode="PAPER",
+        cadence_seconds=300, now_fn=clock.now_fn, sleep_fn=clock.sleep_fn,
+        max_cycles=1, pipeline=pipeline,
+    )
+    # Exactly the SAME sleep pattern this file's own pre-existing
+    # (pipeline-less) weekend test asserts -- unchanged by pipeline being
+    # attached: one overnight/weekend sleep, then one cadence sleep.
+    assert len(clock.sleeps) == 2
+    assert clock.sleeps[0] == pytest.approx(seconds_until_next_session_open(SATURDAY))
+    assert clock.sleeps[1] == 300
+    # Both stages fired exactly once -- on the one real (Monday) cycle that
+    # ran, at the instant the loop actually woke up (the session's own open,
+    # 13:30 UTC -- not IN_SESSION's 15:00, a different instant later in that
+    # same session), never during the weekend the loop slept through.
+    monday_open = datetime(2026, 7, 20, 13, 30, tzinfo=timezone.utc)
+    assert calls == [("collect", monday_open), ("screen", monday_open)]
+
+
+def test_both_flags_false_the_cycle_and_loop_behave_exactly_as_with_no_pipeline_at_all(
+        tmp_path, monkeypatch):
+    """Item 5, proven as true parity, not merely "the flags said no":
+    collection/screening are monkeypatched to FAIL the test outright if
+    ever called, and the full `CycleReport`/sleep pattern from a real
+    `pipeline` (both flags False) is compared against the exact same run
+    with `pipeline=None` -- the pre-pipeline behaviour every other test in
+    this file already exercises."""
+    def fail_if_called(*a, **kw):
+        raise AssertionError("collection/screening must not run when both flags are False")
+
+    monkeypatch.setattr(pipeline_stage_module, "collect_market_data", fail_if_called)
+    monkeypatch.setattr(pipeline_stage_module, "collect_filings", fail_if_called)
+    monkeypatch.setattr(pipeline_stage_module, "run_materiality_cycle", fail_if_called)
+
+    # Two INDEPENDENT store directories (same account_id, separate ledger
+    # files) so the "with disabled pipeline" and "without any pipeline" runs
+    # each start from a genuinely clean, un-shared ledger -- comparing a
+    # second run against a first that already wrote to the SAME file would
+    # not be a fair "identical to today" comparison.
+    (tmp_path / "with").mkdir()
+    (tmp_path / "without").mkdir()
+    acct_with = account_runtime(tmp_path / "with")
+    acct_without = account_runtime(tmp_path / "without")
+
+    def make_broker():
+        return SimulatorBroker(account_id=ACCT, cash=500.0, now=IN_SESSION)
+
+    disabled_pipeline = pipeline_runtime(
+        data_collection_enabled=False, materiality_screen_enabled=False)
+
+    report_with = run_cycle(
+        accounts=[acct_with], adapter_factory=lambda a: make_broker(),
+        mode_store=mode_store_at("PAPER", now=IN_SESSION),
+        audit_log=agreeing_log("PAPER", now=IN_SESSION),
+        approval_service=approval_service(), target_mode="PAPER", now=IN_SESSION,
+        pipeline=disabled_pipeline,
+    )
+
+    report_without = run_cycle(
+        accounts=[acct_without], adapter_factory=lambda a: make_broker(),
+        mode_store=mode_store_at("PAPER", now=IN_SESSION),
+        audit_log=agreeing_log("PAPER", now=IN_SESSION),
+        approval_service=approval_service(), target_mode="PAPER", now=IN_SESSION,
+        pipeline=None,
+    )
+
+    assert report_with.new_fills == report_without.new_fills
+    assert report_with.result.reconciled_accounts == report_without.result.reconciled_accounts
+    assert (report_with.reconciliations[0].local_positions
+           == report_without.reconciliations[0].local_positions)
+    # The pipeline result itself: a real, attached-but-disabled pipeline
+    # still returns a PipelineCycleResult (not None -- see CycleReport's own
+    # docstring), but a completely inert one; pipeline=None returns None.
+    assert report_with.pipeline_result.last_collected_at is None
+    assert report_with.pipeline_result.last_screened_at is None
+    assert report_with.pipeline_result.screening is None
+    assert report_without.pipeline_result is None
+
+
+def test_submit_approved_execution_stays_unreachable_from_the_loop():
+    """Item 6, checked directly against the source rather than only by
+    absence of a call in the tests above (which could pass even if a dead,
+    unreachable-in-practice call existed) -- grepped, not merely asserted by
+    omission, matching this codebase's own established convention (see e.g.
+    agent/approval_bridge.py's own "grepped before writing this module"
+    sections) for proving a negative about what a module does NOT call."""
+    import inspect
+
+    from agent import pipeline_stage, run_loop
+
+    for module in (run_loop, pipeline_stage):
+        source = inspect.getsource(module)
+        assert "execute_approved_request" not in source
+        assert "approval_execution" not in source

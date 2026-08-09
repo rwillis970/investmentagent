@@ -137,11 +137,44 @@ Each prints and exits 0 on success (or exits 1 with a clear reason if the
 step is illegal or out of order -- nothing is written to either store on a
 refusal). Confirm with `--advance-mode-to PAPER` again: a target equal to
 the already-persisted mode is a harmless no-op. Make sure `config.json`
-itself also has `"mode": "PAPER"` before step 4 -- this only advances the
+itself also has `"mode": "PAPER"` before step 5 -- this only advances the
 PERSISTED mode; the loop's own `target_mode` still comes from `config.json`
 on every run.
 
-## 4. Load the job
+## 4. Preflight the installed copy, then load the job
+
+`tests/test_run_agent_plist_parses.py` only ever validates the CHECKED-IN
+TEMPLATE in `deploy/`, before you've filled in a single placeholder --
+it has no way to see what you actually typed into your own copy at
+`~/Library/LaunchAgents/`. This has already gone wrong once: an installed
+copy was missing `--signing-key-secret-ref` entirely and crash-looped on
+argparse every `ThrottleInterval` (60s) after `launchctl bootstrap`, with
+nothing checking it first. Run this against your OWN installed file, not
+the template, before every `bootstrap`:
+
+```sh
+python3 deploy/preflight_plist.py ~/Library/LaunchAgents/com.investmentagent.reconcile-loop.plist
+```
+
+It checks three things: `ProgramArguments` parses against the real
+`scripts/run_agent.py` argument parser (the exact check that would have
+caught the missing-flag incident above); every path the plist names --
+the script, `--config`, `--data-dir`, and the `StandardOutPath`/
+`StandardErrorPath` log directories -- actually exists on this machine;
+and no `REPLACE_`/`/REPLACE/...` placeholder was left unfilled anywhere
+(a placeholder like `REPLACE_WITH_ACCOUNT_ID` parses fine as a string, so
+only this third check catches it). It prints `preflight OK` and exits 0 on
+success; on any failure it exits 1 and lists every problem it found, one
+per line, each naming the specific flag/key and -- where the plist's own
+one-`<string>`-per-line convention makes it unambiguous -- the line number
+to fix.
+
+**Does not need your keychain entry provisioned or unlocked first** -- it
+never resolves `--secret-ref`/`--signing-key-secret-ref`, only checks that
+the flags and values are present and well-formed. A locked keychain is not
+a plist problem, and this check does not conflate the two.
+
+## 5. Load the job
 
 ```sh
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.investmentagent.reconcile-loop.plist
