@@ -26,7 +26,7 @@ from decimal import Decimal
 import pytest
 
 from agent.accounts import BrokerCredentials, CrossAccountError
-from agent.approval import ApprovalService
+from agent.approval import ApprovalService, order_fingerprint
 from agent.audit import AuditLog
 from agent.broker.simulator import SimulatorBroker
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
@@ -87,6 +87,32 @@ def agreeing_log(mode, *, now):
 def approval_service():
     return ApprovalService(expiration=timedelta(minutes=30), min_display=timedelta(seconds=10),
                            max_per_day=4, price_band_pct=1.0)
+
+
+def token_for(fields: dict, *, now: datetime, svc: ApprovalService | None = None,
+             token_id="t1", request_id="r1"):
+    """Mints a token matching a hand-built StagedOrder `fields` dict
+    (require-a-token-in-paper unit, 2026-08-09) -- these tests build and
+    submit a StagedOrder directly against `SimulatorBroker` (simulating an
+    order placed outside this loop entirely), which now needs a token the
+    same as every other submit() call in this codebase. `now` must be the
+    SAME instant `SimulatorBroker.clock()` will report at submit time --
+    unlike `AlpacaPaperAdapter` (tests/test_broker_alpaca.py), a
+    `SimulatorBroker`'s clock is its own injectable `_now`, not real
+    wall-clock time, so the caller passes it explicitly rather than this
+    helper reading `datetime.now()`."""
+    svc = svc or approval_service()
+    fp = order_fingerprint(symbol=fields["symbol"], side=fields["side"],
+                           qty=fields["authorized_qty"], order_type=fields["order_type"],
+                           time_in_force=fields["time_in_force"],
+                           limit_price=fields["limit_price"], lot_id=fields["lot_id"])
+    return svc.approve(token_id=token_id, request_id=request_id, fingerprint=fp,
+                       price_at_analysis=fields["limit_price"] or 0.0,
+                       shown_at=now - timedelta(seconds=15), now=now,
+                       symbol=fields["symbol"], side=fields["side"],
+                       qty=fields["authorized_qty"], order_type=fields["order_type"],
+                       time_in_force=fields["time_in_force"],
+                       limit_price=fields["limit_price"], lot_id=fields["lot_id"])
 
 
 # --------------------------------------------------------------- in_session_now
@@ -179,7 +205,8 @@ def test_sync_fills_runs_before_reconciliation_so_a_real_fill_is_not_a_false_mis
         binding=(), lot_id=None,
     )
     staged = StagedOrder(**fields, signature=sign_staged_order(fields, key))
-    b.submit(staged)   # a real fill now exists at the broker, unknown to any ledger
+    b.submit(staged, approval_token=token_for(fields, now=IN_SESSION))   # a real fill now
+                       # exists at the broker, unknown to any ledger
 
     acct = account_runtime(tmp_path)
     # OrderRecord for c1 was never staged through this loop, so sync_fills
@@ -242,7 +269,7 @@ def test_a_fill_staged_between_cycles_reconciles_clean_on_the_next_cycle(tmp_pat
         binding=(), lot_id=None,
     )
     staged = StagedOrder(**fields, signature=sign_staged_order(fields, key))
-    b.submit(staged)
+    b.submit(staged, approval_token=token_for(fields, now=IN_SESSION, request_id="r2"))
     from agent.ledger_store import LedgerStore
     interim_store = LedgerStore(acct.ledger_store_path, account_id=ACCT, policy_registry=registry())
     interim_store.write_order_record(OrderRecord(client_order_id="c1", account_id=ACCT,
@@ -301,8 +328,9 @@ def test_a_pre_existing_broker_fill_before_the_very_first_cycle_now_seeds_correc
         binding=(), lot_id=None,
     )
     staged = StagedOrder(**fields, signature=sign_staged_order(fields, key))
-    b.submit(staged)   # the broker already has this fill before any cycle ran
-                       # -- SimulatorBroker's own cash is now 500 - 100 = 400
+    b.submit(staged, approval_token=token_for(fields, now=IN_SESSION))   # the broker already
+                       # has this fill before any cycle ran -- SimulatorBroker's own cash is
+                       # now 500 - 100 = 400
 
     acct = account_runtime(tmp_path)
     pre_store = LedgerStore(acct.ledger_store_path, account_id=ACCT, policy_registry=registry())

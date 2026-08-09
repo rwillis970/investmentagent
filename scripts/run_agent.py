@@ -158,6 +158,65 @@ it). This is why `--admit-cash-event` requires `--ledger-store-path` too,
 not just `--cash-quarantine-store-path`; `--reject-cash-event` requires it
 for a uniform flag set but never actually reads it.
 
+--SUBMIT-APPROVED: THE OPERATOR PATH FOR EXECUTING AN APPROVED REQUEST
+(Unit 3, 2026-08-09). Unit 1 (persisted the gate's own StagedOrder output
+onto ApprovalRequest.proposal_snapshot) and Unit 2 (a decided request
+durably mints exactly one spendable ApprovalToken) exist to feed this: the
+seam that actually calls `agent.broker.base.BrokerAdapter.submit`. This
+flag mirrors `--admit-execution`'s SHAPE (a narrow, one-shot administrative
+command, NOT the real scheduled loop, dispatched before any of the
+account/pipeline/failure-sentinel machinery below) but NOT its
+collaborators: `--admit-execution` touches no adapter at all, while this
+command's entire point is to submit through one -- see `_run_submit_
+approved`'s own docstring for exactly what it constructs and why.
+
+NOT WIRED INTO THE UNATTENDED LOOP. `agent.run_loop.run_loop` never calls
+`agent.approval_execution.execute_approved_request` -- this remains
+operator-invoked only, this unit. See that module's own docstring for the
+full reasoning (verify-never-re-derive, the never-resubmit-to-find-out
+idempotency check, the sufficiency-only drift checks) and this unit's own
+delivery report for what is deliberately NOT solved here (a durable,
+cross-process record of TOKEN CONSUMPTION -- Unit 2's own disclosed gap --
+and a market-data fetch for `--submit-approved-reference-price`, which
+this flag instead requires the operator supply directly).
+
+THE GATEKEEPER SIGNING KEY IS NOW DURABLE (follow-up unit, 2026-08-09).
+`agent.pipeline.Gatekeeper.signing_key` used to default to a fresh random
+value every process invocation, which meant a `StagedOrder`'s signature
+could only ever verify inside the SAME process that staged it --
+`agent.approval_execution` used to work around this by re-signing before
+submit. Both `build_pipeline_runtime` (the real scheduled loop) and
+`_run_submit_approved` (this script's `--submit-approved` path) now
+construct their `Gatekeeper` with an EXPLICIT `signing_key`, resolved via
+`_resolve_gatekeeper_signing_key` from a new required flag,
+`--signing-key-secret-ref` -- the SAME read-only `SecretsProvider.resolve`
+call already used for `--secret-ref`'s broker API credential, never a new
+write path. THE OPERATOR PROVISIONS THIS BY HAND, once per mode, before
+either path is run for the first time -- this codebase does not generate
+or write the secret itself (see `agent.secrets_provider`'s own docstring
+for why that stays out of scope everywhere):
+
+    python3 -c "import secrets; print(secrets.token_bytes(32).hex())"
+    security add-generic-password -s investmentagent:PAPER \
+        -a <the --signing-key-secret-ref value> -w <the printed hex string>
+
+CUTOVER. Provisioning this key and restarting the loop means every
+`ApprovalRequest` staged BEFORE that moment carries a `StagedOrder`
+signature that can never verify against the new durable key -- by
+construction, not a bug (see `agent.approval_execution`'s own module
+docstring, `StagingSignatureInvalid`). A request still PENDING at cutover
+is unaffected (nothing has been signed for it yet, and it will be staged
+fresh, under the durable key, whenever a human decides it). A request
+already DECIDED (approved) but not yet run through `--submit-approved` at
+the moment of cutover is the one real casualty: `agent.
+approval_request_store.ApprovalRequestStore.decide` already permanently
+refuses to re-decide an approved request (Unit 2's own design), so there
+is no path to a fresh, verifiable signature for that specific request
+short of abandoning it. THE OPERATOR REMEDY: invalidate it
+(`ApprovalRequestStore.invalidate` -- an existing method, not new here)
+and let the strategy re-screen and re-stage the same opportunity, which
+signs with the now-durable key from that point on.
+
 WHAT THIS SCRIPT DOES NOT SOLVE (see agent/run_loop.py's own docstring for
 the full reasoning on each):
 
@@ -197,6 +256,8 @@ from agent import market_calendar
 from agent import mode as mode_fsm
 from agent.accounts import AccountType, BrokerCredentials
 from agent.approval import ApprovalService
+from agent.approval_bridge import ApprovalBridgeError, mint_approval_token
+from agent.approval_execution import ExecutionError, execute_approved_request
 from agent.approval_request_store import ApprovalRequestStore
 from agent.audit import AuditLog
 from agent.broker.alpaca import AlpacaPaperAdapter
@@ -250,6 +311,55 @@ def _default_notify(message: str) -> None:
         pass
 
 
+def _resolve_gatekeeper_signing_key(secrets_provider: SecretsProvider,
+                                    secret_ref: str) -> bytes:
+    """Resolves the durable `agent.pipeline.Gatekeeper.signing_key` this
+    script now passes explicitly to every `Gatekeeper` it constructs --
+    see module docstring's THE GATEKEEPER SIGNING KEY IS NOW DURABLE
+    section for why, and `agent.approval_execution`'s own docstring for
+    what verifying (rather than re-signing) against it actually buys.
+
+    Uses the SAME `secrets_provider.resolve(secret_ref)` call this script
+    already makes for `--secret-ref`'s broker API credential -- no new
+    write path, and `agent.secrets_provider` stays resolve-only (its own
+    docstring: "PROVISIONING ... IS OUT OF SCOPE for this module"). This
+    function does not write to the keychain either; it only decodes a
+    value the OPERATOR already put there BY HAND, once per mode:
+
+        python3 -c "import secrets; print(secrets.token_bytes(32).hex())"
+        security add-generic-password -s investmentagent:<mode> \
+            -a <secret_ref> -w <the printed hex string>
+
+    `security -w` only stores text, so the entry is a hex string; decoded
+    back to real bytes here, at the one place a `Gatekeeper` actually needs
+    them. Raises `ValueError` -- uncaught, propagating to whichever
+    caller's own `except Exception` turns it into a logged, non-zero exit
+    (this script never trades on an unusable key) -- for a value that
+    isn't valid hex, or that decodes shorter than the 32 bytes `agent.
+    pipeline.Gatekeeper`'s own random default generates. `secrets_provider.
+    resolve` itself already raises `agent.secrets_provider.
+    SecretNotFoundError` (uncaught here too) for a missing entry -- both
+    are hard stops, no fallback to a freshly-generated key, which would
+    silently reintroduce the exact per-process-key gap this exists to
+    close."""
+    raw = secrets_provider.resolve(secret_ref).strip()
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"signing key at secret_ref={secret_ref!r} is not a valid hex "
+            "string; refusing to construct a Gatekeeper with an unusable "
+            "signing key"
+        ) from exc
+    if len(key) < 32:
+        raise ValueError(
+            f"signing key at secret_ref={secret_ref!r} decodes to only "
+            f"{len(key)} bytes; refusing a signing key shorter than the "
+            "32 bytes agent.pipeline.Gatekeeper's own default generates"
+        )
+    return key
+
+
 def build_account_runtime(cfg: config_module.Config, *, account_id: str,
                           credentials: BrokerCredentials,
                           ledger_store_path: str | Path,
@@ -294,6 +404,7 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
                           account_type: AccountType,
                           audit_log: AuditLog,
                           approval_service: ApprovalService,
+                          signing_key: bytes,
                           fact_store_path: str | Path,
                           cost_ledger_path: str | Path,
                           extraction_cache_path: str | Path,
@@ -352,7 +463,14 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
     CONSTRUCTED `approval_service`, not recomputed a second time from
     `cfg` here -- one number, one source, matching `agent.approval.
     ApprovalService`'s own fields exactly rather than risking a second,
-    independently-hardcoded value drifting from the first."""
+    independently-hardcoded value drifting from the first.
+
+    `signing_key` (follow-up unit, 2026-08-09): passed straight to
+    `Gatekeeper` instead of letting it fall back to its own random default
+    -- the caller (`main`, below) resolves it via `_resolve_gatekeeper_
+    signing_key` from `--signing-key-secret-ref` first, so it is the SAME
+    durable value a later `--submit-approved` invocation resolves too. See
+    module docstring's THE GATEKEEPER SIGNING KEY IS NOW DURABLE section."""
     market_data_client = AlpacaMarketDataClient(
         credentials=credentials, secrets_provider=secrets_provider,
         feed=cfg.market_data_feed,
@@ -378,6 +496,7 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
         day_trade_guard=DayTradeGuard(account_id=account_id,
                                       max_per_5_sessions=cfg.max_day_trades_per_5_sessions),
         live=cfg.mode == "PRODUCTION_ACTIVE",
+        signing_key=signing_key,
     )
     return PipelineRuntime(
         data_collection_enabled=cfg.data_collection_enabled,
@@ -733,6 +852,117 @@ def _run_admit_or_reject_cash_event(*, decision: str, activity_id: str, account_
         return 1
 
 
+def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
+                         key_id: str, secret_ref: str, signing_key_secret_ref: str,
+                         account_type: str,
+                         approval_request_store_path: str | Path,
+                         audit_log_path: str | Path, reference_price: float,
+                         secrets_provider_factory: Callable[[str], SecretsProvider],
+                         now_fn: Callable[[], datetime], log: logging.Logger) -> int:
+    """The operator path for executing an APPROVED request (see module
+    docstring's --SUBMIT-APPROVED section). Mirrors `_run_admit_or_reject`'s
+    SHAPE -- one-shot, narrow, dispatched before any pipeline/loop
+    machinery, never touches `agent.failure_sentinel` -- but not its
+    collaborators: this command's entire point is to submit an order
+    through a REAL adapter (`AlpacaPaperAdapter`, via `secrets_provider_
+    factory` -- swappable in tests for a fake broker, per this unit's own
+    "sandbox has no network egress" instruction), unlike `--admit-
+    execution`, which touches no adapter at all.
+
+    TOKEN: obtained here via `agent.approval_bridge.mint_approval_token` --
+    the ONLY production caller of `ApprovalService.approve` (that module's
+    own docstring) -- not accepted as a flag: a token is not something an
+    operator types, and Unit 2's own durable replay means calling this
+    twice for the same request_id returns the SAME token rather than
+    minting a second one, regardless of whether the operator already
+    approved-and-minted through the dashboard or is minting for the first
+    time right here.
+
+    REFERENCE PRICE IS OPERATOR-SUPPLIED, NOT FETCHED. `agent.
+    approval_execution`'s own docstring explains why: no market-data client
+    is threaded through this command, so `--submit-approved-reference-
+    price` is REQUIRED and its value is passed straight through to
+    `execute_approved_request` -- the same figure `ApprovalToken.consume`
+    (called inside `BrokerAdapter.submit`) checks against the approved
+    price band. The operator is expected to read a current quote
+    themselves (the broker's own dashboard, say) before invoking this.
+
+    CAPABILITY POLICY IS ATTACHED, UNLIKE `_real_adapter_factory` ABOVE.
+    That factory (the real scheduled loop) never calls `submit()`/
+    `cancel()`, so it never attaches one. This command's entire point is to
+    call `submit()`, which dereferences `self.capability_policy` and raises
+    `CapabilityPolicyUnset` if it is not attached -- so `cfg.
+    capability_policy` is passed at construction here.
+
+    SIGNING KEY IS RESOLVED, NOT GENERATED (follow-up unit, 2026-08-09):
+    `signing_key_secret_ref` is looked up via the SAME `secrets_provider`
+    already constructed for broker credentials -- `_resolve_gatekeeper_
+    signing_key` -- so the `Gatekeeper` built below verifies against the
+    SAME durable key the scheduled loop staged the order with, rather than
+    a fresh one this invocation would have to re-sign against (removed;
+    see agent/approval_execution.py's own module docstring)."""
+    try:
+        cfg = config_module.load(json.loads(Path(config_path).read_text()))
+        secrets_provider = secrets_provider_factory(cfg.mode)
+        signing_key = _resolve_gatekeeper_signing_key(secrets_provider, signing_key_secret_ref)
+        credentials = BrokerCredentials(account_id=account_id, key_id=key_id,
+                                       secret_ref=secret_ref)
+        store = ApprovalRequestStore(approval_request_store_path)
+        audit_log = AuditLog(path=audit_log_path)
+        now = now_fn()
+
+        approval_service = ApprovalService(
+            expiration=timedelta(minutes=cfg.approval_expiration_minutes),
+            min_display=timedelta(seconds=cfg.approval_min_display_seconds),
+            max_per_day=cfg.max_approval_requests_per_day,
+            price_band_pct=cfg.price_band_pct,
+        )
+        try:
+            token = mint_approval_token(request_id, store=store, service=approval_service,
+                                        now=now, audit_log=audit_log)
+        except ApprovalBridgeError as exc:
+            log.error("refusing --submit-approved %s: could not obtain a token: %s",
+                     request_id, exc)
+            return 1
+
+        gatekeeper = Gatekeeper(
+            account_id=account_id, account_type=AccountType(account_type),
+            capability_policy=cfg.capability_policy, risk_policy=cfg.risk_policy,
+            day_trade_guard=DayTradeGuard(account_id=account_id,
+                                          max_per_5_sessions=cfg.max_day_trades_per_5_sessions),
+            live=cfg.mode == "PRODUCTION_ACTIVE",
+            signing_key=signing_key,
+        )
+        adapter = AlpacaPaperAdapter(account_id=account_id, credentials=credentials,
+                                     secrets_provider=secrets_provider,
+                                     capability_policy=cfg.capability_policy)
+
+        try:
+            order = execute_approved_request(
+                request_id, store=store, adapter=adapter, gatekeeper=gatekeeper,
+                token=token, reference_price=reference_price,
+            )
+        except ExecutionError as exc:
+            log.error("refusing --submit-approved %s: %s", request_id, exc)
+            return 1
+
+        audit_log.append(
+            actor="operator", action="approval_execution_submitted",
+            object_type="approval_request", object_id=request_id,
+            after={"client_order_id": order.client_order_id, "status": order.status,
+                  "broker_order_id": order.broker_order_id},
+            timestamp=now,
+        )
+        log.info("--submit-approved %s -> order %s (%s)", request_id,
+                order.client_order_id, order.status)
+        return 0
+    except Exception as exc:   # noqa: BLE001 -- never raise out of this
+        # script; see _run_advance_mode's own docstring for why this
+        # deliberately does not touch agent.failure_sentinel either.
+        log.error("--submit-approved %s failed: %s", request_id, exc)
+        return 1
+
+
 #  --data-dir DEFAULTING (launchd-deploy-broken follow-up, 2026-08-03).
 #
 #  THE DEFECT: the unattended-wiring unit added `--fact-store-path`/
@@ -790,6 +1020,17 @@ def _parse_args(argv: list[str] | None):
     parser.add_argument("--secret-ref",
                         help="keychain account name the API secret is stored under; "
                              "required unless --advance-mode-to is given")
+    parser.add_argument("--signing-key-secret-ref",
+                        help="keychain account name the DURABLE agent.pipeline."
+                             "Gatekeeper signing key (32+ bytes, hex-encoded) is stored "
+                             "under; required unless --advance-mode-to/--admit-execution/"
+                             "--reject-execution/--admit-cash-event/--reject-cash-event is "
+                             "given. Resolved via the SAME read-only SecretsProvider."
+                             "resolve() call already used for --secret-ref -- see module "
+                             "docstring's THE GATEKEEPER SIGNING KEY IS NOW DURABLE section "
+                             "for the exact provisioning command an operator runs once per "
+                             "mode, and _resolve_gatekeeper_signing_key just below for the "
+                             "hex-decode/validation this script applies to it.")
     parser.add_argument("--data-dir", default="./data",
                         help="base directory for every store/log file below that isn't "
                              "given an explicit override (resolved to an absolute path; "
@@ -910,6 +1151,30 @@ def _parse_args(argv: list[str] | None):
                              "--account-id, --cash-quarantine-store-path and "
                              "--ledger-store-path; every other account/broker flag is "
                              "ignored.")
+    parser.add_argument("--submit-approved", default=None, metavar="REQUEST_ID",
+                        help="verify and submit an APPROVED agent.entities.ApprovalRequest "
+                             "against a real broker adapter, then exit -- see module "
+                             "docstring's --SUBMIT-APPROVED section and agent/approval_"
+                             "execution.py's own module docstring (verify-never-re-derive, "
+                             "the never-resubmit-to-find-out idempotency check, the "
+                             "sufficiency-only drift checks, and -- follow-up unit, "
+                             "2026-08-09 -- the durable signing key this now verifies "
+                             "against instead of re-signing). Mirrors --admit-execution's "
+                             "SHAPE (one-shot, narrow, dispatched before any pipeline/loop "
+                             "machinery) but not its collaborators: this command constructs a "
+                             "REAL AlpacaPaperAdapter and submits through it. NOT wired into "
+                             "the unattended loop this unit. Requires --account-id, --config, "
+                             "--key-id, --secret-ref, --signing-key-secret-ref, "
+                             "--approval-request-store-path and --submit-approved-reference-"
+                             "price; every other pipeline flag is ignored.")
+    parser.add_argument("--submit-approved-reference-price", default=None, type=float,
+                        metavar="PRICE",
+                        help="required by --submit-approved: a current market price for the "
+                             "approved order's symbol, read by the OPERATOR from a live quote "
+                             "-- this command fetches no market data of its own (see agent/"
+                             "approval_execution.py's own module docstring for why). Checked "
+                             "against the approved price band exactly as any other submission "
+                             "would be.")
     parser.add_argument("--confirmed", action="store_true",
                         help="required for the PAPER/PAUSED -> PRODUCTION_ACTIVE edges (§9.2); "
                              "irrelevant, and harmless, for PAPER")
@@ -982,16 +1247,30 @@ def _parse_args(argv: list[str] | None):
                                  "audit_log_path"))
     elif args.advance_mode_to is not None:
         _default_relevant_paths(("mode_store_path", "audit_log_path"))
+    elif args.submit_approved is not None:
+        missing = [name for name, val in (
+            ("--account-id", args.account_id), ("--config", args.config),
+            ("--key-id", args.key_id), ("--secret-ref", args.secret_ref),
+            ("--signing-key-secret-ref", args.signing_key_secret_ref),
+            ("--submit-approved-reference-price", args.submit_approved_reference_price),
+        ) if val is None]
+        if missing:
+            parser.error(
+                "the following arguments are required for --submit-approved: "
+                + ", ".join(missing)
+            )
+        _default_relevant_paths(("approval_request_store_path", "audit_log_path"))
     else:
         missing = [name for name, val in (
             ("--config", args.config), ("--account-id", args.account_id),
             ("--key-id", args.key_id), ("--secret-ref", args.secret_ref),
+            ("--signing-key-secret-ref", args.signing_key_secret_ref),
         ) if val is None]
         if missing:
             parser.error(
                 "the following arguments are required unless --advance-mode-to/"
                 "--admit-execution/--reject-execution/--admit-cash-event/"
-                "--reject-cash-event is given: " + ", ".join(missing)
+                "--reject-cash-event/--submit-approved is given: " + ", ".join(missing)
             )
         _default_relevant_paths(tuple(_DEFAULT_STORE_FILENAMES))
     return args
@@ -1023,9 +1302,13 @@ def main(argv: list[str] | None = None, *,
     see module docstring's --ADMIT-EXECUTION section. If `--admit-cash-event`/
     `--reject-cash-event` was given, dispatches to
     `_run_admit_or_reject_cash_event` and returns immediately -- see module
-    docstring's --ADMIT-CASH-EVENT section. None of the account/
+    docstring's --ADMIT-CASH-EVENT section. If `--submit-approved` was
+    given, dispatches to `_run_submit_approved` and returns immediately --
+    see module docstring's --SUBMIT-APPROVED section. None of the account/
     broker/failure-sentinel machinery below is touched on any of these
-    paths."""
+    paths (`--submit-approved` builds its OWN adapter, inside `_run_submit_
+    approved` -- not the `run_loop_fn`/`_real_adapter_factory` path below,
+    which this flag never reaches)."""
     args = _parse_args(argv)
     logging.basicConfig(level=args.log_level)
     log = logging.getLogger(LOGGER_NAME)
@@ -1058,9 +1341,23 @@ def main(argv: list[str] | None = None, *,
             audit_log_path=args.audit_log_path, now_fn=now_fn, log=log,
         )
 
+    if args.submit_approved is not None:
+        return _run_submit_approved(
+            request_id=args.submit_approved, account_id=args.account_id,
+            config_path=args.config, key_id=args.key_id, secret_ref=args.secret_ref,
+            signing_key_secret_ref=args.signing_key_secret_ref,
+            account_type=args.account_type,
+            approval_request_store_path=args.approval_request_store_path,
+            audit_log_path=args.audit_log_path,
+            reference_price=args.submit_approved_reference_price,
+            secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
+        )
+
     try:
         cfg = config_module.load(json.loads(Path(args.config).read_text()))
         secrets_provider = secrets_provider_factory(cfg.mode)
+        signing_key = _resolve_gatekeeper_signing_key(secrets_provider,
+                                                       args.signing_key_secret_ref)
         credentials = BrokerCredentials(account_id=args.account_id, key_id=args.key_id,
                                        secret_ref=args.secret_ref)
         account = build_account_runtime(
@@ -1089,6 +1386,7 @@ def main(argv: list[str] | None = None, *,
             secrets_provider=secrets_provider,
             account_type=AccountType(args.account_type),
             audit_log=audit_log, approval_service=approval_service,
+            signing_key=signing_key,
             fact_store_path=args.fact_store_path,
             cost_ledger_path=args.cost_ledger_path,
             extraction_cache_path=args.extraction_cache_path,

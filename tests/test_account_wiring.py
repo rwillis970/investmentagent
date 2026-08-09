@@ -18,7 +18,7 @@ import pytest
 from agent.accounts import AccountType, CrossAccountError
 from agent.account_wiring import build_account_reconciliation
 from agent.audit import AuditLog
-from agent.approval import ApprovalService
+from agent.approval import ApprovalService, order_fingerprint
 from agent.broker.base import AccountPosture
 from agent.broker.simulator import SimulatorBroker
 from agent.daytrade import DayTradeGuard
@@ -226,5 +226,21 @@ def test_nothing_prevents_a_submit_without_run_startup_ever_running():
                       limit_price=500.0,
                       portfolio=PortfolioState(account_id=ACCT, nlv=500.0, settled_cash=500.0),
                       now=NOW, posture="CASH", asset_class="ETF")
-    order = b.submit(staged)
+    # This test's own point is that nothing gates submit() on run_startup
+    # having run -- unaffected by the require-a-token-in-paper unit
+    # (2026-08-09), except that submit() now needs a token regardless, so
+    # one is minted here matching the staged order exactly.
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    fp = order_fingerprint(symbol=staged.symbol, side=staged.side,
+                           qty=staged.authorized_qty, order_type=staged.order_type,
+                           time_in_force=staged.time_in_force,
+                           limit_price=staged.limit_price, lot_id=staged.lot_id)
+    tok = svc.approve(token_id="t1", request_id="r1", fingerprint=fp,
+                      price_at_analysis=staged.limit_price, shown_at=NOW - timedelta(seconds=15),
+                      now=NOW, symbol=staged.symbol, side=staged.side,
+                      qty=staged.authorized_qty, order_type=staged.order_type,
+                      time_in_force=staged.time_in_force, limit_price=staged.limit_price,
+                      lot_id=staged.lot_id)
+    order = b.submit(staged, approval_token=tok)
     assert order.status == "filled"    # no run_startup call anywhere above

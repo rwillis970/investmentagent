@@ -217,6 +217,17 @@ class ApprovalRequest:
     decided_at: datetime | None = None
     decision_elapsed_ms: int | None = None
     invalidated_reason: str | None = None
+    # DURABLE MINT RECORD (Unit 2, 2026-08-09). `ApprovalService._tokens` is
+    # in-memory only -- a fresh `ApprovalService` instance (a real process
+    # restart, or simply a second instance) starts with an empty dict, so
+    # nothing stopped a second `approve()` call for an already-approved
+    # request from minting a second, independently-spendable token once the
+    # first process's memory was gone. Set once, at successful mint time, by
+    # `ApprovalRequestStore.record_token_minted` -- never by `create()` or
+    # `decide()`. See `agent.approval_bridge.mint_approval_token`'s own
+    # docstring for how this is consulted before ever calling
+    # `ApprovalService.approve` again.
+    token_snapshot: dict | None = None
 
 
 @dataclass(frozen=True)

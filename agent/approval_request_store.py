@@ -52,6 +52,17 @@ FSYNC: EVERY ROW -- no external source of truth for an approval decision
 once made; same reasoning as `agent.cost.CostLedger`/`agent.
 analysis_result_store.AnalysisResultStore`.
 
+DURABLE TOKEN-MINT RECORD (Unit 2, 2026-08-09). `record_token_minted`
+persists that a token was minted for a request -- see `agent.entities.
+ApprovalRequest.token_snapshot`'s own docstring and `agent.approval_bridge.
+mint_approval_token`'s for why: `agent.approval.ApprovalService._tokens` is
+in-memory only, so nothing previously stopped a second `approve()` call
+against a fresh `ApprovalService` instance (a real restart) from minting a
+second, independently-spendable token for an already-approved request.
+This store is the durable side of that fix -- a new "token_minted" event,
+replayed the same generic way `_load_into` already replays "decided"/
+"invalidated" (no special-casing needed there).
+
 `count_decided_on` (renamed from `count_created_on`, earmarking unit,
 2026-08-02) COUNTS DECIDED REQUESTS ONLY -- APPROVED or REJECTED --
 NOT EVERY REQUEST CREATED. `max_approval_requests_per_day` exists to
@@ -157,6 +168,36 @@ class ApprovalRequestStore:
         self._decided_dates.append(market_calendar.session_for_instant(now))
         if persist:
             self._append_event("decided", self._account_of[request_id], updated)
+        return updated
+
+    def record_token_minted(self, request_id: str, *, token_snapshot: dict,
+                            now: datetime, persist: bool = True) -> ApprovalRequest:
+        """Durably records that a token was minted for `request_id` (Unit 2,
+        2026-08-09) -- see `agent.entities.ApprovalRequest.token_snapshot`'s
+        own docstring for why this exists. Called ONLY by `agent.
+        approval_bridge.mint_approval_token`, immediately after a successful
+        `ApprovalService.approve()`, and ONLY when no snapshot is already
+        recorded (that caller checks first; this method still refuses a
+        second call defensively, the same posture `decide()` takes against a
+        second decision). `now` is accepted for signature symmetry with
+        `decide()`/`invalidate()` but is not currently stored -- the token's
+        own `decided_at` field, inside `token_snapshot`, already carries the
+        mint instant."""
+        current = self._require(request_id)
+        if current.decision != "APPROVED":
+            raise ApprovalRequestStoreError(
+                f"request {request_id} is not approved (decision="
+                f"{current.decision!r}); cannot record a token mint"
+            )
+        if current.token_snapshot is not None:
+            raise ApprovalRequestStoreError(
+                f"request {request_id} already has a recorded token mint; "
+                "refusing to overwrite it"
+            )
+        updated = replace(current, token_snapshot=token_snapshot)
+        self._current[request_id] = updated
+        if persist:
+            self._append_event("token_minted", self._account_of[request_id], updated)
         return updated
 
     def invalidate(self, request_id: str, *, reason: str, now: datetime,
@@ -293,6 +334,7 @@ def _encode(r: ApprovalRequest) -> dict:
         "decided_at": r.decided_at.isoformat() if r.decided_at else None,
         "decision_elapsed_ms": r.decision_elapsed_ms,
         "invalidated_reason": r.invalidated_reason,
+        "token_snapshot": r.token_snapshot,
     }
 
 
@@ -308,4 +350,8 @@ def _decode(row: dict) -> ApprovalRequest:
         decided_at=datetime.fromisoformat(row["decided_at"]) if row["decided_at"] else None,
         decision_elapsed_ms=row["decision_elapsed_ms"],
         invalidated_reason=row["invalidated_reason"],
+        # .get, not [] -- a row written before Unit 2 (2026-08-09) has no
+        # "token_snapshot" key at all; absence means "no token minted yet
+        # under the old, in-memory-only regime", never a fabricated mint.
+        token_snapshot=row.get("token_snapshot"),
     )

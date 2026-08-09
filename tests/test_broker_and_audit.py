@@ -124,8 +124,15 @@ def test_posture_is_detected_not_declared():
 
 def test_submit_is_idempotent_on_client_order_id():
     b, gk = broker()
-    o1 = b.submit(staged(gk))
-    o2 = b.submit(staged(gk))
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    # Two distinct tokens for the same client_order_id -- a retried submit
+    # (this test's whole point) mints and consumes its OWN token each time;
+    # a single token cannot be consumed twice (TokenConsumed).
+    o1 = b.submit(staged(gk), approval_token=approved_token(
+        svc, token_id="t1", request_id="r1"))
+    o2 = b.submit(staged(gk), approval_token=approved_token(
+        svc, token_id="t2", request_id="r2"))
     assert o1 is o2 and o1.broker_order_id == o2.broker_order_id
     assert len(b.positions()) == 1
     assert b.get_by_client_id("c1").status == "filled"
@@ -137,7 +144,9 @@ def test_fills_returns_one_execution_per_filled_order_with_a_stable_id():
     order, qty == cum_qty, and a deterministic id so a re-poll produces
     the exact same Execution, not a new one."""
     b, gk = broker()
-    b.submit(staged(gk))
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    b.submit(staged(gk), approval_token=approved_token(svc))
     execs = b.fills()
     assert len(execs) == 1
     e = execs[0]
@@ -160,27 +169,39 @@ def test_simulator_reports_no_non_fill_activities():
     (agent/broker/base.py), not a stub standing in for unbuilt behaviour.
     See agent/broker/alpaca.py for the real, overriding implementation."""
     b, gk = broker()
-    b.submit(staged(gk))
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    b.submit(staged(gk), approval_token=approved_token(svc))
     assert b.non_fill_activities() == []
 
 
 def test_fills_excludes_rejected_and_unfilled_orders():
     b, gk = broker(cash=50.0)
-    b.submit(staged(gk, qty=1.0))   # rejected: insufficient settled cash
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    b.submit(staged(gk, qty=1.0),   # rejected: insufficient settled cash
+            approval_token=approved_token(svc, qty=1.0))
     assert b.fills() == []
 
 
 def test_insufficient_settled_cash_is_rejected():
     b, gk = broker(cash=50.0)
-    o = b.submit(staged(gk, qty=1.0))
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    o = b.submit(staged(gk, qty=1.0), approval_token=approved_token(svc, qty=1.0))
     assert o.status == "rejected"
 
 
 def test_sale_proceeds_settle_t_plus_one():
     b, gk = broker()
-    b.submit(staged(gk, client_order_id="buy", qty=0.5))
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    b.submit(staged(gk, client_order_id="buy", qty=0.5),
+            approval_token=approved_token(svc, qty=0.5, token_id="t-buy", request_id="r-buy"))
     b.submit(staged(gk, client_order_id="sell", side="SELL", qty=0.5,
-                    lot_id="l1", lots=[lot(0.5)]))
+                    lot_id="l1", lots=[lot(0.5)]),
+            approval_token=approved_token(svc, side="SELL", qty=0.5, lot_id="l1",
+                                          token_id="t-sell", request_id="r-sell"))
     assert b.account().unsettled_cash == 250.0
     assert b.account().settled_cash == 250.0
     b.advance(timedelta(days=1))
@@ -198,9 +219,16 @@ def test_sale_proceeds_settle_on_the_real_next_session_not_a_calendar_day():
     from agent import market_calendar as mc
     friday = datetime(2026, 1, 16, 15, 0, tzinfo=timezone.utc)
     b, gk = broker(now=friday)
-    b.submit(staged(gk, client_order_id="buy", qty=0.5, now=friday))
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    b.submit(staged(gk, client_order_id="buy", qty=0.5, now=friday),
+            approval_token=approved_token(svc, qty=0.5, now=friday,
+                                          token_id="t-buy", request_id="r-buy"))
     b.submit(staged(gk, client_order_id="sell", side="SELL", qty=0.5,
-                    lot_id="l1", lots=[lot(0.5, opened=friday)], now=friday))
+                    lot_id="l1", lots=[lot(0.5, opened=friday)], now=friday),
+            approval_token=approved_token(svc, side="SELL", qty=0.5, lot_id="l1",
+                                          now=friday, token_id="t-sell",
+                                          request_id="r-sell"))
     assert b.account().unsettled_cash == 250.0
 
     b.advance(timedelta(days=1))   # lands on Saturday -- must still be unsettled
@@ -267,7 +295,10 @@ def test_paper_only_order_type_is_allowed_on_paper_and_blocked_live():
     only way to observe the adapter's OWN, independent block is to hand it a
     StagedOrder as if gate 1 had (wrongly) let it through."""
     paper, gk = broker()
-    o = paper.submit(staged(gk, order_type="TRAILING_STOP"))
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    o = paper.submit(staged(gk, order_type="TRAILING_STOP"),
+                     approval_token=approved_token(svc, order_type="TRAILING_STOP"))
     assert o.status == "filled"
 
     live, live_gk = broker(live=True)
@@ -287,6 +318,34 @@ def test_an_adapter_without_a_policy_refuses_to_trade():
     bare.attach_staging_key(gk.signing_key)
     with pytest.raises(CapabilityPolicyUnset):
         bare.submit(staged(gk))
+
+
+# ------------------------------------ paper path ALSO requires a token now
+# (require-a-token-in-paper unit, 2026-08-09). The governance path this
+# token exists to prove must be exercised in paper, not first exercised
+# live -- `agent/broker/base.py::submit`'s old `if self.is_live:` gate
+# around the whole token-consumption block is gone; these two tests are the
+# paper-mode analogues of `test_live_order_without_a_token_is_refused` /
+# `test_an_increased_buy_qty_is_refused_not_silently_authorized` below,
+# proving the same two properties hold with no `live=True` anywhere.
+
+def test_paper_order_without_a_token_is_refused():
+    b, gk = broker()   # live=False, the default
+    s = staged(gk)
+    with pytest.raises(MissingApproval):
+        b.submit(s)
+    assert b.get_by_client_id("c1") is None
+
+
+def test_paper_order_with_a_token_outside_its_approved_bounds_is_refused():
+    b, gk = broker()
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    tok = approved_token(svc, qty=0.2)   # approved for 0.2 ...
+    s = staged(gk, qty=0.3)              # ... but 0.3 is what's actually staged
+    with pytest.raises(OrderMismatch):
+        b.submit(s, approval_token=tok)
+    assert b.get_by_client_id("c1") is None
 
 
 # ------------------------------------------------- live path requires a token
@@ -385,12 +444,21 @@ def test_live_sell_approved_for_the_correct_lot_still_consumes():
 
 def approved_token(svc, *, symbol="SPY", side="BUY", qty=0.2, order_type="LIMIT",
                    time_in_force="DAY", limit_price=500.0, lot_id=None,
-                   shown_delta=timedelta(seconds=15)):
+                   shown_delta=timedelta(seconds=15), now=T0,
+                   token_id="t1", request_id="r1"):
+    """`token_id`/`request_id` and `now` (require-a-token-in-paper unit,
+    2026-08-09) default to this file's original hardcoded "t1"/"r1"/T0 --
+    every pre-existing call site keeps its exact prior behaviour unchanged.
+    Both became necessary once submit() started requiring a token for every
+    order, not just a live one: a test staging TWO orders against the same
+    `svc` (e.g. a BUY then a SELL) needs two distinct tokens, and a test
+    whose own clock isn't T0 needs shown_at/now computed against ITS clock,
+    not a token that reads as already-expired or not-yet-displayed."""
     fp = order_fingerprint(symbol=symbol, side=side, qty=qty, order_type=order_type,
                            time_in_force=time_in_force, limit_price=limit_price,
                            lot_id=lot_id)
-    return svc.approve(token_id="t1", request_id="r1", fingerprint=fp,
-                       price_at_analysis=limit_price, shown_at=T0 - shown_delta, now=T0,
+    return svc.approve(token_id=token_id, request_id=request_id, fingerprint=fp,
+                       price_at_analysis=limit_price, shown_at=now - shown_delta, now=now,
                        symbol=symbol, side=side, qty=qty, order_type=order_type,
                        time_in_force=time_in_force, limit_price=limit_price, lot_id=lot_id)
 

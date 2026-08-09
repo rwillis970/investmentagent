@@ -11,12 +11,13 @@ file is not re-testing those, only what `AlpacaPaperAdapter` adds.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
 from agent.accounts import BrokerCredentials, CrossAccountError
+from agent.approval import ApprovalService, order_fingerprint
 from agent.broker.alpaca import (STATUS_MAP, AlpacaError, AlpacaPaperAdapter,
                                  AmbiguousOrderState, UnsupportedOrderShape)
 from agent.broker.base import (TERMINAL_ORDER_STATUSES, AccountSnapshot, BrokerOrder,
@@ -428,6 +429,38 @@ def _risk_policy():
                       min_settled_cash_pct_of_nlv=0.0, min_absolute_settled_cash=0.0)
 
 
+def approved_token(s, *, svc=None, now=None,
+                   shown_delta=timedelta(seconds=15),
+                   token_id="t1", request_id="r1"):
+    """Mints a token that exactly matches StagedOrder `s` -- every submit()
+    call in this file needs one now that the approval-token requirement
+    applies to paper adapters too, not just live ones (require-a-token-in-
+    paper unit, 2026-08-09; agent/broker/base.py's own `if self.is_live:`
+    gate around the token check is gone). Derived from the StagedOrder
+    itself, rather than re-specifying matching fields by hand, so the
+    fingerprint can never accidentally drift from what was actually
+    staged.
+
+    `now` defaults to a FRESH `datetime.now(timezone.utc)` read at call
+    time (never a fixed literal): `AlpacaPaperAdapter` -- unlike
+    `SimulatorBroker` elsewhere in this codebase's tests -- has no
+    injectable fake clock, so `submit()`'s own `self.clock()` call always
+    returns the real wall-clock instant. A token minted against a fixed
+    2026-07-20 literal expired the moment this test suite was run on any
+    later date (found running this fix on 2026-08-09)."""
+    now = now or datetime.now(timezone.utc)
+    svc = svc or ApprovalService(expiration=timedelta(minutes=30),
+                                 min_display=timedelta(seconds=10), max_per_day=4)
+    fp = order_fingerprint(symbol=s.symbol, side=s.side, qty=s.authorized_qty,
+                           order_type=s.order_type, time_in_force=s.time_in_force,
+                           limit_price=s.limit_price, lot_id=s.lot_id)
+    return svc.approve(token_id=token_id, request_id=request_id, fingerprint=fp,
+                       price_at_analysis=s.limit_price or 0.0, shown_at=now - shown_delta,
+                       now=now, symbol=s.symbol, side=s.side, qty=s.authorized_qty,
+                       order_type=s.order_type, time_in_force=s.time_in_force,
+                       limit_price=s.limit_price, lot_id=s.lot_id)
+
+
 def test_submit_checks_idempotency_first_before_any_post():
     t = ScriptedTransport()
     t.enqueue(200, order_json(client_order_id="c1", status="new"))  # get_by_client_id hit
@@ -435,7 +468,7 @@ def test_submit_checks_idempotency_first_before_any_post():
     a = adapter(t)
     a.attach_staging_key(gk.signing_key)
     staged = staged_order(gk)
-    order = a.submit(staged)
+    order = a.submit(staged, approval_token=approved_token(staged))
     assert order.client_order_id == "c1"
     # Only the one GET -- no POST at all, since it already existed.
     assert len(t.calls) == 1
@@ -450,7 +483,7 @@ def test_submit_posts_with_client_order_id_when_not_already_known():
     a = adapter(t)
     a.attach_staging_key(gk.signing_key)
     staged = staged_order(gk)
-    order = a.submit(staged)
+    order = a.submit(staged, approval_token=approved_token(staged))
     assert order.status == "filled"
     post_call = t.calls[1]
     assert post_call["method"] == "POST"
@@ -481,7 +514,7 @@ def test_submit_timeout_raises_ambiguous_order_state_not_a_retry():
     a.attach_staging_key(gk.signing_key)
     staged = staged_order(gk)
     with pytest.raises(AmbiguousOrderState, match="c1"):
-        a.submit(staged)
+        a.submit(staged, approval_token=approved_token(staged))
     # Exactly 2 calls -- the idempotency GET, and ONE POST attempt. A write
     # never retries, regardless of http_max_retries.
     assert len(t.calls) == 2
@@ -499,7 +532,7 @@ def test_submit_duplicate_422_resolves_via_get_by_client_id_not_raised():
     a = adapter(t)
     a.attach_staging_key(gk.signing_key)
     staged = staged_order(gk)
-    order = a.submit(staged)
+    order = a.submit(staged, approval_token=approved_token(staged))
     assert order.status == "filled"
 
 
@@ -513,7 +546,7 @@ def test_submit_genuine_422_with_no_resolvable_order_raises():
     a.attach_staging_key(gk.signing_key)
     staged = staged_order(gk)
     with pytest.raises(AlpacaError):
-        a.submit(staged)
+        a.submit(staged, approval_token=approved_token(staged))
 
 
 # ------------------------------------------------------------------ cancel()

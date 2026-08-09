@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent.approval import ApprovalService, TokenReissued, verify_modification_within_bounds
+from agent.approval import ApprovalService, verify_modification_within_bounds
 from agent.approval_bridge import ApprovalBridgeError, mint_approval_token
 from agent.approval_request_store import ApprovalRequestStore
 
@@ -107,12 +107,16 @@ def test_token_id_is_deterministic_from_request_id(tmp_path):
     assert tok.token_id == f"tok-{req.request_id}"
 
 
-def test_a_replayed_mint_hits_token_reissued_not_a_second_live_token(tmp_path):
+def test_a_replayed_mint_within_the_same_service_returns_the_same_token(tmp_path):
+    """Unit 2 (2026-08-09): a same-process replay no longer hits
+    `TokenReissued` -- it returns the ORIGINAL token, durably recorded by
+    the first call, rather than erroring on a benign retry."""
     store, req = make(tmp_path)
     svc = service()
-    mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT)
-    with pytest.raises(TokenReissued):
-        mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT)
+    first = mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT)
+    second = mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT)
+    assert second.token_id == first.token_id == f"tok-{req.request_id}"
+    assert second.order_fingerprint == first.order_fingerprint
 
 
 # ------------------------------------------------------------------ guards
@@ -372,3 +376,83 @@ def test_a_valid_modification_is_what_the_fingerprint_actually_binds(tmp_path):
                                     order_type="LIMIT", time_in_force="DAY",
                                     limit_price=99.0, lot_id=None)
     assert tok.order_fingerprint == expected_fp
+
+
+# ------------------------------------------------------- durable single mint
+# (Unit 2, 2026-08-09). `ApprovalService._tokens` is in-memory only -- the
+# real bug this unit closes only shows up across a FRESH `ApprovalService`
+# instance (a real process restart), not within one. See
+# `agent.approval_bridge`'s own "A DECIDED REQUEST MINTS EXACTLY ONE
+# SPENDABLE TOKEN" docstring section.
+
+def test_a_replayed_mint_across_a_restarted_service_does_not_mint_a_second_token(tmp_path):
+    """The literal bug this unit closes: before this fix, a fresh
+    `ApprovalService` instance (simulating a restart -- its own `_tokens`
+    dict starts empty) sailed straight past `TokenReissued` and minted a
+    second, fully independent, spendable `ApprovalToken` for an
+    already-approved request. The durable `token_snapshot`
+    (`ApprovalRequestStore.record_token_minted`) is what the SECOND
+    instance now consults instead."""
+    store, req = make(tmp_path)
+    svc1 = service()
+    first = mint_approval_token(req.request_id, store=store, service=svc1, now=DECIDE_AT)
+
+    svc2 = service()   # a fresh instance -- empty _tokens, as after a restart
+    second = mint_approval_token(req.request_id, store=store, service=svc2,
+                                 now=DECIDE_AT + timedelta(minutes=1))
+
+    assert second.token_id == first.token_id == f"tok-{req.request_id}"
+    assert second.order_fingerprint == first.order_fingerprint
+    assert second.original_qty == first.original_qty == pytest.approx(0.5)
+    # And svc2 itself never independently minted anything -- the durable
+    # snapshot was consulted before `ApprovalService.approve` was ever
+    # called a second time.
+    assert svc2.token_for_request(req.request_id) is None
+
+
+def test_a_consumed_token_is_not_re_mintable_within_the_same_service(tmp_path):
+    """Item 2, tested explicitly: consume the token that was actually
+    minted, then re-approve/re-mint -- the result must still be that same,
+    now-consumed token (spending it again raises `TokenConsumed`), never a
+    fresh, unconsumed, independently-spendable one."""
+    from agent.approval import TokenConsumed
+
+    store, req = make(tmp_path)
+    svc = service()
+    tok = mint_approval_token(req.request_id, store=store, service=svc, now=DECIDE_AT)
+    tok.consume(fingerprint=tok.order_fingerprint, price=100.0,
+               now=DECIDE_AT + timedelta(seconds=1))
+    assert tok.consumed_at is not None
+
+    replayed = mint_approval_token(req.request_id, store=store, service=svc,
+                                   now=DECIDE_AT + timedelta(seconds=2))
+    assert replayed is tok   # the SAME object -- svc.token_for_request found it
+    with pytest.raises(TokenConsumed):
+        replayed.consume(fingerprint=replayed.order_fingerprint, price=100.0,
+                         now=DECIDE_AT + timedelta(seconds=3))
+
+
+def test_disclosed_gap_a_reconstructed_token_after_a_restart_does_not_know_it_was_consumed(tmp_path):
+    """NOT a passing feature -- a documented, disclosed limitation (see
+    `agent.approval_bridge`'s own "CONSUMPTION IS STILL NOT DURABLE"
+    docstring section). `token_snapshot` is written once, at MINT time;
+    `ApprovalToken.consume()` mutates the in-memory object only and is
+    never persisted (closing that would thread a store dependency through
+    `consume()`, called from `agent.broker.base.BrokerAdapter.submit` --
+    the execution path, out of scope this unit). A token reconstructed from
+    the durable snapshot after a real restart therefore always reports
+    `consumed_at=None`, even if the original was already spent. This test
+    exists so the gap is visible, not silently assumed closed."""
+    store, req = make(tmp_path)
+    svc1 = service()
+    tok = mint_approval_token(req.request_id, store=store, service=svc1, now=DECIDE_AT)
+    tok.consume(fingerprint=tok.order_fingerprint, price=100.0,
+               now=DECIDE_AT + timedelta(seconds=1))
+    assert tok.consumed_at is not None   # truly consumed, in svc1's memory
+
+    svc2 = service()   # simulated restart -- svc1's mutation is gone with it
+    reconstructed = mint_approval_token(req.request_id, store=store, service=svc2,
+                                        now=DECIDE_AT + timedelta(minutes=1))
+    assert reconstructed.token_id == tok.token_id
+    # The gap: the reconstructed copy does NOT know it was already spent.
+    assert reconstructed.consumed_at is None

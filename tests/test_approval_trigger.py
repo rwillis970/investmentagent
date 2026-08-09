@@ -12,15 +12,16 @@ import pytest
 
 from agent.accounts import AccountType
 from agent.approval_request_store import ApprovalRequestStore
-from agent.approval_trigger import (ApprovalTriggerError,
-                                    request_approval_for_analysis)
+from agent.approval_trigger import (ApprovalTriggerError, MissingStagedOrder,
+                                    request_approval_for_analysis,
+                                    staged_order_from_snapshot)
 from agent.audit import AuditLog
 from agent.broker.base import AccountSnapshot, Position
 from agent.daytrade import DayTradeGuard
 from agent.entities import AnalysisResult, OpportunityEvent
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger import Fill, Ledger
-from agent.pipeline import Gatekeeper
+from agent.pipeline import Gatekeeper, StagedOrder, sign_staged_order
 from agent.policy import initial_policy
 from agent.risk import RiskPolicy
 
@@ -492,5 +493,114 @@ def test_insufficient_settled_cash_accounts_for_other_pending_earmarks_too(tmp_p
     result = call(s, tmp_path,
                  acct_snapshot=account_snapshot(equity=500.0, settled_cash=100.0))
     assert result.suppressed_reason == "insufficient_settled_cash"
+
+
+# --------------------------------------------- persist gate output (Unit 1,
+# require-a-token-in-paper unit's follow-on, 2026-08-09). Nothing durable
+# used to hold the actual StagedOrder Gatekeeper.stage() produced -- only a
+# handful of scalar fields. See agent/approval_trigger.py's own module
+# docstring addendum for why re-staging later is refused by design, not
+# merely unbuilt.
+
+def test_created_request_persists_every_staged_order_field(tmp_path):
+    """`proposal_snapshot["staged_order"]` must carry enough to reconstruct
+    the EXACT StagedOrder approved -- not just the seven fields
+    `verify_modification_within_bounds` inspects (symbol/side/qty/
+    order_type/time_in_force/limit_price/lot_id), but also account_id,
+    client_order_id, the notional figures, gates_passed, binding and the
+    signature -- everything a later verifier would need to prove this
+    wasn't tampered with or silently re-derived."""
+    s = store(tmp_path)
+    result = call(s, tmp_path)
+    persisted = result.request.proposal_snapshot["staged_order"]
+    staged = result.staged
+    assert persisted["account_id"] == staged.account_id
+    assert persisted["client_order_id"] == staged.client_order_id
+    assert persisted["symbol"] == staged.symbol
+    assert persisted["side"] == staged.side
+    assert persisted["requested_qty"] == staged.requested_qty
+    assert persisted["authorized_qty"] == staged.authorized_qty
+    assert persisted["order_type"] == staged.order_type
+    assert persisted["time_in_force"] == staged.time_in_force
+    assert persisted["limit_price"] == staged.limit_price
+    assert persisted["asset_class"] == staged.asset_class
+    assert persisted["funding"] == staged.funding
+    assert persisted["session"] == staged.session
+    assert persisted["requested_notional"] == staged.requested_notional
+    assert persisted["notional"] == staged.notional
+    assert persisted["gates_passed"] == list(staged.gates_passed)
+    assert persisted["binding"] == list(staged.binding)
+    assert persisted["signature"] == staged.signature
+    assert persisted["lot_id"] == staged.lot_id
+
+
+def test_created_request_top_level_scalars_are_unchanged(tmp_path):
+    """The pre-existing top-level fields (symbol, side, authorized_qty,
+    limit_price, lot_id, ...) that agent/approval_bridge.py and the
+    dashboard already read stay exactly as they were -- this is a pure
+    addition, not a restructuring. Every existing reader keeps working with
+    no changes of its own."""
+    s = store(tmp_path)
+    result = call(s, tmp_path)
+    snap = result.request.proposal_snapshot
+    assert snap["symbol"] == "AAPL"
+    assert snap["side"] == "BUY"
+    assert snap["authorized_qty"] == result.staged.authorized_qty
+    assert snap["order_type"] == result.staged.order_type
+    assert snap["time_in_force"] == result.staged.time_in_force
+    assert snap["limit_price"] == result.staged.limit_price
+    assert snap["lot_id"] == result.staged.lot_id
+
+
+def test_staged_order_from_snapshot_reconstructs_an_equal_staged_order(tmp_path):
+    s = store(tmp_path)
+    result = call(s, tmp_path)
+    reconstructed = staged_order_from_snapshot(result.request.proposal_snapshot)
+    assert reconstructed == result.staged
+
+
+def test_staged_order_from_snapshot_round_trips_a_real_lot_id():
+    """Exercised directly against the encode/decode helpers with a real
+    lot_id -- `request_approval_for_analysis`'s own CLOSE path always stages
+    with `lot_id=None` today (a separate, disclosed, pre-existing gap -- see
+    that function's own module docstring), so a genuine non-None lot_id is
+    never produced through the trigger itself. The persistence mechanism
+    must still round-trip one correctly for whenever it is."""
+    key = b"k" * 32
+    fields = dict(
+        account_id=ACCT, client_order_id="c1", symbol="AAPL", side="SELL",
+        requested_qty=1.0, authorized_qty=1.0, order_type="LIMIT",
+        time_in_force="DAY", limit_price=100.0, asset_class="US_EQUITY",
+        funding="SETTLED_CASH", session="REGULAR", requested_notional=100.0,
+        notional=100.0, gates_passed=("capability:universe", "risk"),
+        binding=("position_cap",), lot_id="l1",
+    )
+    staged = StagedOrder(**fields, signature=sign_staged_order(fields, key))
+    from agent.approval_trigger import _encode_staged_order
+    snapshot = {"staged_order": _encode_staged_order(staged)}
+    reconstructed = staged_order_from_snapshot(snapshot)
+    assert reconstructed == staged
+    assert reconstructed.lot_id == "l1"
+    assert reconstructed.binding == ("position_cap",)
+
+
+def test_staged_order_from_snapshot_fails_closed_on_a_pre_unit_1_record():
+    """A request created before this unit shipped has no `staged_order` key
+    at all. This MUST raise, never fall back to re-staging from current
+    conditions -- see MissingStagedOrder's own docstring for why."""
+    old_snapshot = {
+        "event_id": "sec_edgar:AAPL:2026-07-19T09:00:00+00:00", "symbol": "AAPL",
+        "side": "BUY", "requested_qty": 0.5, "authorized_qty": 0.5,
+        "order_type": "LIMIT", "time_in_force": "DAY", "limit_price": 100.0,
+        "lot_id": None, "confidence": 0.7, "analysis": {}, "model_id": "claude-sonnet-5",
+        "doc_sha256": "a" * 64, "analyzed_at": NOW.isoformat(),
+    }
+    with pytest.raises(MissingStagedOrder):
+        staged_order_from_snapshot(old_snapshot)
+
+
+def test_staged_order_from_snapshot_fails_closed_on_an_empty_snapshot():
+    with pytest.raises(MissingStagedOrder):
+        staged_order_from_snapshot({})
 
 

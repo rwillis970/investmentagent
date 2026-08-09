@@ -178,6 +178,55 @@ CYCLE -- named in the audit log (`approval_request_suppressed`, reason
 above: a screened, materially-worthy event that the risk/holding/day-trade
 gates refuse is not a bug, it is exactly those gates doing their job one
 step earlier than a human ever sees a card for it.
+
+PERSIST THE STAGED ORDER ITSELF, NOT JUST THE SCALARS AN OPERATOR READS
+(Unit 1, 2026-08-09). Before this unit, `proposal_snapshot` carried only
+the handful of scalar fields a human reads off the card (symbol, side,
+authorized_qty, order_type, time_in_force, limit_price, lot_id, plus the
+analysis metadata) -- nothing durable held the actual `StagedOrder`
+`Gatekeeper.stage` produced. Re-deriving one later by calling `stage()` a
+second time is refused by design, not merely unbuilt: portfolio state
+(cash, positions, other pending earmarks) moves between staging and any
+later verification, so a re-staged order can legitimately differ from the
+one an operator actually saw and approved -- verifying against a re-staged
+order would silently substitute a DIFFERENT order for the one approved.
+`_encode_staged_order`/`staged_order_from_snapshot` serialize/reconstruct
+every one of `StagedOrder`'s fields (including `gates_passed`/`binding`,
+stored as lists since JSON has no tuple) into/from a new top-level
+`proposal_snapshot["staged_order"]` key -- every pre-existing top-level
+scalar key is left exactly as it was, so `agent.approval_bridge.
+mint_approval_token` and `agent.dashboard_state` (both of which only ever
+read named top-level scalar keys) need no changes. A `proposal_snapshot`
+written before this unit shipped has no `"staged_order"` key at all;
+`staged_order_from_snapshot` raises `MissingStagedOrder` for it -- fails
+closed, never falls back to re-staging.
+
+`StagedOrder.signature` is persisted verbatim as part of this, but a
+signature checked with a DIFFERENT `Gatekeeper.signing_key` than the one
+that produced it will never verify: `signing_key` defaults to a fresh
+random value per `Gatekeeper` instance (`field(default_factory=lambda:
+secrets.token_bytes(32))`, see `agent.pipeline`'s own docstring). At the
+time this unit shipped, `scripts/run_agent.py` always took that default,
+and nothing in this codebase persisted the key anywhere -- so a later,
+separate process (an operator-invoked submit CLI, for instance) held a
+DIFFERENT signing key and could never reproduce the original HMAC. This
+paragraph originally concluded that whatever verifies a persisted
+`StagedOrder` later would have to compare its business-logic fields
+against freshly-gathered state rather than re-check `.signature` at all.
+
+SUPERSEDED (follow-up unit, 2026-08-09): that conclusion no longer holds.
+`scripts/run_agent.py` now resolves `signing_key` from a durable secret
+(`agent.secrets_provider.SecretsProvider.resolve`) instead of the random
+default, so two separately-constructed `Gatekeeper` instances that
+resolved the same secret produce and verify the SAME signature.
+`agent.approval_execution.execute_approved_request` now DOES re-check
+`.signature` against the caller's `gatekeeper.signing_key`, and refuses
+outright (`StagingSignatureInvalid`, a hard stop -- no fallback) rather
+than silently trusting an unverified order's fields. The real, still-open
+consequence is at the CUTOVER moment: any `proposal_snapshot["staged_order"]`
+signed before the durable key was provisioned carries a signature that can
+never verify against it, by construction -- see `agent.approval_execution`'s
+own module docstring for the full reasoning and the operator's remedy.
 """
 from __future__ import annotations
 
@@ -204,6 +253,54 @@ LONG_TERM_THRESHOLD_DAYS = 365
 
 class ApprovalTriggerError(Exception):
     pass
+
+
+class MissingStagedOrder(ApprovalTriggerError):
+    """Raised by `staged_order_from_snapshot` when `proposal_snapshot` has
+    no `"staged_order"` key -- a request created before Unit 1 (2026-08-09)
+    shipped. There is deliberately no fallback to re-staging: portfolio
+    state has moved since the original request was created, so a re-staged
+    order can legitimately differ from the one an operator actually saw.
+    Silently substituting a re-derived order for a missing persisted one
+    would defeat the entire point of persisting it -- this fails closed
+    instead."""
+
+
+_STAGED_ORDER_LIST_FIELDS = ("gates_passed", "binding")
+_STAGED_ORDER_FIELDS = (
+    "account_id", "client_order_id", "symbol", "side", "requested_qty",
+    "authorized_qty", "order_type", "time_in_force", "limit_price",
+    "asset_class", "funding", "session", "requested_notional", "notional",
+    "gates_passed", "binding", "signature", "lot_id",
+)
+
+
+def _encode_staged_order(staged: StagedOrder) -> dict:
+    """Every `StagedOrder` field, verbatim -- enough to reconstruct the
+    EXACT order `Gatekeeper.stage` produced, not just the seven fields
+    `agent.approval.verify_modification_within_bounds` inspects. Tuple
+    fields (`gates_passed`, `binding`) become lists; JSON has no tuple."""
+    encoded = {name: getattr(staged, name) for name in _STAGED_ORDER_FIELDS}
+    for name in _STAGED_ORDER_LIST_FIELDS:
+        encoded[name] = list(encoded[name])
+    return encoded
+
+
+def staged_order_from_snapshot(proposal_snapshot: dict) -> StagedOrder:
+    """Reconstructs the persisted `StagedOrder` from a request's
+    `proposal_snapshot`. Raises `MissingStagedOrder` -- never re-stages --
+    when the key is absent (see that exception's own docstring)."""
+    encoded = proposal_snapshot.get("staged_order")
+    if encoded is None:
+        raise MissingStagedOrder(
+            "proposal_snapshot has no 'staged_order' key -- this request "
+            "predates Unit 1 (2026-08-09) and cannot be reconstructed; "
+            "re-staging is refused by design, not merely unbuilt"
+        )
+    fields = dict(encoded)
+    for name in _STAGED_ORDER_LIST_FIELDS:
+        fields[name] = tuple(fields[name])
+    return StagedOrder(**fields)
 
 
 @dataclass(frozen=True)
@@ -535,6 +632,7 @@ def request_approval_for_analysis(
         "confidence": analysis_result.confidence, "analysis": analysis_result.analysis,
         "model_id": analysis_result.model_id, "doc_sha256": analysis_result.doc_sha256,
         "analyzed_at": analysis_result.analyzed_at.isoformat(),
+        "staged_order": _encode_staged_order(staged),
     }
     risk_result = {
         "gates_passed": list(staged.gates_passed), "binding": list(staged.binding),

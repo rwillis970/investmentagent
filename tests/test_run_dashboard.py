@@ -34,7 +34,8 @@ def test_filenames_match_run_agents_own_defaults_for_the_same_four_stores(tmp_pa
     dashboard_args = _parse_args(["--config", "c.json", "--data-dir", str(data_dir)])
     agent_args = run_agent_module._parse_args([
         "--config", "c.json", "--account-id", "a", "--key-id", "k",
-        "--secret-ref", "r", "--data-dir", str(data_dir),
+        "--secret-ref", "r", "--signing-key-secret-ref", "sk",
+        "--data-dir", str(data_dir),
     ])
     assert dashboard_args.cost_ledger_path == agent_args.cost_ledger_path
     assert dashboard_args.approval_request_store_path == agent_args.approval_request_store_path

@@ -148,10 +148,62 @@ consumed/expired/swept) -- currently "sees" it as outstanding. See
 `ApprovalRequestStore.outstanding_earmarks`'s own updated docstring (same
 commit) for the mechanics. This bridge's only relevant obligation is that
 it never itself consumes or sweeps the token -- minting is not spending.
+
+A DECIDED REQUEST MINTS EXACTLY ONE SPENDABLE TOKEN, DURABLY (Unit 2,
+2026-08-09). Before this unit, `ApprovalService.approve`'s deterministic
+`token_id` (`f"tok-{request_id}"`) plus its `TokenReissued` guard only
+protected a SECOND mint attempt within the SAME `ApprovalService`
+instance -- its `_tokens` dict is in-memory only. A fresh instance (a real
+process restart; trivially, a second instance in a test) starts with an
+empty dict, so a second call to this function for the same, already-
+approved request_id would sail past `TokenReissued` entirely and mint a
+second, fully independent `ApprovalToken` object -- unrelated to the
+first, with its own `consumed_at=None` regardless of whether the first was
+already spent. This function now checks `request.token_snapshot`
+(`ApprovalRequestStore.record_token_minted`, durable, checked BEFORE ever
+calling `service.approve()` again) and, if present, reconstructs and
+returns THAT token verbatim -- no new mint, no re-validation of
+`qty_override`/`limit_price_override` (a replay returns the ORIGINAL
+decision, exactly as `agent.dashboard_decisions.approve`'s own "already
+APPROVED" branch already does one layer up), regardless of how many
+processes or `ApprovalService` instances have come and gone since the
+original mint.
+
+WHY "RETURN THE EXISTING TOKEN," NOT "REFUSE OUTRIGHT" (Unit 2 item 1's
+explicit design choice). Refusing a second mint attempt outright would
+strand the genuine retry case (item 3): a caller that already decided the
+request but never learned whether the FIRST mint attempt succeeded (lost
+response, process died between `service.approve()` returning and its
+caller persisting anything -- see below) would have no way forward except
+a brand new human decision, and `ApprovalRequestStore.decide()` already
+permanently refuses to re-decide a request that is APPROVED. Returning the
+existing token instead makes the retry resolvable by the ORIGINAL caller
+retrying the SAME call, no new approval required.
+
+CONSUMPTION IS STILL NOT DURABLE -- A DISCLOSED, UNCLOSED GAP. This unit
+persists the token's MINT-time material (`_encode_token` below) -- never
+its `consumed_at`/`swept_at`, because those are set later by `agent.
+approval.ApprovalToken.consume()`, called from `agent.broker.base.
+BrokerAdapter.submit()` (the execution path, out of scope this unit: see
+Unit 2's own instructions). A token reconstructed from `token_snapshot`
+after a real process restart therefore always reports `consumed_at=None`
+and `swept_at=None`, even if the ORIGINAL in-memory token object was
+already consumed before the restart. Within one process, this is not
+reachable -- `ApprovalService.token_for_request` (checked by `agent.
+dashboard_decisions.approve` before this bridge is ever called) already
+returns the SAME, still-mutated object, so a consumed token's true state
+is visible there. ACROSS a restart, nothing in this codebase durably
+records that a token was spent, independent of whether an order resulted
+-- closing that requires threading persistence through `consume()` itself,
+which this unit does not do. See this unit's own delivery report for why
+that is deliberately left for whatever unit next touches the execution
+path (also review `_submit_impl`'s own idempotency-by-client_order_id
+promise, which is the one existing durable defense against a double-
+consumed reconstructed token producing a double-submitted order today).
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .approval import ApprovalService, ApprovalToken, order_fingerprint
 from .approval_request_store import ApprovalRequestStore
@@ -238,6 +290,57 @@ def _validate_modification(proposal: dict, *, qty_override: float | None,
                 )
 
 
+_TOKEN_FIELDS = (
+    "token_id", "request_id", "order_fingerprint", "price_band", "expires_at",
+    "decided_at", "decision_elapsed_ms", "original_symbol", "original_side",
+    "original_qty", "original_order_type", "original_time_in_force",
+    "original_limit_price", "original_lot_id", "shown_at", "min_display",
+    "consumed_at", "swept_at",
+)
+
+
+def _encode_token(token: ApprovalToken) -> dict:
+    """Every mint-time `ApprovalToken` field, verbatim -- see this module's
+    own "A DECIDED REQUEST MINTS EXACTLY ONE SPENDABLE TOKEN" docstring
+    section for why. `consumed_at`/`swept_at` are always `None` at the
+    instant this is called (a token is encoded immediately after `service.
+    approve()` mints it, before anything could have consumed or swept it) --
+    encoded anyway, verbatim, rather than hardcoded, so this function has
+    exactly one job (serialize whatever the token says) and no implicit
+    assumption about when it runs."""
+    encoded = {name: getattr(token, name) for name in _TOKEN_FIELDS}
+    encoded["price_band"] = list(encoded["price_band"])
+    encoded["expires_at"] = encoded["expires_at"].isoformat()
+    encoded["decided_at"] = encoded["decided_at"].isoformat()
+    encoded["shown_at"] = encoded["shown_at"].isoformat() if encoded["shown_at"] else None
+    encoded["min_display"] = (encoded["min_display"].total_seconds()
+                              if encoded["min_display"] is not None else None)
+    encoded["consumed_at"] = encoded["consumed_at"].isoformat() if encoded["consumed_at"] else None
+    encoded["swept_at"] = encoded["swept_at"].isoformat() if encoded["swept_at"] else None
+    return encoded
+
+
+def _token_from_snapshot(snapshot: dict) -> ApprovalToken:
+    """Reconstructs the token exactly as it was at MINT time -- see this
+    module's own "CONSUMPTION IS STILL NOT DURABLE" docstring section for
+    why `consumed_at`/`swept_at` reconstruct as whatever was in the
+    snapshot (always `None`, today) rather than reflecting any consumption
+    that happened to the original in-memory object after mint."""
+    fields = dict(snapshot)
+    fields["price_band"] = tuple(fields["price_band"])
+    fields["expires_at"] = datetime.fromisoformat(fields["expires_at"])
+    fields["decided_at"] = datetime.fromisoformat(fields["decided_at"])
+    fields["shown_at"] = (datetime.fromisoformat(fields["shown_at"])
+                          if fields["shown_at"] else None)
+    fields["min_display"] = (timedelta(seconds=fields["min_display"])
+                             if fields["min_display"] is not None else None)
+    fields["consumed_at"] = (datetime.fromisoformat(fields["consumed_at"])
+                             if fields["consumed_at"] else None)
+    fields["swept_at"] = (datetime.fromisoformat(fields["swept_at"])
+                          if fields["swept_at"] else None)
+    return ApprovalToken(**fields)
+
+
 def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
                         service: ApprovalService, now: datetime,
                         audit_log: AuditLog | None = None,
@@ -269,6 +372,34 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
             f"request {request_id} was invalidated "
             f"({request.invalidated_reason}); refusing to mint a token"
         )
+
+    # DURABLE REPLAY (Unit 2, 2026-08-09): a token was already minted for
+    # this request -- possibly by a DIFFERENT `ApprovalService` instance
+    # (a real restart; see module docstring's "A DECIDED REQUEST MINTS
+    # EXACTLY ONE SPENDABLE TOKEN" section). Return it verbatim. Checked
+    # BEFORE the request's own `expires_at` deliberately: a request's
+    # expiry governs whether a NEW decision may still act on it, not
+    # whether an ALREADY-minted token may still be handed back to whoever
+    # is asking for it again -- the token carries its own, independent
+    # `expires_at`, unaffected by this. No re-validation of `qty_override`/
+    # `limit_price_override` against a replay -- this returns the ORIGINAL
+    # decision, exactly as `agent.dashboard_decisions.approve`'s own
+    # "already APPROVED" branch already does for its own in-memory fast
+    # path one layer up.
+    #
+    # THE IN-MEMORY OBJECT FIRST, WHEN THIS `service` STILL HOLDS IT -- only
+    # falling back to reconstructing from the durable snapshot when it does
+    # not (a fresh instance; see module docstring's "CONSUMPTION IS STILL
+    # NOT DURABLE" section). Checking the durable snapshot FIRST, unconditionally,
+    # would silently discard any consumption that happened to THIS SAME
+    # process's own live token object -- reconstructing a fresh copy with
+    # `consumed_at=None` even when `service` itself knows better.
+    live = service.token_for_request(request_id)
+    if live is not None:
+        return live
+    if request.token_snapshot is not None:
+        return _token_from_snapshot(request.token_snapshot)
+
     if now >= request.expires_at:
         raise ApprovalBridgeError(
             f"request {request_id} expired at {request.expires_at.isoformat()}; "
@@ -318,7 +449,7 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
         time_in_force=proposal["time_in_force"],
         limit_price=final_limit_price, lot_id=proposal.get("lot_id"),
     )
-    return service.approve(
+    tok = service.approve(
         token_id=token_id, request_id=request_id, fingerprint=fingerprint,
         price_at_analysis=request.price_at_analysis, shown_at=request.shown_at,
         now=now, symbol=proposal["symbol"], side=proposal["side"],
@@ -329,3 +460,9 @@ def mint_approval_token(request_id: str, *, store: ApprovalRequestStore,
         price_band_low=request.price_band_low, price_band_high=request.price_band_high,
         audit_log=audit_log,
     )
+    # DURABLE, IMMEDIATELY (Unit 2): persisted before this function returns,
+    # so the VERY NEXT call for this request_id -- same process or a fresh
+    # one -- finds it via the `request.token_snapshot` check above instead
+    # of reaching `service.approve()` a second time.
+    store.record_token_minted(request_id, token_snapshot=_encode_token(tok), now=now)
+    return tok

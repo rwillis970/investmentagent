@@ -168,9 +168,11 @@ CREATE TABLE agent."order" (
   avg_fill_price    NUMERIC(14,4),
   fees              NUMERIC(12,4) NOT NULL DEFAULT 0,
   submitted_at      TIMESTAMPTZ,
-  -- §12 criterion 13: a live order must carry a token.
-  CONSTRAINT live_orders_require_a_token
-    CHECK (environment = 'PAPER' OR token_id IS NOT NULL)
+  -- §12 criterion 13: every order must carry a token, paper and live alike
+  -- (require-a-token-in-paper unit, 2026-08-09 -- this used to read
+  -- `environment = 'PAPER' OR token_id IS NOT NULL`, exempting paper).
+  CONSTRAINT orders_require_a_token
+    CHECK (token_id IS NOT NULL)
 );
 
 CREATE TABLE agent.position_lot (

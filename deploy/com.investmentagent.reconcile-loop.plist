@@ -9,9 +9,11 @@
 
   Every /REPLACE/... value below is a placeholder. Fill them in for your
   own machine before loading this job; do not put a raw secret anywhere in
-  this file. secret-ref is a keychain account name, resolved by
-  agent.secrets_provider.KeychainSecretsProvider at the point of use, never
-  a value that belongs here.
+  this file. secret-ref (and, follow-up unit 2026-08-09, signing-key-secret-
+  ref) are keychain account names, resolved by agent.secrets_provider.
+  KeychainSecretsProvider at the point of use, never a value that belongs
+  here. See deploy/README.md for the one-time command that provisions the
+  signing-key-secret-ref entry itself (this codebase never writes it).
 
   THE DATA DIR FLAG, NOT ELEVEN SEPARATE STORE PATH FLAGS (launchd deploy
   broken follow up, 2026-08-03). This template used to enumerate every
@@ -44,6 +46,8 @@
         <string>REPLACE_WITH_ALPACA_PAPER_KEY_ID</string>
         <string>--secret-ref</string>
         <string>REPLACE_WITH_KEYCHAIN_SECRET_REF</string>
+        <string>--signing-key-secret-ref</string>
+        <string>REPLACE_WITH_SIGNING_KEY_SECRET_REF</string>
         <string>--data-dir</string>
         <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state</string>
         <string>--account-type</string>

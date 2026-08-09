@@ -23,14 +23,15 @@ of Days 6–10). Zero third-party dependencies so it runs immediately:
 | `agent/entities.py` | §9.1 | Runtime entities, kept in step with the SQL by test |
 | `agent/broker/base.py` | §1.2, §5.1 | The swap seam. Gate 4 + token consumption live here |
 | `agent/broker/simulator.py` | Day 8 | Paper broker with T+1 settlement |
-| `migrations/001_init.sql` | §9.1 | Schema, incl. a CHECK that live orders carry a token |
+| `migrations/001_init.sql` | §9.1 | Schema, incl. a CHECK that every order carries a token |
 
 Two design points worth knowing before you extend it:
 
 * **Gate 4 is in `BrokerAdapter.submit`, not in each adapter.** Concrete adapters
   implement `_submit_impl`, which is only reached after the capability check has
-  passed and — in live mode — after an approval token has been consumed. A new
-  adapter inherits the backstop instead of having to remember it.
+  passed and — paper and live alike — after an approval token has been
+  consumed. A new adapter inherits the backstop instead of having to remember
+  it.
 * **`agent/pipeline.py` is the only place that composes gates.** Nothing else
   should assemble its own sequence of checks; that is how a gate goes missing.
 

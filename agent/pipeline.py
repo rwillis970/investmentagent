@@ -9,9 +9,10 @@ unit test. Nothing else in the codebase should assemble these checks itself.
       -> risk_constrain (capability gate 2, position cap, sector cap, reserve)
       -> capability (pre-submit) -> signed StagedOrder
 
-A StagedOrder is not an order. It still requires an approval token in live
-mode, and `BrokerAdapter.submit` re-checks capability at gate 4 before
-submission — independently, not by trusting this module's signature.
+A StagedOrder is not an order. It still requires an approval token to submit
+— paper and live alike (§12 criterion 13; require-a-token-in-paper unit,
+2026-08-09) — and `BrokerAdapter.submit` re-checks capability at gate 4
+before submission — independently, not by trusting this module's signature.
 
 WHY risk_constrain AND NOT AN INLINE CHECK. §6.1/§1's invariant is that risk
 is applied to the *target weight vector*, never per order after the fact.
@@ -177,9 +178,18 @@ class Gatekeeper:
     risk_policy: RiskPolicy
     day_trade_guard: DayTradeGuard
     live: bool = False
-    # One random key per Gatekeeper instance (per process, in the pilot's
-    # single-process deployment). The matching adapter is wired to the same
-    # key via `attach_staging_key` — see broker/base.py.
+    # Defaults to one random key per Gatekeeper instance -- fine for a
+    # caller (a test, an ad hoc script) that only ever verifies against the
+    # SAME instance that signed. Production (`scripts/run_agent.py`) passes
+    # this explicitly instead: a DURABLE key resolved via
+    # `agent.secrets_provider.SecretsProvider.resolve` (see that script's
+    # own `_resolve_gatekeeper_signing_key`), so a StagedOrder signed by one
+    # process verifies in a later, separately-constructed Gatekeeper that
+    # resolved the same secret -- see `agent.approval_execution`'s own
+    # module docstring for why this matters (verify the persisted
+    # signature, never re-derive or re-sign it). The matching adapter is
+    # wired to whichever key this instance ends up holding via
+    # `attach_staging_key` — see broker/base.py.
     signing_key: bytes = field(default_factory=lambda: secrets.token_bytes(32),
                                repr=False)
 

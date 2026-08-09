@@ -48,6 +48,26 @@ replace every `/REPLACE/...` value:
   Add it first with `agent.secrets_provider.KeychainSecretsProvider`'s own
   setup, or the macOS `Keychain Access` app / `security add-generic-password`
   directly.
+- `--signing-key-secret-ref` (follow-up unit, 2026-08-09): the keychain
+  **account name** the durable `agent.pipeline.Gatekeeper` signing key is
+  stored under -- a 32+ byte value, hex-encoded, never a raw secret. This
+  is what lets a `StagedOrder` signed by the scheduled loop actually verify
+  later, when `--submit-approved` runs as a separate process invocation
+  (see `agent/approval_execution.py`'s own module docstring for why that
+  matters). Provision it once per mode, before loading this job for the
+  first time:
+
+  ```
+  python3 -c "import secrets; print(secrets.token_bytes(32).hex())"
+  security add-generic-password -s investmentagent:PAPER \
+      -a <the --signing-key-secret-ref value> -w <the printed hex string>
+  ```
+
+  Provisioning a NEW value after orders have already been staged means
+  every request staged under the old key can never verify again -- see
+  that same module docstring's CUTOVER section for the operator remedy
+  (`ApprovalRequestStore.invalidate` on anything still DECIDED but not yet
+  submitted; anything still PENDING is unaffected).
 - `--data-dir`: an absolute path to the `state/` directory created in
   step 1. Every durable store/log file `scripts/run_agent.py` needs
   (ledger, quarantine, cash-quarantine, fact store, cost ledger,

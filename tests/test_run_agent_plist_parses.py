@@ -37,6 +37,7 @@ _PLACEHOLDER_SUBSTITUTIONS = {
     "REPLACE_WITH_ACCOUNT_ID": "acct-real",
     "REPLACE_WITH_ALPACA_PAPER_KEY_ID": "key-real",
     "REPLACE_WITH_KEYCHAIN_SECRET_REF": "alpaca_secret_key",
+    "REPLACE_WITH_SIGNING_KEY_SECRET_REF": "gatekeeper_signing_key",
 }
 
 
@@ -67,6 +68,7 @@ def test_the_checked_in_templates_program_arguments_parse_against_the_real_parse
     assert args.account_id == "acct-real"
     assert args.key_id == "key-real"
     assert args.secret_ref == "alpaca_secret_key"
+    assert args.signing_key_secret_ref == "gatekeeper_signing_key"
     assert args.account_type == "TAXABLE"
 
 

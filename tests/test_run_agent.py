@@ -10,6 +10,7 @@ alpaca_probe.py's own test file's approach.
 from __future__ import annotations
 
 import logging
+import secrets as secrets_module
 from datetime import datetime, timedelta, timezone
 
 from agent import config as config_module
@@ -33,6 +34,25 @@ def base_config(**over):
     raw = json.loads((pathlib.Path(__file__).parent.parent / "config.example.json").read_text())
     raw.update(over)
     return raw
+
+
+# DURABLE SIGNING KEY (follow-up unit, 2026-08-09). `--signing-key-secret-ref`
+# is now a required flag everywhere `--key-id`/`--secret-ref` are required --
+# see scripts/run_agent.py's own `_resolve_gatekeeper_signing_key`. A FIXED
+# hex value, reused by every `InMemorySecretsProvider` this file constructs
+# (via `_secrets_provider_factory`, not a fresh random value per call): real
+# code resolves the SAME durable value across separate process invocations
+# (the point of this whole follow-up unit), and the idempotency test below
+# depends on two separate `main()` calls resolving the identical key.
+SIGNING_KEY_SECRET_REF = "gatekeeper-signing-key"
+SIGNING_KEY_BYTES = secrets_module.token_bytes(32)
+SIGNING_KEY_HEX = SIGNING_KEY_BYTES.hex()
+
+
+def _secrets_provider_factory(mode):
+    sp = InMemorySecretsProvider(mode=mode)
+    sp.put(SIGNING_KEY_SECRET_REF, SIGNING_KEY_HEX)
+    return sp
 
 
 def test_build_account_runtime_derives_the_holding_policy_from_config(tmp_path):
@@ -64,6 +84,7 @@ def test_main_returns_nonzero_and_logs_when_the_loop_raises(tmp_path, caplog):
     argv = [
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
@@ -79,7 +100,7 @@ def test_main_returns_nonzero_and_logs_when_the_loop_raises(tmp_path, caplog):
     with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
         code = main(
             argv, run_loop_fn=failing_run_loop,
-            secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+            secrets_provider_factory=_secrets_provider_factory,
         )
     assert code == 1
     assert any("boom" in r.message for r in caplog.records)
@@ -98,6 +119,7 @@ def test_main_calls_run_loop_with_the_configured_cadence_and_mode(tmp_path):
     argv = [
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
@@ -112,7 +134,7 @@ def test_main_calls_run_loop_with_the_configured_cadence_and_mode(tmp_path):
     ]
     code = main(
         argv, run_loop_fn=fake_run_loop,
-        secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+        secrets_provider_factory=_secrets_provider_factory,
     )
     assert code == 0
     assert captured["cadence_seconds"] == 42
@@ -162,6 +184,7 @@ def test_build_pipeline_runtime_the_money_guardrail_defaults_are_off(tmp_path):
         cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
         account_type=AccountType.TAXABLE, audit_log=AuditLog(),
         approval_service=approval_service,
+        signing_key=SIGNING_KEY_BYTES,
         fact_store_path=tmp_path / "facts.jsonl",
         cost_ledger_path=tmp_path / "cost_ledger.jsonl",
         extraction_cache_path=tmp_path / "extraction_cache.jsonl",
@@ -209,6 +232,7 @@ def test_build_pipeline_runtime_constructs_a_real_anthropic_client_only_when_t4_
         cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
         account_type=AccountType.TAXABLE, audit_log=AuditLog(),
         approval_service=approval_service,
+        signing_key=SIGNING_KEY_BYTES,
         fact_store_path=tmp_path / "facts.jsonl",
         cost_ledger_path=tmp_path / "cost_ledger.jsonl",
         extraction_cache_path=tmp_path / "extraction_cache.jsonl",
@@ -241,6 +265,7 @@ def test_build_pipeline_runtime_price_band_and_expiration_come_from_the_approval
         cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
         account_type=AccountType.TAXABLE, audit_log=AuditLog(),
         approval_service=approval_service,
+        signing_key=SIGNING_KEY_BYTES,
         fact_store_path=tmp_path / "facts.jsonl",
         cost_ledger_path=tmp_path / "cost_ledger.jsonl",
         extraction_cache_path=tmp_path / "extraction_cache.jsonl",
@@ -282,6 +307,7 @@ def test_build_pipeline_runtime_threads_the_real_approval_service_through(tmp_pa
         cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
         account_type=AccountType.TAXABLE, audit_log=AuditLog(),
         approval_service=approval_service,
+        signing_key=SIGNING_KEY_BYTES,
         fact_store_path=tmp_path / "facts.jsonl",
         cost_ledger_path=tmp_path / "cost_ledger.jsonl",
         extraction_cache_path=tmp_path / "extraction_cache.jsonl",
@@ -311,6 +337,7 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
     argv = [
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
@@ -324,7 +351,7 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
         "--audit-log-path", str(audit_path),
     ]
     code = main(argv, run_loop_fn=appending_run_loop,
-               secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode))
+               secrets_provider_factory=_secrets_provider_factory)
     assert code == 0
 
     captured = {}
@@ -333,7 +360,7 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
         captured.update(kwargs)
 
     main(argv, run_loop_fn=inspecting_run_loop,
-        secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode))
+        secrets_provider_factory=_secrets_provider_factory)
     reloaded = captured["audit_log"]
     assert len(reloaded) == 1
     assert reloaded.events[0].action == "test_event"
@@ -346,6 +373,7 @@ def _argv(tmp_path, config_path):
     return [
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
@@ -370,7 +398,7 @@ def test_a_single_failure_does_not_notify(tmp_path):
     notified = []
     code = main(
         _argv(tmp_path, config_path), run_loop_fn=failing_run_loop,
-        secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+        secrets_provider_factory=_secrets_provider_factory,
         notify_fn=notified.append,
     )
     assert code == 1
@@ -392,7 +420,7 @@ def test_the_same_failure_recurring_three_times_notifies_on_the_third(tmp_path):
     for _ in range(3):
         code = main(
             _argv(tmp_path, config_path), run_loop_fn=failing_run_loop,
-            secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+            secrets_provider_factory=_secrets_provider_factory,
             notify_fn=notified.append,
         )
         assert code == 1
@@ -417,7 +445,7 @@ def test_a_different_exception_type_each_time_never_notifies(tmp_path):
 
         code = main(
             _argv(tmp_path, config_path), run_loop_fn=make_failing_run_loop(exc_type),
-            secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+            secrets_provider_factory=_secrets_provider_factory,
             notify_fn=notified.append,
         )
         assert code == 1
@@ -443,7 +471,7 @@ def test_the_same_exception_type_recurring_with_a_varying_message_still_notifies
 
         code = main(
             _argv(tmp_path, config_path), run_loop_fn=make_failing_run_loop(cash),
-            secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+            secrets_provider_factory=_secrets_provider_factory,
             notify_fn=notified.append,
         )
         assert code == 1
@@ -464,6 +492,7 @@ def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
     argv = [
         "--config", str(config_path),
         "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
@@ -477,7 +506,7 @@ def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
         "--audit-log-path", str(audit_path),
     ]
     main(argv, run_loop_fn=failing_run_loop,
-        secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+        secrets_provider_factory=_secrets_provider_factory,
         notify_fn=lambda msg: None)
     assert (audit_path.parent / "failure_sentinel.json").exists()
 
@@ -496,7 +525,7 @@ def test_a_raising_notify_fn_does_not_change_the_exit_code_or_propagate(tmp_path
     for _ in range(3):
         code = main(
             _argv(tmp_path, config_path), run_loop_fn=failing_run_loop,
-            secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+            secrets_provider_factory=_secrets_provider_factory,
             notify_fn=bad_notify,
         )
     assert code == 1
@@ -1130,6 +1159,7 @@ def test_data_dir_defaults_every_missing_store_path_to_a_named_file_inside_it(tm
     data_dir = tmp_path / "data"
     args = _parse_args([
         "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--data-dir", str(data_dir),
     ])
     assert args.fact_store_path == str(data_dir / "facts.jsonl")
@@ -1154,6 +1184,7 @@ def test_data_dir_default_is_resolved_to_an_absolute_path(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     args = _parse_args([
         "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
     ])
     assert args.data_dir == str(tmp_path / "data")
 
@@ -1164,6 +1195,7 @@ def test_data_dir_explicit_relative_value_is_also_resolved_to_absolute(tmp_path,
     monkeypatch.chdir(tmp_path)
     args = _parse_args([
         "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--data-dir", "relative_data",
     ])
     assert Path(args.data_dir).is_absolute()
@@ -1180,6 +1212,7 @@ def test_explicit_store_path_overrides_are_untouched_by_data_dir_defaulting(tmp_
     explicit = tmp_path / "custom" / "ledger.jsonl"
     args = _parse_args([
         "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--ledger-store-path", str(explicit),
     ])
     assert args.ledger_store_path == str(explicit)
@@ -1194,6 +1227,7 @@ def test_data_dir_is_never_created_when_every_store_path_is_given_explicitly(tmp
     monkeypatch.chdir(tmp_path)
     _parse_args([
         "--config", "c.json", "--account-id", "a", "--key-id", "k", "--secret-ref", "r",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--cash-quarantine-store-path", str(tmp_path / "cq.jsonl"),
@@ -1209,14 +1243,16 @@ def test_data_dir_is_never_created_when_every_store_path_is_given_explicitly(tmp
     assert not (tmp_path / "data").exists()
 
 
-def test_bare_invocation_with_only_the_four_identity_flags_parses_and_starts(tmp_path, monkeypatch):
+def test_bare_invocation_with_only_the_five_identity_flags_parses_and_starts(tmp_path, monkeypatch):
     """The exact contract item 1 of the follow-up demands: `python3
     scripts/run_agent.py --config config.json --account-id X --key-id Y
-    --secret-ref Z` with NO path flags at all must parse AND start -- not
-    merely survive argparse. Runs main() for real (with run_loop_fn/
-    secrets_provider_factory injected, per this file's own convention) to
-    prove every store actually constructs, not just that _parse_args
-    returns."""
+    --secret-ref Z --signing-key-secret-ref W` with NO path flags at all
+    must parse AND start -- not merely survive argparse (a fifth required
+    flag, `--signing-key-secret-ref`, joined the other four this same
+    follow-up unit -- see scripts/run_agent.py's own module docstring).
+    Runs main() for real (with run_loop_fn/secrets_provider_factory
+    injected, per this file's own convention) to prove every store
+    actually constructs, not just that _parse_args returns."""
     import json as json_module
     config_path = tmp_path / "config.json"
     config_path.write_text(json_module.dumps(base_config()))
@@ -1229,9 +1265,10 @@ def test_bare_invocation_with_only_the_four_identity_flags_parses_and_starts(tmp
 
     code = main(
         ["--config", str(config_path), "--account-id", "acct-a",
-        "--key-id", "k", "--secret-ref", "ref"],
+        "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF],
         run_loop_fn=fake_run_loop,
-        secrets_provider_factory=lambda mode: InMemorySecretsProvider(mode=mode),
+        secrets_provider_factory=_secrets_provider_factory,
     )
     assert code == 0
     assert (tmp_path / "data").is_dir()
@@ -1246,3 +1283,237 @@ def test_missing_account_flags_without_advance_mode_still_errors_with_data_dir_p
     with pytest.raises(SystemExit) as exc_info:
         main(["--data-dir", str(tmp_path / "data")])
     assert exc_info.value.code == 2
+
+
+# ------------------------------------------------------- --submit-approved
+# (Unit 3, 2026-08-09). No real network/broker is available in this
+# sandbox -- `scripts.run_agent.AlpacaPaperAdapter` is monkeypatched to a
+# factory that returns a real `agent.broker.simulator.SimulatorBroker`
+# instead, exactly the fake-broker posture `agent.approval_execution`'s own
+# tests already use. See that module's docstring and agent/approval_
+# execution.py's own for the full reasoning this CLI flag is a thin wrapper
+# around.
+
+from decimal import Decimal
+
+import pytest
+
+from agent.accounts import AccountType
+from agent.approval_request_store import ApprovalRequestStore
+from agent.approval_trigger import request_approval_for_analysis
+from agent.broker.base import AccountSnapshot
+from agent.broker.simulator import SimulatorBroker
+from agent.daytrade import DayTradeGuard
+from agent.entities import AnalysisResult, OpportunityEvent
+from agent.ledger import Ledger
+from agent.pipeline import Gatekeeper
+from agent.policy import initial_policy
+from agent.risk import RiskPolicy
+
+_SA_ACCT = "acct-taxable"
+_SA_NOW = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)   # confirmed real trading Monday
+_SA_DECIDE_AT = _SA_NOW + timedelta(seconds=15)
+_SA_SUBMIT_AT = _SA_DECIDE_AT + timedelta(seconds=3)   # past min_display (10s from shown_at),
+# and within mint_approval_token's own 5000ms shown_at-drift tolerance of decide_at
+
+
+def _submit_approved_request(tmp_path, *, price=100.0, max_position_pct=10.0):
+    # signing_key=SIGNING_KEY_BYTES -- the SAME durable key
+    # `_secrets_provider_factory`/`SIGNING_KEY_HEX` supplies, so this stands
+    # in for the scheduled loop's own process, which will have staged the
+    # order under that durable key too (follow-up unit, 2026-08-09). A
+    # freshly-random key here would make every --submit-approved test below
+    # fail closed with StagingSignatureInvalid, correctly -- this fixture
+    # exists to exercise the happy path, not that one.
+    gk = Gatekeeper(
+        account_id=_SA_ACCT, account_type=AccountType.TAXABLE,
+        capability_policy=initial_policy(),
+        risk_policy=RiskPolicy("t", max_position_pct=100.0, max_sector_pct=100.0,
+                              min_settled_cash_pct_of_nlv=0.0, min_absolute_settled_cash=0.0),
+        day_trade_guard=DayTradeGuard(account_id=_SA_ACCT, max_per_5_sessions=3),
+        signing_key=SIGNING_KEY_BYTES,
+    )
+    store_path = tmp_path / "approval_requests.jsonl"
+    store = ApprovalRequestStore(store_path)
+    ledger = Ledger(account_id=_SA_ACCT, opening_settled_cash=Decimal("500"),
+                    policy_registry=HoldingPolicyRegistry([]), t_plus=1)
+    event = OpportunityEvent(
+        event_id="sec_edgar:AAPL:2026-07-19T09:00:00+00:00", type="FILING",
+        source_id="sec_edgar", observed_at=_SA_NOW - timedelta(days=1),
+        effective_at=_SA_NOW - timedelta(days=1), symbols=("AAPL",),
+        materiality_score=3.5, score_components={}, threshold_version="v1",
+        analysis_status="PENDING_ANALYSIS",
+    )
+    analysis_result = AnalysisResult(
+        result_id="ar-1", event_id=event.event_id, symbol="AAPL",
+        model_id="claude-sonnet-5", prompt_version="t4-prompt-v1",
+        schema_version="t4-schema-v1", validator_version="t4-validator-v1",
+        doc_sha256="a" * 64, cache_hit=False, cost_usd=0.15, confidence=0.7,
+        analysis={"bull_case": [], "bear_case": [], "contradicting_evidence": [],
+                 "confidence": 0.7},
+        analyzed_at=_SA_NOW,
+    )
+    account_snapshot = AccountSnapshot(
+        account_id=_SA_ACCT, equity=Decimal("500"), cash=Decimal("500"),
+        settled_cash=Decimal("500"), unsettled_cash=Decimal("0"),
+        buying_power=Decimal("500"), multiplier=Decimal("1"), pattern_day_trader=False,
+        day_trade_count=0, fetched_at=_SA_NOW,
+    )
+    result = request_approval_for_analysis(
+        event=event, analysis_result=analysis_result, gatekeeper=gk, ledger=ledger,
+        broker_account=account_snapshot, broker_positions=(), day_trade_guard=gk.day_trade_guard,
+        account_type=AccountType.TAXABLE, posture="CASH", price_at_analysis=price,
+        max_position_pct=max_position_pct, minimum_holding_period=timedelta(hours=1),
+        approval_request_store=store, audit_log=AuditLog(), max_approval_requests_per_day=4,
+        approval_expiration=timedelta(minutes=30), price_band_pct=1.0,
+        estimated_short_term_tax_rate=None, estimated_long_term_tax_rate=None,
+        run_id="run-1", now=_SA_NOW,
+    )
+    store.decide(result.request.request_id, decision="APPROVED", now=_SA_DECIDE_AT,
+                decided_by="operator")
+    return store_path, result
+
+
+def _submit_approved_argv(*, tmp_path, request_id, reference_price=100.0,
+                          config_path=None, approval_request_store_path):
+    return [
+        "--config", str(config_path or tmp_path / "config.json"),
+        "--account-id", _SA_ACCT, "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
+        "--approval-request-store-path", str(approval_request_store_path),
+        "--audit-log-path", str(tmp_path / "audit.jsonl"),
+        "--submit-approved", request_id,
+        "--submit-approved-reference-price", str(reference_price),
+    ]
+
+
+def _fake_alpaca_factory(*, cash=500.0, price=100.0):
+    """Stands in for `AlpacaPaperAdapter` -- a real `SimulatorBroker`
+    underneath, matching that adapter's own keyword-only constructor shape
+    closely enough for `_run_submit_approved`'s own call site (`account_id`,
+    `credentials`, `secrets_provider`, `capability_policy`); the rest are
+    accepted and ignored."""
+    def factory(*, account_id, credentials, secrets_provider, capability_policy=None,
+               **_ignored):
+        b = SimulatorBroker(account_id=account_id, cash=cash, now=_SA_SUBMIT_AT,
+                            capability_policy=capability_policy)
+        b.set_price("AAPL", price)
+        return b
+    return factory
+
+
+def test_submit_approved_requires_its_own_flags(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--submit-approved", "apr-1", "--audit-log-path", str(tmp_path / "a.jsonl")])
+    assert exc_info.value.code == 2
+
+
+def test_submit_approved_executes_against_a_fake_broker_and_audits(tmp_path, monkeypatch):
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    store_path, result = _submit_approved_request(tmp_path)
+
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _fake_alpaca_factory())
+
+    code = main(
+        _submit_approved_argv(tmp_path=tmp_path, request_id=result.request.request_id,
+                              reference_price=100.0, config_path=config_path,
+                              approval_request_store_path=store_path),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _SA_SUBMIT_AT,
+    )
+    assert code == 0
+
+    audit = AuditLog(path=tmp_path / "audit.jsonl")
+    submitted = [e for e in audit.events if e.action == "approval_execution_submitted"]
+    assert len(submitted) == 1
+    assert submitted[0].object_id == result.request.request_id
+    assert submitted[0].after["status"] == "filled"
+
+
+def test_submit_approved_never_constructs_the_real_scheduled_loop(tmp_path, monkeypatch):
+    """Proves the dispatch-and-return-immediately contract: run_loop_fn is
+    never called on this path."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    store_path, result = _submit_approved_request(tmp_path)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _fake_alpaca_factory())
+
+    def _boom(**kwargs):
+        raise AssertionError("--submit-approved must never reach run_loop_fn")
+
+    code = main(
+        _submit_approved_argv(tmp_path=tmp_path, request_id=result.request.request_id,
+                              config_path=config_path, approval_request_store_path=store_path),
+        run_loop_fn=_boom,
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _SA_SUBMIT_AT,
+    )
+    assert code == 0
+
+
+def test_submit_approved_refuses_an_unapproved_request_without_touching_the_adapter(tmp_path, monkeypatch):
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+
+    def _boom(*a, **k):
+        raise AssertionError("must not construct an adapter for a refused request")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _boom)
+
+    store_path = tmp_path / "approval_requests.jsonl"
+    code = main(
+        _submit_approved_argv(tmp_path=tmp_path, request_id="apr-does-not-exist",
+                              config_path=config_path, approval_request_store_path=store_path),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _SA_SUBMIT_AT,
+    )
+    assert code == 1
+
+
+def test_submit_approved_is_idempotent_across_two_separate_invocations(tmp_path, monkeypatch):
+    """The durable-token-mint (Unit 2) and never-resubmit-to-find-out
+    (Unit 3) mechanisms together mean a SECOND, fully separate `main()`
+    call for the same request_id -- simulating a real operator retry after
+    an ambiguous first run -- resolves to the SAME order rather than
+    erroring or double-submitting."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    store_path, result = _submit_approved_request(tmp_path)
+
+    # A single fake broker instance, standing in for the SAME real paper
+    # account both invocations would actually hit.
+    shared_adapter = _fake_alpaca_factory()(
+        account_id=_SA_ACCT, credentials=None, secrets_provider=None, capability_policy=None,
+    )
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter",
+                        lambda **kw: shared_adapter)
+
+    argv = _submit_approved_argv(tmp_path=tmp_path, request_id=result.request.request_id,
+                                 config_path=config_path,
+                                 approval_request_store_path=store_path)
+    first = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                now_fn=lambda: _SA_SUBMIT_AT)
+    second = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                 now_fn=lambda: _SA_SUBMIT_AT + timedelta(seconds=5))
+    assert first == 0
+    assert second == 0
+
+    audit = AuditLog(path=tmp_path / "audit.jsonl")
+    submitted = [e for e in audit.events if e.action == "approval_execution_submitted"]
+    assert len(submitted) == 2   # one audit row per invocation...
+    assert submitted[0].after["client_order_id"] == submitted[1].after["client_order_id"]
+    assert submitted[0].after["broker_order_id"] == submitted[1].after["broker_order_id"]
+    # ...but exactly ONE real order at the broker.
+    assert len(shared_adapter._orders) == 1

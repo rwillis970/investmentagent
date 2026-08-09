@@ -298,6 +298,26 @@ def test_command_center_html_has_no_support_js_reference(tmp_path):
     assert "support.js" not in html
 
 
+def test_approval_card_html_has_no_support_js_reference(tmp_path):
+    """Standalone-build unit, 2026-08-09: `approval_card.html` is still the
+    raw design upload -- it references `<script src="./support.js">`, a
+    file this repo does not contain, so its `{{ }}`/`sc-for` bindings never
+    populate in a browser (same defect `agent_command_center.html` had
+    before the 2026-08-03 follow-up unit closed it for that file). This
+    guard is INTENTIONALLY RED right now. `/approval-card` already routes
+    through `_serve_static` (see `route_request`), so no server code change
+    is needed to serve a corrected build once one lands -- only the file on
+    disk needs to change. When it does, this test goes green with no
+    further edits; until then it stands as the proof the swap hasn't
+    happened yet. Do not skip/xfail it and do not hand-edit the card's
+    bindings to make it pass -- the corrected build is generated
+    externally from the design source (see this unit's own report)."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/approval-card")
+    html = result.body.decode("utf-8")
+    assert "support.js" not in html
+
+
 def test_command_center_html_is_the_real_generated_build_not_the_turn_3_mock(tmp_path):
     """Follow-up unit, 2026-08-06 ('bring the real command center live'),
     superseded 2026-08-09 ('swap in the corrected command center build'):

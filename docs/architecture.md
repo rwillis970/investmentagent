@@ -142,7 +142,7 @@ the day-trade guard is active from the first session.
 - Continuous collection, event triggers, scheduled reviews
 - Deterministic risk, reserve and capability enforcement
 - Configurable minimum hold with audited early-exit path
-- Human approval token required for every live order
+- Human approval token required for every order, paper and live alike
 - Idempotent submission, reconciliation, kill switch, restart recovery
 - Cost metering against a monthly budget
 - Playbook candidate generation without self-promotion
@@ -1281,10 +1281,22 @@ passes the store's own server-recorded `shown_at` and already-audited `decision_
 through unchanged (not a fresh, independently computed figure — see below); and it inherits
 the request's own stored price band rather than letting `ApprovalService.approve` recompute
 one from the day's config, so the token enforces exactly the band the operator saw. The
-token's `token_id` is derived deterministically from `request_id` (not caller-supplied), so a
-replayed decision — a retried request, a duplicate inbox event — hits `ApprovalService`'s
-existing `TokenReissued` guard rather than minting a second, independently live token for one
-decision.
+token's `token_id` is derived deterministically from `request_id` (not caller-supplied).
+**Unit 2 (2026-08-09):** this alone did not close the gap it looks like it closes.
+`ApprovalService._tokens` is in-memory only — the crash-only design above already says no
+in-memory state survives a restart — so a FRESH `ApprovalService` instance (a real restart, not
+just a retried call within one process) starts with an empty `_tokens` dict and sails straight
+past the deterministic-`token_id`/`TokenReissued` guard, minting a second, fully independent,
+spendable token for an already-approved request. The bridge now checks a durable record —
+`ApprovalRequestStore.record_token_minted`, written immediately after the first successful mint
+— before ever calling `ApprovalService.approve()` again, and returns that exact token instead,
+regardless of how many process restarts separate the two calls. Consumption itself is still not
+durable: `ApprovalToken.consume()` (called from `BrokerAdapter.submit()`) mutates the in-memory
+object only, so a token reconstructed from the durable record after a real restart cannot know
+whether the original was already spent before the restart — closing that would require
+threading persistence through `consume()`/`submit()`, deliberately out of scope for Unit 2 (see
+that unit's own delivery report). `_submit_impl`'s own idempotency-by-`client_order_id` remains
+the one durable defense against that gap producing an actual duplicate order today.
 
 The bridge refuses a `proposal_snapshot` naming more than one leg rather than silently
 minting a token for only its first: a sell-to-fund-buy cannot be one approval in a cash
@@ -1399,8 +1411,8 @@ ahead of need.
     hold.
 12. Risk profile and dual-basis settled-cash reserve are enforced deterministically at
     target construction and again pre-submit.
-13. Every live order requires a valid, unexpired, single-use approval token bound to an
-    order fingerprint and price band.
+13. Every order — paper and live alike — requires a valid, unexpired, single-use approval
+    token bound to an order fingerprint and price band.
 14. Order submission is idempotent; broker state is reconciled before and after trading.
 15. Kill switch, stale-data protection, sleep/wake and restart recovery are tested and
     resolve to no trade.

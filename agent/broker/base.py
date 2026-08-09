@@ -7,7 +7,8 @@ broker agnostic. Adding a live broker means implementing `_submit_impl`,
 Gate 4 lives in `BrokerAdapter.submit`/`cancel` rather than in each concrete
 adapter, so a new adapter INHERITS the backstop instead of having to remember
 it. Concrete adapters implement `_submit_impl`/`_cancel_impl`, which are only
-ever reached after the gate has passed and — in live mode, for submit — after
+ever reached after the gate has passed and — for submit, paper and live
+alike (§12 criterion 13; require-a-token-in-paper unit, 2026-08-09) — after
 an approval token has been consumed.
 
 CLOSING THE PIPELINE-BYPASS GAP (§8.3). There used to be a keyword-argument
@@ -469,43 +470,52 @@ class BrokerAdapter(ABC):
             session=staged.session, time_in_force=staged.time_in_force,
         )
 
-        if self.is_live:
-            if approval_token is None:
-                raise MissingApproval(
-                    "a live order requires an approval token (§12 criterion 13)"
-                )
-            price = reference_price if reference_price is not None else staged.limit_price
-            if price is None:
-                raise MissingApproval(
-                    "cannot validate the approved price band without a reference price"
-                )
-            now = self.clock()
-            # §10, unattended wiring unit (2026-08-01): both checks enforced
-            # HERE, where the token is consumed -- not trusted from whatever
-            # assembled `staged` or from ApprovalService.approve()'s own
-            # earlier, UI-reported check. verify_modification_within_bounds
-            # allows `staged` to be a reduced/adversely-limited version of
-            # what was approved (§10's "modify within bounds"); anything else
-            # raises OrderMismatch, same as an exact-fingerprint failure.
-            # verify_minimum_display_time re-derives elapsed time from the
-            # token's own server-recorded shown_at, independent of anything
-            # a UI claimed at approve() time.
-            verify_modification_within_bounds(
-                approval_token, symbol=staged.symbol, side=staged.side,
-                qty=staged.authorized_qty, order_type=staged.order_type,
-                time_in_force=staged.time_in_force, limit_price=staged.limit_price,
-                lot_id=staged.lot_id,
+        # APPROVAL TOKEN REQUIRED FOR EVERY ORDER, PAPER AND LIVE ALIKE
+        # (require-a-token-in-paper unit, 2026-08-09; §12 criterion 13).
+        # This block used to be gated on `if self.is_live:` -- a paper
+        # adapter (AlpacaPaperAdapter, SimulatorBroker) accepted submit()
+        # with no token at all, so the governance path this token exists to
+        # prove was first exercised live, never in paper. There is no
+        # supported token-free submit path after this unit: no config flag,
+        # no opt-out, no environment check. See this unit's own report for
+        # every call site (all of them in tests/) this made a real signal.
+        if approval_token is None:
+            raise MissingApproval(
+                "an approval token is required to submit an order -- paper "
+                "and live alike (§12 criterion 13)"
             )
-            verify_minimum_display_time(approval_token, now=now)
-            # Consumed atomically here: a retry, replay or restart cannot
-            # reuse it. The fingerprint consumed is always the token's OWN
-            # (i.e. the originally-approved order's) fingerprint -- the real
-            # verification against the ACTUAL (possibly modified) `staged`
-            # order already happened above; `consume`'s own exact-match
-            # check is retained unchanged as a second, independent guard
-            # (see agent.approval.ApprovalToken.consume's own docstring).
-            approval_token.consume(fingerprint=approval_token.order_fingerprint,
-                                   price=price, now=now)
+        price = reference_price if reference_price is not None else staged.limit_price
+        if price is None:
+            raise MissingApproval(
+                "cannot validate the approved price band without a reference price"
+            )
+        now = self.clock()
+        # §10, unattended wiring unit (2026-08-01): both checks enforced
+        # HERE, where the token is consumed -- not trusted from whatever
+        # assembled `staged` or from ApprovalService.approve()'s own
+        # earlier, UI-reported check. verify_modification_within_bounds
+        # allows `staged` to be a reduced/adversely-limited version of
+        # what was approved (§10's "modify within bounds"); anything else
+        # raises OrderMismatch, same as an exact-fingerprint failure.
+        # verify_minimum_display_time re-derives elapsed time from the
+        # token's own server-recorded shown_at, independent of anything
+        # a UI claimed at approve() time.
+        verify_modification_within_bounds(
+            approval_token, symbol=staged.symbol, side=staged.side,
+            qty=staged.authorized_qty, order_type=staged.order_type,
+            time_in_force=staged.time_in_force, limit_price=staged.limit_price,
+            lot_id=staged.lot_id,
+        )
+        verify_minimum_display_time(approval_token, now=now)
+        # Consumed atomically here: a retry, replay or restart cannot
+        # reuse it. The fingerprint consumed is always the token's OWN
+        # (i.e. the originally-approved order's) fingerprint -- the real
+        # verification against the ACTUAL (possibly modified) `staged`
+        # order already happened above; `consume`'s own exact-match
+        # check is retained unchanged as a second, independent guard
+        # (see agent.approval.ApprovalToken.consume's own docstring).
+        approval_token.consume(fingerprint=approval_token.order_fingerprint,
+                               price=price, now=now)
 
         return self._submit_impl(staged)
 

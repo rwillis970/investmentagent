@@ -1,0 +1,15 @@
+-- Unit 2 (2026-08-09): a decided request mints exactly one spendable token,
+-- durably. `agent.approval.ApprovalService._tokens` is in-memory only -- a
+-- fresh instance (a real process restart) started with an empty dict, so
+-- nothing stopped a second `approve()` call for an already-approved
+-- request from minting a second, independently-spendable token once the
+-- first process's memory was gone. See agent/entities.py's own
+-- ApprovalRequest.token_snapshot docstring and agent/approval_bridge.py's
+-- module docstring ("A DECIDED REQUEST MINTS EXACTLY ONE SPENDABLE TOKEN,
+-- DURABLY") for the full reasoning.
+--
+-- Nullable, unlike earmark (migration 007): a request that is still
+-- undecided, or decided REJECTED, or APPROVED-but-not-yet-minted, has no
+-- token snapshot at all -- NULL means "no token minted for this request
+-- yet", never a fabricated empty mint.
+ALTER TABLE agent.approval_request ADD COLUMN token_snapshot JSONB;
