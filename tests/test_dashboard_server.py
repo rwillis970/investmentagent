@@ -299,12 +299,13 @@ def test_command_center_html_has_no_support_js_reference(tmp_path):
 
 
 def test_command_center_html_is_the_real_generated_build_not_the_turn_3_mock(tmp_path):
-    """Follow-up unit, 2026-08-06 ('bring the real command center live'):
+    """Follow-up unit, 2026-08-06 ('bring the real command center live'),
+    superseded 2026-08-09 ('swap in the corrected command center build'):
     `agent_command_center.html` was replaced byte for byte with the
-    designer's own generated standalone build
-    (`agent_command_center.new.html`, 689,729 bytes, sha256
-    26c248d1c12603bdaa0f7d2685267c9a6be625bc4bcab6aea4eced0053633857).
-    The prior file -- a hand-integrated combination of the original
+    designer's own generated standalone build (`agent_command_center.
+    new.html`, 692,044 bytes before the dashboard_bind.js insertion, sha256
+    ce388210c57afdcd9eeca41c1a01696013010fbcbc1eef0850b88fd927dae4d4). The
+    prior file -- a hand-integrated combination of the original
     pre-integration mock plus this codebase's own Turn-3
     agent-core-zones/energy-connectors inlining -- is gone entirely, not
     merged forward (see this unit's own report). `customElements.
