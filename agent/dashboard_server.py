@@ -128,6 +128,8 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         return _serve_static("approval_card.html")
     if method == "GET" and path == "/dashboard_bind.js":
         return _serve_static("dashboard_bind.js")
+    if method == "GET" and path == "/approval_card_bind.js":
+        return _serve_static("approval_card_bind.js")
 
     return _json_result(404, {"error": f"no route for {method} {path}"})
 
@@ -211,10 +213,14 @@ def _serve_static(filename: str) -> RouteResult:
     `agent_command_center.html` (follow-up unit, 2026-08-03) is now the
     fully self-contained standalone build -- the template runtime, React,
     and fonts are inlined; there is no `support.js` reference left to be
-    missing. `approval_card.html` is UNCHANGED from the original upload and
-    STILL depends on a `support.js` this codebase does not have -- its
-    `{{ }}`/`sc-for` bindings will not populate in a browser until it gets
-    the same standalone treatment (see this unit's own report).
+    missing. `approval_card.html` (bound-card unit, 2026-08-09) is now the
+    standalone build too, registering `window.ApprovalCard` /
+    `window.ApprovalCardActions` in componentDidMount the same way
+    `agent_command_center.html` registers `window.AgentCommandCenter`. Its
+    served copy carries a `<script src="approval_card_bind.js">` tag; as of
+    this unit that file has NOT been written yet (see this unit's own
+    report -- the binding work stopped on a disclosed gap), so the route
+    below exists but 404s until a follow-up unit adds the file.
 
     CONTENT-TYPE IS SUFFIX-AWARE (dashboard_bind.js unit, 2026-08-03) -- this
     function used to hand back `text/html` unconditionally, correct for its

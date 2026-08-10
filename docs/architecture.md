@@ -177,6 +177,7 @@ the model is invoked when a numeric materiality threshold is crossed or a schedu
 |---|---|---|---|
 | T1 Collect | Poll prices, account, open orders; heartbeat freshness | 60 s (market hours) | none |
 | T2 Watch | EDGAR and news feeds; dedupe; entity resolution; cheap classification | 5 min or push | Haiku tier |
+| T2b Context | Alternative-evidence provider: delayed disclosures, flows, contracts, lobbying; dedupe; entity resolution | daily (delayed sources) | none |
 | T3 Screen | Deterministic materiality score + eligibility gate — no model call, ever | 5–15 min | none |
 | T4 Analyse | Structured research on a specific candidate; target portfolio; approval card | on trigger + schedule | Sonnet tier |
 
@@ -284,6 +285,106 @@ count against it. It rolls over on a market SESSION boundary (`agent.market_cale
 a bare UTC calendar date — a UTC-date rollover would reset the cap mid-session or hold it
 open across a weekend/holiday in a way that does not correspond to when an operator is
 actually available to spend it.
+
+### 3.5 Alternative evidence, and why it is not a signal
+
+Market data, EDGAR and news are the primary feeds, and they stay primary. Timely SEC
+insider filings — Form 4 transactions, due within two business days — belong to that
+primary EDGAR path and are detectable directly from EDGAR without any third-party
+provider. An alternative-evidence provider may later enrich or normalize insider data,
+but the system must never depend on one to see it.
+
+Alternative datasets — congressional trading disclosures, government contract awards,
+lobbying activity, ETF flows, 13F and other large-holder filings — are an optional
+secondary source that produces *evidence*, never a trade. They may strengthen or weaken
+an existing thesis, raise or lower a symbol's watchlist priority, and inform confidence
+and materiality scoring. No alternative-evidence item may independently authorize, force,
+or size a trade, and none may create a candidate that would not otherwise have entered
+the universe.
+
+The distinction is not stylistic. These sources report transactions that already
+happened, often long ago, and treating a stale report as a live catalyst is how a system
+buys the reaction rather than the information (§3.3).
+
+**Latency classes.** Sources are separated by how soon after the underlying event they
+are observable, and the two classes enter the system at different tiers:
+
+| Class | Sources | Tier | Cadence | Role |
+|---|---|---|---|---|
+| Timely | News, EDGAR company releases, Form 4 insider transactions (due within 2 business days) | T2 | 5 min or push | May participate in event-driven screening when fresh |
+| Delayed | Congressional disclosures (up to 45 days under the STOCK Act), 13F and other large-holder filings (quarterly, up to 45 days after quarter end), lobbying registrations, government contract awards, ETF flow aggregates | T2b | daily | Contextual evidence only, deliberately lower prior |
+
+A delayed-class item never triggers T4. It is durable context that adjusts the prior on a
+symbol the primary feeds surface independently.
+
+**13F and large-holder data are in scope** as delayed-class evidence. This was not
+previously canonical and is stated explicitly here so it is not later read in or out by
+inference.
+
+**Provider is an adapter, not a dependency.** The collector sits behind an
+`AlternativeEvidenceProvider` interface in the same shape as `BrokerAdapter` (§1.2): one
+interface, provider-specific implementations behind it. Quiver Quant is the first
+candidate implementation, not an architectural commitment — no module outside the adapter
+may name a provider, and swapping providers must require no change to screening, scoring,
+or the evidence store.
+
+**Coverage is claimed only where verified.** Federal congressional disclosures are the
+scope of this section. State-legislature disclosures — including Texas — are NOT claimed,
+are not assumed to exist in any provider's coverage, and are modelled as a separately
+enableable evidence source that stays disabled until a specific provider's coverage is
+verified against primary sources and recorded here. A collector must refuse a dataset it
+has not been configured for rather than returning an empty result that reads as "no
+activity."
+
+**Evidence schema.** Every item is stored in the bitemporal evidence plane (§5) with:
+`source_id`, `dataset`, `symbol`, `event_at` (when the underlying transaction occurred),
+`disclosed_at` (when it became public), `observed_at` (when we fetched it), `direction`,
+`magnitude` where the dataset provides one, `actor` where applicable, `raw_ref`, and
+`latency_class`. `event_at` and `disclosed_at` are distinct fields and neither substitutes
+for the other — the gap between them is the reason for the lower prior, so it must remain
+visible rather than being collapsed at ingest.
+
+**Freshness and staleness.** Each dataset carries a maximum useful age. Past it, the item
+remains queryable as history but contributes zero weight to scoring — it is never dropped
+and never silently kept alive. A provider that returns nothing is recorded as "no data",
+which is not the same fact as "no activity", and the two must not be conflated at any
+layer.
+
+**Deduplication and entity resolution** reuse T2's existing mechanism. An item is keyed on
+`(source_id, dataset, actor, symbol, event_at)`; a re-disclosure or amendment of the same
+underlying transaction updates the existing item rather than creating a second one.
+Issuer-to-symbol resolution goes through the same path as EDGAR entity resolution — a
+dataset that names an issuer this system cannot resolve is quarantined, not guessed.
+
+**Scoring — a reserved term, defaulted to zero.** The materiality score (§3.2) reserves
+one additional term for this evidence:
+
+```
+      + w7 * alt_evidence_prior(symbol, t)      # reserved; w7 defaults to 0.0
+```
+
+`w7` defaults to `0.0`. Ingestion and auditability are deliberately separated from
+decision influence: alternative evidence may be collected, associated with symbols, shown
+in analysis and evaluated for usefulness while contributing nothing to any trading
+decision. Raising `w7` above zero is a deliberate, versioned policy change made only after
+evidence that it adds value, and it re-triggers §3.2's calibration and policy-version
+logging exactly as any other threshold change does.
+
+When `w7` is eventually non-zero, `alt_evidence_prior` is bounded in absolute value and
+cannot by itself carry a symbol across the trigger threshold — a symbol whose only
+above-baseline input is alternative evidence does not reach T4 — and delayed-class
+contributions are capped below timely-class ones.
+
+**Cost and budget.** The provider is a paid external API and is metered by the cost
+control plane (§8.2) on the same footing as model spend, against its own sub-budget. On
+budget exhaustion the collector stops fetching; it does not degrade to a cheaper endpoint
+or a cached-but-stale read presented as current.
+
+**Fail-safe.** Every failure mode lands on no additional trading pressure. A provider
+outage, an auth failure, a schema change, a rate limit, or budget exhaustion causes
+`alt_evidence_prior` to return zero — never a last-known value, never an imputed one. The
+system's behavior with the collector disabled and with the collector failing must be
+identical, and that equivalence is a test, not a claim.
 
 ---
 
@@ -1371,6 +1472,7 @@ it — see the note below the table.
 | 12 | Failure suite: restart mid-submit, stale data, duplicate callback, sleep/wake, network loss, kill switch, hash-chain verification | Every anomaly resolves to no trade with no duplicate or orphaned order |
 | 13 | Readiness review, operator runbook, backup and restore drill, ▲ adversarial self-review in a fresh session (Appendix C.6) | Checklist approved; restore from backup verified; no unresolved high-severity review finding |
 | 14 | Controlled live pilot: minimum-size order, human approval, full reconciliation, then flat | One approved live order placed, filled, reconciled and closed safely; audit trail complete end to end |
+| 15+ | Post-pilot, explicitly off the Day-14 critical path: alternative-evidence collector (§3.5) — `AlternativeEvidenceProvider` adapter, T2b delayed-class ingestion, evidence-schema rows in the bitemporal store, `w7` calibration harness | Delayed-class evidence visible in analysis and audit trail; `w7` remains `0.0` (§3.2) until raised by a deliberate, versioned policy change — not a Day-14 gate |
 
 **Evaluation and attribution move ahead of the playbook machinery (§7.3).** Day 11 is
 where Class A candidate generation is built, and Class B (the self-directed one) needs

@@ -285,6 +285,34 @@ def test_approval_card_path_serves_the_approval_card_html(tmp_path):
     assert result.body == (STATIC_DIR / "approval_card.html").read_bytes()
 
 
+def test_approval_card_bind_js_is_reachable_through_serve_static(tmp_path):
+    """approval_card_bind.js (bound-card unit, 2026-08-09) -- served the
+    same way as dashboard_bind.js, byte-identical to the checked-in file.
+
+    INTENTIONALLY RED as of this commit. `approval_card.html` now carries
+    `<script src="approval_card_bind.js"></script>` and this route exists
+    in `route_request`, but `dashboard/static/approval_card_bind.js` has
+    not been written yet -- the binding work (this unit's own second,
+    separate commit) stopped on a disclosed gap before any file landed.
+    See this unit's own report. `_serve_static` 404s for a missing file,
+    which is what this assertion currently exercises; it goes green with
+    no further edits once the file exists."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/approval_card_bind.js")
+    assert result.status == 200
+    assert result.body == (STATIC_DIR / "approval_card_bind.js").read_bytes()
+
+
+def test_approval_card_bind_js_is_served_as_javascript_not_html(tmp_path):
+    """Mirrors test_dashboard_bind_js_is_served_as_javascript_not_html.
+    INTENTIONALLY RED as of this commit -- see
+    test_approval_card_bind_js_is_reachable_through_serve_static's own
+    docstring; the missing file 404s as application/json today."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/approval_card_bind.js")
+    assert result.content_type == "text/javascript; charset=utf-8"
+
+
 def test_command_center_html_has_no_support_js_reference(tmp_path):
     """Follow-up unit, 2026-08-03: `agent_command_center.html` was replaced
     with the standalone build (template runtime, React, and fonts inlined)
@@ -299,19 +327,13 @@ def test_command_center_html_has_no_support_js_reference(tmp_path):
 
 
 def test_approval_card_html_has_no_support_js_reference(tmp_path):
-    """Standalone-build unit, 2026-08-09: `approval_card.html` is still the
-    raw design upload -- it references `<script src="./support.js">`, a
-    file this repo does not contain, so its `{{ }}`/`sc-for` bindings never
-    populate in a browser (same defect `agent_command_center.html` had
-    before the 2026-08-03 follow-up unit closed it for that file). This
-    guard is INTENTIONALLY RED right now. `/approval-card` already routes
-    through `_serve_static` (see `route_request`), so no server code change
-    is needed to serve a corrected build once one lands -- only the file on
-    disk needs to change. When it does, this test goes green with no
-    further edits; until then it stands as the proof the swap hasn't
-    happened yet. Do not skip/xfail it and do not hand-edit the card's
-    bindings to make it pass -- the corrected build is generated
-    externally from the design source (see this unit's own report)."""
+    """Standalone-build unit, 2026-08-03 -> bound-card unit, 2026-08-09:
+    `approval_card.html` was replaced byte for byte with the standalone
+    build (`window.ApprovalCard` registered in componentDidMount, same
+    mechanism as `agent_command_center.html`'s `window.AgentCommandCenter`)
+    -- it no longer references `<script src="./support.js">`. This guard
+    was INTENTIONALLY RED before that swap landed; it is a plain
+    regression guard now."""
     runtime, _ = make_runtime(tmp_path)
     result = route_request(runtime, method="GET", path="/approval-card")
     html = result.body.decode("utf-8")
