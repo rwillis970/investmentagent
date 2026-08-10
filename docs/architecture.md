@@ -72,7 +72,7 @@ accountant and cooldown rules in §4.5 mitigate this; nothing eliminates it.
 | §9 Evaluation governance | Revised | Pre-registration, experiment budget, deflated metrics and the project kill criterion all retained. Self-improvement is enabled from release but confined to the categories in §7.2. |
 | §11 Technology | Revised | Single-VM assumption replaced by laptop-local with a documented cloud-migration seam (§8). |
 | §12 Phases 0–5 | Replaced | Replaced by the 14-day backlog (§11). The v1.0 gates are not deleted — they move to a parallel post-launch validation track (§7.3) with the kill criterion intact. |
-| New in v1.1 | Added | Cadence tiers (§3), holding policy (§4), trade capability registry (§5), approval protocol (§10), cost control plane (§8.2), laptop lifecycle (§8.1), PDT guard (§4.4). |
+| New in v1.1 | Added | Cadence tiers (§3), holding policy (§4), trade capability registry (§5), approval protocol (§10), cost control plane (§8.2), laptop lifecycle (§8.1), PDT guard (§4.4), alternative evidence and the T2b context tier (§3.5). |
 
 ### 1.2 Decisions received, and what they change
 
@@ -169,9 +169,12 @@ track, not on the pilot succeeding mechanically.
 ## 3. Cadence architecture
 
 The requirement is continuous awareness without continuous model spend. The resolution is
-a four-tier loop in which cost rises by roughly two orders of magnitude per tier and
-frequency falls by the same factor. Only deterministic local code runs at high frequency;
-the model is invoked when a numeric materiality threshold is crossed or a schedule fires.
+a four-tier escalation loop — T1 through T4 — in which cost rises by roughly two orders of
+magnitude per tier and frequency falls by the same factor, plus a fifth, parallel context
+tier (T2b, §3.5) that feeds delayed-class evidence into scoring without itself joining the
+escalation chain: a T2b item never triggers T4. Only deterministic local code runs at high
+frequency; the model is invoked when a numeric materiality threshold is crossed or a
+schedule fires.
 
 | Tier | Work | Frequency | Model cost |
 |---|---|---|---|
@@ -223,6 +226,14 @@ Filing weights are an explicit allowlist, not a heuristic: 8-K items 2.02, 4.02,
 5.02 and 7.01 carry weight; 10-K and 10-Q carry weight; routine ownership and
 administrative forms carry none. This alone removes most feed volume before any scoring
 happens.
+
+**TODO (unresolved, cross-ref §3.5's latency-class table):** Form 4 is an ownership form,
+so it carries zero `w3` filing weight here — but §3.5's Timely-class row states Form 4
+insider transactions "may participate in event-driven screening when fresh." A Form 4
+with zero filing-weight contribution cannot clear the T3 threshold on filing weight alone,
+so the two sections disagree. Resolve one of two ways: give Form 4 its own nonzero
+`filing_weight` entry, or soften §3.5's table row to match the current zero-weight
+allowlist. Not resolved here.
 
 Tuning is inverted from the usual approach. Rather than choosing a threshold and
 discovering the cost, you declare the budget — a target number of analyses per day — and
@@ -314,6 +325,13 @@ are observable, and the two classes enter the system at different tiers:
 | Timely | News, EDGAR company releases, Form 4 insider transactions (due within 2 business days) | T2 | 5 min or push | May participate in event-driven screening when fresh |
 | Delayed | Congressional disclosures (up to 45 days under the STOCK Act), 13F and other large-holder filings (quarterly, up to 45 days after quarter end), lobbying registrations, government contract awards, ETF flow aggregates | T2b | daily | Contextual evidence only, deliberately lower prior |
 
+**TODO (unresolved, cross-ref §3.2's filing-weight allowlist):** §3.2's `filing_weight`
+table gives routine ownership forms zero weight, so a Form 4 as scored today cannot cross
+the T3 threshold on filing weight alone, contradicting this row's "may participate in
+event-driven screening when fresh." Resolve one of two ways: give Form 4 its own nonzero
+`filing_weight` entry in §3.2, or soften this row to match the current zero-weight
+allowlist. Not resolved here.
+
 A delayed-class item never triggers T4. It is durable context that adjusts the prior on a
 symbol the primary feeds surface independently.
 
@@ -336,7 +354,7 @@ verified against primary sources and recorded here. A collector must refuse a da
 has not been configured for rather than returning an empty result that reads as "no
 activity."
 
-**Evidence schema.** Every item is stored in the bitemporal evidence plane (§5) with:
+**Evidence schema.** Every item is stored in the bitemporal evidence plane (§9) with:
 `source_id`, `dataset`, `symbol`, `event_at` (when the underlying transaction occurred),
 `disclosed_at` (when it became public), `observed_at` (when we fetched it), `direction`,
 `magnitude` where the dataset provides one, `actor` where applicable, `raw_ref`, and
