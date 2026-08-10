@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -15,6 +16,7 @@ from agent import config as config_module
 from agent.approval import ApprovalService
 from agent.approval_request_store import ApprovalRequestStore
 from agent.audit import AuditLog
+from agent.broker.base import AccountSnapshot
 from agent.cost import CostLedger
 from agent.dashboard_server import (STATIC_DIR, DashboardRuntime,
                                     make_server, route_request)
@@ -311,6 +313,63 @@ def test_approval_card_bind_js_is_served_as_javascript_not_html(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(runtime, method="GET", path="/approval_card_bind.js")
     assert result.content_type == "text/javascript; charset=utf-8"
+
+
+def test_api_state_approvals_pending_is_an_empty_list_with_no_requests(tmp_path):
+    """The server-side half of the whole-queue follow-up (2026-08-10):
+    approval_card_bind.js now hands `approvals.pending` to
+    `window.ApprovalCard.applyQueue` verbatim, including when it is empty --
+    that only works if a runtime with nothing pending actually returns `[]`
+    here, not `null` or an omitted key."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/api/state")
+    payload = json.loads(result.body)
+    assert payload["approvals"]["pending"] == []
+
+
+def test_api_state_never_exposes_a_settled_cash_figure(tmp_path):
+    """Whole-queue follow-up (2026-08-10): approval_card_bind.js's own
+    `extractCash` only ever builds a non-null `{settled, floor, earmarked,
+    available}` object if all four are present, and documents that
+    `settled` never resolves because /api/state has no field for it
+    anywhere -- checked directly, not assumed. This test locks that claim
+    in against the real server response, WITH a broker_account supplied so
+    floor/available are populated -- proving `cash` is null because
+    `settled` is specifically and permanently missing, not just because
+    every other figure happened to be missing too."""
+    runtime, _ = make_runtime(tmp_path)
+    runtime.broker_account = AccountSnapshot(
+        account_id=ACCT, equity=Decimal("500"), cash=Decimal("500"),
+        settled_cash=Decimal("500"), unsettled_cash=Decimal("0"),
+        buying_power=Decimal("500"), multiplier=Decimal("1"),
+        pattern_day_trader=False, day_trade_count=0, fetched_at=T0,
+    )
+    result = route_request(runtime, method="GET", path="/api/state")
+    payload = json.loads(result.body)
+    # floor/available ARE populated -- proves this isn't just "no
+    # broker_account at all" producing every risk_gates field as null.
+    assert payload["risk_gates"]["required_reserve_usd"] is not None
+    assert payload["risk_gates"]["investable_cash_usd"] is not None
+    # settled cash itself (the ACCOUNT-STATE figure, $500 on the snapshot
+    # above) is nowhere in the response, under any key -- walk the whole
+    # payload for any "settled"-named key whose value is that figure.
+    # `minimum_settled_cash_pct_of_nlv`/`minimum_absolute_settled_cash` are
+    # a different concept entirely (config policy thresholds, not a current
+    # account balance) and are excluded by name, not by accident.
+    _POLICY_THRESHOLD_KEYS = {"minimum_settled_cash_pct_of_nlv", "minimum_absolute_settled_cash"}
+
+    def find_settled_cash_value(node, path=""):
+        found = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if "settled" in k.lower() and k not in _POLICY_THRESHOLD_KEYS:
+                    found.append((f"{path}.{k}", v))
+                found.extend(find_settled_cash_value(v, f"{path}.{k}"))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                found.extend(find_settled_cash_value(v, f"{path}[{i}]"))
+        return found
+    assert find_settled_cash_value(payload) == []
 
 
 def test_command_center_html_has_no_support_js_reference(tmp_path):
