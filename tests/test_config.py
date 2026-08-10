@@ -128,6 +128,21 @@ def test_mode_membership_is_still_checked_here_transition_legality_is_not():
     assert cfg.mode == "PRODUCTION_ACTIVE"
 
 
+def test_broker_defaults_to_simulator():
+    """config-driven-broker-selection unit, 2026-08-10: config.example.json
+    itself names no broker key, so a config that never mentions this field
+    at all must land on the safe, no-credential, no-network posture."""
+    cfg = C.load(base())
+    assert cfg.broker == "simulator"
+
+
+def test_broker_membership_is_checked_and_rejects_a_typo_loudly():
+    with pytest.raises(C.ConfigError, match="broker must be one of"):
+        C.load(base(broker="alpca_paper"))
+    cfg = C.load(base(broker="alpaca_paper"))
+    assert cfg.broker == "alpaca_paper"
+
+
 def test_paused_is_still_a_valid_config_mode_value():
     """Regression guard for the §9.2 topology fix: PAUSED left agent.mode.
     CHAIN (the four-mode escalation ordering) but remains a real, valid

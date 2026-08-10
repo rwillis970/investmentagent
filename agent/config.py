@@ -29,6 +29,17 @@ MODES = mode_fsm.MODES
 PROFILES = ("CONSERVATIVE", "MODERATE", "AGGRESSIVE", "CUSTOM")
 POSTURES = ("CASH", "MARGIN_UNDER_25K", "MARGIN_OVER_25K", "UNKNOWN")
 
+# Broker adapter selection (config-driven-broker-selection unit, 2026-08-10).
+# The single source of truth for "which adapter does agent.broker.selection.
+# select_broker_adapter construct" -- "simulator" (agent.broker.simulator.
+# SimulatorBroker: no credentials, no network) or "alpaca_paper" (agent.
+# broker.alpaca.AlpacaPaperAdapter: real credentials via agent.
+# secrets_provider, real HTTP to Alpaca's paper servers). Defaults to
+# "simulator" -- see Config.broker's own comment for why, and see agent/
+# broker/selection.py's own module docstring for the belt-and-suspenders
+# reason this same membership check is repeated there.
+BROKER_TYPES = ("simulator", "alpaca_paper")
+
 # Platform maxima — §6. Config is validated against these, not the reverse,
 # and rejected at load if it exceeds them — never clamped to them.
 MIN_HOLDING_FLOOR = timedelta(minutes=15)
@@ -109,6 +120,18 @@ class Config:
     require_human_trade_approval: bool = True
     risk_profile: str = "MODERATE"
     assert_account_posture: str = "UNKNOWN"
+
+    # Broker adapter selection (config-driven-broker-selection unit,
+    # 2026-08-10) -- consumed by agent.broker.selection.select_broker_
+    # adapter, the one place scripts/run_dashboard.py constructs a real
+    # adapter from. Defaults to "simulator" DELIBERATELY: it is the only
+    # value with no credential, no network call and no way to place a real
+    # order, so a config that never mentions this key at all gets the safe
+    # posture, not an implicitly-live one. See BROKER_TYPES above for the
+    # membership this is checked against, and agent/broker/selection.py's
+    # own module docstring for why an unrecognised value must fail loudly
+    # rather than silently fall back to this default.
+    broker: str = "simulator"
 
     minimum_settled_cash_pct_of_nlv: float = 20.0
     minimum_absolute_settled_cash: float = 75.0
@@ -558,6 +581,8 @@ def validate(cfg: Config) -> None:
         err.append(f"risk_profile must be one of {PROFILES}")
     if cfg.assert_account_posture not in POSTURES:
         err.append(f"assert_account_posture must be one of {POSTURES}")
+    if cfg.broker not in BROKER_TYPES:
+        err.append(f"broker must be one of {BROKER_TYPES}")
     if not cfg.require_human_trade_approval:
         err.append("require_human_trade_approval cannot be false in this release (§6)")
 

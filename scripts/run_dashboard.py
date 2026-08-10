@@ -20,16 +20,33 @@ that class's own docstring) -- fed through the SAME `agent.account_wiring.
 build_account_reconciliation` assembler `agent/run_loop.py`'s own real
 cycle already uses, rather than a second, independently-built read path.
 
-STILL NO LIVE ADAPTER, STILL NO CREDENTIAL. This does not wire `scripts/
-run_agent.py`'s own `build_account_runtime`/`_real_adapter_factory` (that
-path constructs `AlpacaPaperAdapter`, which needs a real `secrets_provider`
-resolve and real network access to Alpaca's paper servers -- neither
-available in this environment, and both explicitly out of scope for this
-unit). A `SimulatorBroker` constructed here is consequently a fresh,
+CONFIG-DRIVEN BROKER SELECTION (config-driven-broker-selection unit,
+2026-08-10). `_build_broker_state` no longer constructs `SimulatorBroker`
+directly -- it calls `agent.broker.selection.select_broker_adapter(cfg,
+...)`, the single selection point this script now shares with `scripts/
+run_agent.py`'s own call sites (see that module's own docstring for why
+those call sites are NOT yet routed through the same function in this
+commit -- a genuine, reported conflict, not an oversight). `cfg.broker`
+defaults to "simulator" (`agent.config.Config.broker`'s own default), so
+this script's own behavior is UNCHANGED by this rewiring: no `--key-id`/
+`--secret-ref` flags exist on this script, so `credentials`/
+`secrets_provider` are always `None` here, meaning `cfg.broker:
+"alpaca_paper"` would raise inside `_build_broker_state`'s own `try`
+(caught, degrading to the same null triple below) rather than construct
+anything -- see `_build_broker_state`'s own docstring.
+
+STILL NO LIVE ADAPTER, STILL NO CREDENTIAL, BY DEFAULT. This does not wire
+`scripts/run_agent.py`'s own `build_account_runtime`/`_real_adapter_factory`
+(that path constructs `AlpacaPaperAdapter`, which needs a real
+`secrets_provider` resolve and real network access to Alpaca's paper
+servers -- neither available in this environment). A `SimulatorBroker`
+constructed here (the default, and today the ONLY adapter this script can
+actually reach -- see the paragraph above) is consequently a fresh,
 disconnected default paper account ($500, no positions) -- NOT a live
 mirror of whatever a real, separately-running `run_agent.py` process has
 actually done. Bridging to that live state (sharing a process, or a real
-read-only Alpaca client) is the SAME "real, worthwhile future work" this
+read-only Alpaca client, or adding this script's own `--key-id`/
+`--secret-ref` flags) is the SAME "real, worthwhile future work" this
 module's docstring already named before this unit, now additionally
 blocked on this sandbox's own lack of network egress -- still not done
 here. See this unit's own report for the exact fields this produces.
@@ -59,7 +76,7 @@ from agent.approval import ApprovalService
 from agent.approval_request_store import ApprovalRequestStore
 from agent.audit import AuditLog
 from agent.broker.base import AccountSnapshot, Position
-from agent.broker.simulator import SimulatorBroker
+from agent.broker.selection import select_broker_adapter
 from agent.cost import CostLedger
 from agent.dashboard_server import DashboardRuntime, make_server
 from agent.daytrade import DayTradeGuard
@@ -72,13 +89,25 @@ def _build_broker_state(
     cfg: config_module.Config, *, account_id: str | None,
     ledger_store_path: str | Path, now: datetime,
 ) -> tuple[AccountSnapshot | None, tuple[Position, ...], DayTradeGuard | None]:
-    """Real, local, PAPER-simulator-only broker state for `DashboardRuntime`
-    -- see this module's own docstring for what this is and is not. Never
-    raises: any failure (including "no account_id to scope any of this to"
-    at all) returns the same `(None, (), None)` triple `DashboardRuntime`'s
-    own field defaults already produce, so a broker-state failure degrades
-    exactly like "never wired at all" rather than crashing the process that
-    serves the rest of `GET /api/state`."""
+    """Real, local broker state for `DashboardRuntime`, via `agent.broker.
+    selection.select_broker_adapter` -- see this module's own docstring for
+    what this is and is not. Never raises: any failure (including "no
+    account_id to scope any of this to" at all) returns the same `(None,
+    (), None)` triple `DashboardRuntime`'s own field defaults already
+    produce, so a broker-state failure degrades exactly like "never wired
+    at all" rather than crashing the process that serves the rest of
+    `GET /api/state`.
+
+    CREDENTIALS ARE NOT WIRED HERE (config-driven-broker-selection unit,
+    2026-08-10): this script has no `--key-id`/`--secret-ref` flags, so
+    `select_broker_adapter` is always called with `credentials=None`,
+    `secrets_provider=None`. `cfg.broker` defaults to "simulator" (see
+    agent/config.py's own comment), for which neither is needed -- but if
+    an operator ever sets `cfg.broker: "alpaca_paper"` without ALSO adding
+    those flags to this script (out of scope for this unit), selection
+    raises `BrokerSelectionError` for the missing credentials, which the
+    `except Exception` below degrades to the same honest null this
+    function already promises, never a fabricated adapter."""
     if not account_id:
         return None, (), None
     try:
@@ -86,7 +115,7 @@ def _build_broker_state(
             HoldingPolicy(version="config", minimum_holding_period=cfg.minimum_hold,
                          cooldown_period=cfg.cooldown),
         ])
-        adapter = SimulatorBroker(account_id=account_id, now=now)
+        adapter = select_broker_adapter(cfg, account_id=account_id, now=now)
         store = LedgerStore(ledger_store_path, account_id=account_id,
                             policy_registry=registry)
         guard = DayTradeGuard(account_id=account_id,
