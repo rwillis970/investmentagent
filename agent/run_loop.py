@@ -461,7 +461,8 @@ def run_loop(*, accounts: list[AccountRuntime],
             sleep_fn: Callable[[float], None] = time.sleep,
             logger: logging.Logger | None = None,
             max_cycles: int | None = None,
-            pipeline: PipelineRuntime | None = None) -> None:
+            pipeline: PipelineRuntime | None = None,
+            on_cycle_success: Callable[[CycleReport], None] | None = None) -> None:
     """The scheduled loop. Runs `run_cycle` only when `in_session_now(now)`
     -- never overnight, never on a weekend/holiday -- and sleeps exactly
     until the next session's open otherwise, in one `sleep_fn` call, rather
@@ -515,6 +516,16 @@ def run_loop(*, accounts: list[AccountRuntime],
                 last_screened_at = report.pipeline_result.last_screened_at
             cycles_run += 1
             sleep_for = float(cadence_seconds)
+            # Notification-noise unit (2026-08-12): reaching here means
+            # run_cycle returned without raising -- every step, including
+            # run_startup, succeeded. This is the ONLY place a cycle is ever
+            # known-good; a caller wanting to detect "the process has
+            # recovered from a prior failure streak" (agent.failure_sentinel.
+            # clear) must observe success at exactly this granularity, not
+            # infer it from the absence of an exception at some higher
+            # layer. Default no-op preserves every existing call site.
+            if on_cycle_success is not None:
+                on_cycle_success(report)
         else:
             sleep_for = seconds_until_next_session_open(now)
             log.info(

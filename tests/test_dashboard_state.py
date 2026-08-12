@@ -6,10 +6,12 @@ no backing store and must come back null + a reason.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from agent import config as config_module
 from agent.approval_request_store import ApprovalRequestStore
 from agent.audit import AuditLog
+from agent.broker.base import AccountSnapshot, Position
 from agent.cost import CostEntry, CostLedger
 from agent.dashboard_state import build_dashboard_state
 from agent.opportunity_event_tracker import OpportunityEventTracker
@@ -83,6 +85,88 @@ def test_risk_gates_reflect_real_config_values(tmp_path):
     assert state["risk_gates"]["max_position_pct"] == 7.5
     assert state["risk_gates"]["current_reserve_pct"] is None
     assert state["risk_gates"]["current_reserve_pct_unavailable_reason"]
+
+
+def test_risk_gates_settled_and_unsettled_cash_are_null_with_no_broker_account(tmp_path):
+    """DASHBOARD FIX (2026-08-12): settled_cash_usd/unsettled_cash_usd share
+    the same broker_account-supplied-or-not gating as current_reserve_pct
+    above -- no fabricated figure when no broker_account was given."""
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+    )
+    assert state["risk_gates"]["settled_cash_usd"] is None
+    assert state["risk_gates"]["settled_cash_usd_unavailable_reason"]
+    assert state["risk_gates"]["unsettled_cash_usd"] is None
+    assert state["risk_gates"]["unsettled_cash_usd_unavailable_reason"]
+
+
+def test_risk_gates_broker_positions_is_an_empty_list_with_no_positions_supplied(tmp_path):
+    """Unlike settled_cash_usd/unsettled_cash_usd, broker_positions has its
+    own default of () (never None) -- it is always a present list, never
+    null/unavailable."""
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+    )
+    assert state["risk_gates"]["broker_positions"] == []
+    assert state["risk_gates"]["broker_positions_unavailable_reason"] is None
+
+
+def _account_snapshot(**over):
+    defaults = dict(
+        account_id=ACCT, equity=Decimal("500.00"), cash=Decimal("480.00"),
+        settled_cash=Decimal("480.00"), unsettled_cash=Decimal("20.00"),
+        buying_power=Decimal("480.00"), multiplier=Decimal("1.0"),
+        pattern_day_trader=False, day_trade_count=0, fetched_at=T0,
+    )
+    defaults.update(over)
+    return AccountSnapshot(**defaults)
+
+
+def test_risk_gates_settled_and_unsettled_cash_reflect_the_real_broker_account(tmp_path):
+    """DASHBOARD FIX (2026-08-12): the dashboard's own "Capital"/"Settled
+    cash" figures were reading hardcoded sample values ($500/$480) instead
+    of these -- same broker_account.settled_cash/.unsettled_cash source
+    current_reserve_pct already reads above."""
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    account = _account_snapshot(
+        settled_cash=Decimal("480.00"), unsettled_cash=Decimal("20.00"))
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, broker_account=account,
+    )
+    assert state["risk_gates"]["settled_cash_usd"] == 480.0
+    assert state["risk_gates"]["settled_cash_usd_unavailable_reason"] is None
+    assert state["risk_gates"]["unsettled_cash_usd"] == 20.0
+    assert state["risk_gates"]["unsettled_cash_usd_unavailable_reason"] is None
+
+
+def test_risk_gates_broker_positions_reflect_the_real_positions_tuple(tmp_path):
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    account = _account_snapshot()
+    positions = (
+        Position(account_id=ACCT, symbol="AAPL", qty=Decimal("1.5"),
+                avg_price=Decimal("190.00"), market_value=Decimal("300.00")),
+        Position(account_id=ACCT, symbol="SPY", qty=Decimal("0.25"),
+                avg_price=Decimal("600.00"), market_value=Decimal("150.00")),
+    )
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, broker_account=account,
+        broker_positions=positions,
+    )
+    assert state["risk_gates"]["broker_positions"] == [
+        {"symbol": "AAPL", "qty": 1.5, "market_value": 300.0},
+        {"symbol": "SPY", "qty": 0.25, "market_value": 150.0},
+    ]
+    assert state["risk_gates"]["broker_positions_unavailable_reason"] is None
 
 
 def test_pending_approvals_are_listed_with_real_fields(tmp_path):

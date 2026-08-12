@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import secrets as secrets_module
+import types
 from datetime import datetime, timedelta, timezone
 
 from agent import config as config_module
@@ -211,6 +212,51 @@ def test_build_pipeline_runtime_the_money_guardrail_defaults_are_off(tmp_path):
     assert pipeline.opportunity_tracker is not None
     assert pipeline.gatekeeper is not None
     assert pipeline.approval_request_store is not None
+    # REGRESSION (found live, 2026-08-12): news_provider/news_lookback were
+    # added to PipelineRuntime by the news collector unit but never threaded
+    # through here -- every real cycle with data_collection_enabled=True ran
+    # `collect_news_events(None, ...)`, which raises AttributeError
+    # unconditionally, every single collection-due cycle, restart-looping
+    # the whole process. market_data_client/edgar_client (same tier, same
+    # "always real, gated by data_collection_enabled at the CALL site, not
+    # here" contract) were never allowed to be None; news_provider must not
+    # be either.
+    assert pipeline.news_provider is not None
+
+
+def test_build_pipeline_runtime_threads_a_real_news_provider_and_lookback_through(tmp_path):
+    from agent import config as config_module
+    from agent.accounts import AccountType
+    from agent.approval import ApprovalService
+    from agent.audit import AuditLog
+    from agent.news_provider import NullNewsProvider
+    from agent.secrets_provider import InMemorySecretsProvider
+    from datetime import timedelta
+    from scripts.run_agent import build_pipeline_runtime
+
+    cfg = config_module.load(base_config())
+    creds = BrokerCredentials(account_id="acct-a", key_id="k", secret_ref="ref")
+    secrets = InMemorySecretsProvider(mode="PAPER")
+    approval_service = ApprovalService(expiration=timedelta(minutes=30),
+                                       min_display=timedelta(seconds=10), max_per_day=4)
+    pipeline = build_pipeline_runtime(
+        cfg, account_id="acct-a", credentials=creds, secrets_provider=secrets,
+        account_type=AccountType.TAXABLE, audit_log=AuditLog(),
+        approval_service=approval_service,
+        signing_key=SIGNING_KEY_BYTES,
+        fact_store_path=tmp_path / "facts.jsonl",
+        cost_ledger_path=tmp_path / "cost_ledger.jsonl",
+        extraction_cache_path=tmp_path / "extraction_cache.jsonl",
+        analysis_result_store_path=tmp_path / "analysis_results.jsonl",
+        approval_request_store_path=tmp_path / "approval_requests.jsonl",
+        opportunity_tracker_path=tmp_path / "opportunity_tracker.jsonl",
+    )
+    # base_config() never sets news_feed_provider -> defaults to "null" ->
+    # build_provider(cfg) returns the real, always-empty NullNewsProvider,
+    # never None -- mirroring config.py's own "safe, always-empty provider,
+    # not an implicitly-live one" default posture.
+    assert isinstance(pipeline.news_provider, NullNewsProvider)
+    assert pipeline.news_lookback == timedelta(hours=cfg.news_lookback_hours)
 
 
 def test_build_pipeline_runtime_constructs_a_real_anthropic_client_only_when_t4_is_enabled(tmp_path):
@@ -509,6 +555,109 @@ def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
         secrets_provider_factory=_secrets_provider_factory,
         notify_fn=lambda msg: None)
     assert (audit_path.parent / "failure_sentinel.json").exists()
+
+
+def _succeeding_run_loop_calling_on_cycle_success(now):
+    """A fake run_loop_fn that mimics agent.run_loop.run_loop's real
+    contract: it returns normally (no exception) and, before doing so,
+    calls the on_cycle_success hook it was given exactly once -- matching
+    what a real successful cycle does (see agent/run_loop.py)."""
+    def run_loop_fn(**kwargs):
+        on_cycle_success = kwargs["on_cycle_success"]
+        fake_report = types.SimpleNamespace(now=now)
+        on_cycle_success(fake_report)
+    return run_loop_fn
+
+
+def test_recovering_after_a_notified_failure_streak_sends_a_recovery_notification(tmp_path):
+    """The other half of the notification-noise unit's request: 'notify
+    when the process recovers, including how long the incident lasted and
+    how many consecutive failures occurred.' Three failing relaunches
+    notify on the third (existing behavior); a fourth, SUCCESSFUL cycle
+    must then send exactly one recovery notification and clear the
+    sentinel."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+
+    def failing_run_loop(**kwargs):
+        raise RuntimeError("SecretNotFoundError: keychain locked")
+
+    notified = []
+    for _ in range(3):
+        code = main(
+            _argv(tmp_path, config_path), run_loop_fn=failing_run_loop,
+            secrets_provider_factory=_secrets_provider_factory,
+            notify_fn=notified.append,
+        )
+        assert code == 1
+    assert len(notified) == 1   # the failure-side alert, at the 3rd
+
+    recovered_at = datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc)
+    code = main(
+        _argv(tmp_path, config_path),
+        run_loop_fn=_succeeding_run_loop_calling_on_cycle_success(recovered_at),
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=notified.append,
+    )
+    assert code == 0
+    assert len(notified) == 2
+    recovery_message = notified[1]
+    assert "RECOVERED" in recovery_message
+    assert "RuntimeError" in recovery_message   # exc_type, not the message text
+    assert "3" in recovery_message
+
+    sentinel_path = tmp_path / "failure_sentinel.json"
+    assert not sentinel_path.exists()
+
+
+def test_recovering_after_a_single_non_alerting_failure_sends_no_recovery_notification(tmp_path):
+    """A single transient failure never alerted in the first place (count 1
+    < threshold 3) -- an operator was never told anything was wrong, so
+    there is nothing to tell them recovered from. The sentinel is still
+    cleared so the next failure starts a fresh streak."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+
+    def failing_run_loop(**kwargs):
+        raise RuntimeError("boom")
+
+    notified = []
+    code = main(
+        _argv(tmp_path, config_path), run_loop_fn=failing_run_loop,
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=notified.append,
+    )
+    assert code == 1
+    assert notified == []
+
+    recovered_at = datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc)
+    code = main(
+        _argv(tmp_path, config_path),
+        run_loop_fn=_succeeding_run_loop_calling_on_cycle_success(recovered_at),
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=notified.append,
+    )
+    assert code == 0
+    assert notified == []   # still no notification -- never alerted, nothing to recover from
+
+    sentinel_path = tmp_path / "failure_sentinel.json"
+    assert not sentinel_path.exists()
+
+
+def test_a_successful_cycle_with_no_prior_failure_history_is_a_silent_no_op(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+
+    notified = []
+    code = main(
+        _argv(tmp_path, config_path),
+        run_loop_fn=_succeeding_run_loop_calling_on_cycle_success(
+            datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc)),
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=notified.append,
+    )
+    assert code == 0
+    assert notified == []
 
 
 def test_a_raising_notify_fn_does_not_change_the_exit_code_or_propagate(tmp_path):

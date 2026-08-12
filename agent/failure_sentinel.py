@@ -77,12 +77,29 @@ def record_failure(prior: FailureRecord | None, *, exc_type: str, message: str,
                         last_at=now, consecutive_count=1)
 
 
-def should_alert(record: FailureRecord, *, threshold: int = 3) -> bool:
-    """True once the SAME failure has recurred at least `threshold` times
-    in a row. A single occurrence of a new failure never alerts -- only a
-    failure that keeps recurring identically does, which is what
-    distinguishes "permanent" from "transient" here."""
-    return record.consecutive_count >= threshold
+def should_alert(record: FailureRecord, *, threshold: int = 3,
+                 escalation_counts: tuple[int, ...] = (5, 25, 100)) -> bool:
+    """True at the exact instant the SAME failure crosses `threshold`
+    consecutive occurrences, and again at each of `escalation_counts` --
+    never on every occurrence in between (notification-noise unit,
+    2026-08-12).
+
+    THE BUG THIS REPLACES: the original `consecutive_count >= threshold`
+    is true on EVERY call once the streak passes `threshold` -- since
+    `scripts/run_agent.py`'s `main()` calls this (and fires a real macOS
+    notification when it returns True) on every single launchd relaunch,
+    one persistent incident produced one notification per relaunch,
+    forever, for as long as the underlying condition stayed broken (a real
+    deployment hit 205 in a row for a single incident). A single occurrence
+    of a NEW failure still never alerts -- only a failure that keeps
+    recurring identically does, which is what distinguishes "permanent"
+    from "transient" here; this function now ALSO never re-alerts for the
+    same reason a single occurrence doesn't: an operator who has already
+    been told "this has failed 3 times in a row" gains nothing from being
+    told again at 4, 6, 7, ... 204 -- only at meaningfully escalated
+    milestones (5, 25, 100 by default) does the SAME information become
+    worth a second interruption."""
+    return record.consecutive_count == threshold or record.consecutive_count in escalation_counts
 
 
 def load(path: str | Path) -> FailureRecord | None:
@@ -119,3 +136,14 @@ def save(path: str | Path, record: FailureRecord) -> None:
     d["first_at"] = record.first_at.isoformat()
     d["last_at"] = record.last_at.isoformat()
     p.write_text(json.dumps(d))
+
+
+def clear(path: str | Path) -> None:
+    """Deletes the sentinel file (notification-noise unit, 2026-08-12): the
+    RECOVERY half of the same mechanism -- once a process resumes
+    succeeding, the incident this file was tracking is over, and the next
+    failure (of any type) must start a fresh streak at count 1, not
+    silently continue the old one. A safe no-op if the file does not exist
+    (nothing to clear -- e.g. a process that has never failed)."""
+    p = Path(path)
+    p.unlink(missing_ok=True)

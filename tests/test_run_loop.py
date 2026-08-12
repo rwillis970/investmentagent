@@ -50,7 +50,7 @@ from agent.news_provider import NullNewsProvider
 from agent.pipeline import Gatekeeper, StagedOrder, sign_staged_order
 from agent import pipeline_stage as pipeline_stage_module
 from agent.pipeline_stage import PipelineRuntime
-from agent.run_loop import (AccountRuntime, in_session_now, run_cycle,
+from agent.run_loop import (AccountRuntime, CycleReport, in_session_now, run_cycle,
                             run_loop, seconds_until_next_session_open)
 from agent.startup import StartupResult
 from agent.store import FactStore
@@ -511,6 +511,44 @@ def test_run_loop_stops_and_propagates_on_a_halt(tmp_path):
     # the halt happened on the first cycle attempt -- no sleep call after it,
     # proving the loop did not continue to a next iteration.
     assert clock.sleeps == []
+
+
+def test_run_loop_calls_on_cycle_success_once_per_successful_cycle(tmp_path):
+    """Notification-noise unit (2026-08-12): the recovery-notification
+    mechanism needs to know exactly when a cycle succeeded -- this is the
+    only place that is ever known True (run_cycle raises on any failure,
+    including a halt; see test above). Default is a no-op, so every existing
+    call site is unaffected."""
+    b = SimulatorBroker(account_id=ACCT, cash=500.0, now=IN_SESSION)
+    acct = account_runtime(tmp_path)
+    clock = FakeClock(IN_SESSION)
+    reports = []
+    run_loop(
+        accounts=[acct], adapter_factory=lambda a: b,
+        mode_store=mode_store_at("PAPER", now=IN_SESSION),
+        audit_log=agreeing_log("PAPER", now=IN_SESSION),
+        approval_service=approval_service(), target_mode="PAPER",
+        cadence_seconds=300, now_fn=clock.now_fn, sleep_fn=clock.sleep_fn,
+        max_cycles=2, on_cycle_success=reports.append,
+    )
+    assert len(reports) == 2
+    assert all(isinstance(r, CycleReport) for r in reports)
+
+
+def test_run_loop_does_not_call_on_cycle_success_on_a_halted_cycle(tmp_path):
+    b = SimulatorBroker(account_id=ACCT, cash=500.0, now=IN_SESSION)
+    acct = account_runtime(tmp_path)
+    clock = FakeClock(IN_SESSION)
+    reports = []
+    with pytest.raises(mode_fsm.IllegalModeTransition):
+        run_loop(
+            accounts=[acct], adapter_factory=lambda a: b,
+            mode_store=ModeStore(), audit_log=AuditLog(),
+            approval_service=approval_service(), target_mode="PRODUCTION_ACTIVE",
+            cadence_seconds=300, now_fn=clock.now_fn, sleep_fn=clock.sleep_fn,
+            max_cycles=5, on_cycle_success=reports.append,
+        )
+    assert reports == []
 
 
 # --------------------------------------------------- pipeline stage integration

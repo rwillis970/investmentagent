@@ -143,12 +143,28 @@ def build_dashboard_state(
             **_prefixed("current_reserve_pct", _present(reserve_pct)),
             **_prefixed("required_reserve_usd", _present(floor)),
             **_prefixed("investable_cash_usd", _present(available)),
+            # DASHBOARD FIX (2026-08-12): same source as current_reserve_pct
+            # above (`broker_account.settled_cash`/`.unsettled_cash`) -- the
+            # dashboard's own "Capital"/"Settled cash" figures were reading
+            # hardcoded sample values instead of these.
+            **_prefixed("settled_cash_usd", _present(float(broker_account.settled_cash))),
+            **_prefixed("unsettled_cash_usd", _present(float(broker_account.unsettled_cash))),
         })
     else:
-        for name in ("current_reserve_pct", "required_reserve_usd", "investable_cash_usd"):
+        for name in ("current_reserve_pct", "required_reserve_usd", "investable_cash_usd",
+                     "settled_cash_usd", "unsettled_cash_usd"):
             risk_gates.update(_prefixed(name, _null(
                 "no broker_account was supplied to build_dashboard_state for this cycle"
             )))
+
+    # DASHBOARD FIX (2026-08-12): `broker_positions` is a separate parameter
+    # from `broker_account` (its own default of `()`, never None) -- so
+    # unlike settled_cash_usd/unsettled_cash_usd above, this is always a
+    # real, present list (possibly empty), never null/unavailable.
+    risk_gates.update(_prefixed("broker_positions", _present([
+        {"symbol": p.symbol, "qty": float(p.qty), "market_value": float(p.market_value)}
+        for p in broker_positions
+    ])))
 
     pending = approval_request_store.pending(account_id=account_id, now=now)
     pending_out = []

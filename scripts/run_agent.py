@@ -38,6 +38,21 @@ transient failure never notifies. See deploy/README.md for the manual
 fallback (`launchctl list`, tailing the log files) alongside this automatic
 path.
 
+NOTIFICATION-NOISE FIX + RECOVERY NOTIFICATION (notification-noise unit,
+2026-08-12; a real deployment hit 205 notifications for one incident,
+root-caused to `agent.failure_sentinel.should_alert`'s old `>= threshold`
+logic firing on literally every relaunch past the third). `should_alert`
+now fires only at the exact threshold crossing and at configurable
+escalation milestones (5, 25, 100 by default) -- see that function's own
+docstring. The other half of the same incident report ("notify when the
+process recovers, including how long the incident lasted and how many
+consecutive failures occurred") is `_on_cycle_success` below, passed as
+`agent.run_loop.run_loop`'s new `on_cycle_success` hook: called once per
+cycle that completes without raising, it notifies (once) if the
+just-cleared incident had ever crossed the alert threshold, then always
+clears the sentinel (`agent.failure_sentinel.clear`) so the next failure
+starts a fresh streak.
+
 --ADVANCE-MODE-TO: THE OPERATOR PATH AROUND A REAL DEAD END (found running
 the loop for the first time). §9.2's one-step rule requires DISABLED ->
 RESEARCH -> PAPER; a fresh install cannot reach PAPER in one step. Setting
@@ -483,6 +498,22 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
         http_max_retries=cfg.edgar_http_max_retries,
         min_request_interval_seconds=cfg.edgar_min_request_interval_seconds,
     )
+    # REGRESSION FIX (found live, 2026-08-12): news_provider/news_lookback
+    # are read unconditionally by agent.pipeline_stage.run_pipeline_stage's
+    # collection block whenever data_collection_enabled is true -- same
+    # tier as market_data_client/edgar_client immediately above, which this
+    # function has always constructed unconditionally. This one line was
+    # missing when the news collector unit added the two PipelineRuntime
+    # fields; every live cycle with data_collection_enabled=True (config.
+    # json's real setting) called agent.news_collector.collect_news_events
+    # with provider=None (the dataclass default), which raises
+    # `AttributeError: 'NoneType' object has no attribute 'fetch_since'`
+    # unconditionally, restart-looping the whole process. config_module.
+    # build_provider(cfg) is the same config-driven dispatch
+    # agent.broker.selection.select_broker_adapter already models for
+    # `cfg.broker` -- it returns a real NullNewsProvider by default
+    # (news_feed_provider="null", the safe default), never None.
+    news_provider = config_module.build_provider(cfg)
     cost_ledger = CostLedger(monthly_budget=cfg.monthly_budget_usd,
                             warning_at=cfg.budget_warning_usd,
                             hard_stop_at=cfg.budget_hard_stop_usd, path=cost_ledger_path)
@@ -504,6 +535,8 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
         fact_store=FactStore(fact_store_path),
         market_data_client=market_data_client,
         edgar_client=edgar_client,
+        news_provider=news_provider,
+        news_lookback=timedelta(hours=cfg.news_lookback_hours),
         ticker_cik_cache=TickerCikCache(),
         ticker_cik_refresh_max_age=timedelta(
             hours=cfg.edgar_ticker_cik_refresh_interval_hours),
@@ -1353,6 +1386,66 @@ def main(argv: list[str] | None = None, *,
             secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
         )
 
+    # Computed once, before the try block, so both the success-side
+    # recovery closure below and the except-block's failure bookkeeping
+    # reference the SAME path (notification-noise unit, 2026-08-12).
+    sentinel_path = Path(args.audit_log_path).parent / "failure_sentinel.json"
+
+    def _on_cycle_success(report) -> None:
+        """RECOVERY half of the failure_sentinel mechanism (notification-
+        noise unit, 2026-08-12): passed as `agent.run_loop.run_loop`'s
+        `on_cycle_success` hook, so this is called once per cycle that
+        completes without raising -- the only place a recovery is ever
+        known to have happened (see that parameter's own docstring).
+
+        A prior sentinel record whose OWN `consecutive_count` ever reached
+        `FAILURE_ALERT_THRESHOLD` means an operator was already notified
+        this incident started; they should also be told it ended, with how
+        long it lasted and how many consecutive failures occurred -- the
+        two facts explicitly asked for. `consecutive_count >= threshold`
+        (not `== threshold`) is deliberate: because `record_failure`
+        increments by exactly 1 each time starting from 1, `>= threshold`
+        can only be true if the record passed through `== threshold` on
+        some earlier save -- i.e. an alert was already fired then,
+        regardless of where escalation left it now (see agent.
+        failure_sentinel.should_alert's own docstring for the milestone
+        logic this mirrors).
+
+        A prior record that never crossed the threshold (a single
+        transient failure) never alerted in the first place -- there is
+        nothing an operator was told to "recover" from, so this stays
+        silent for that case, but STILL clears the sentinel below: the
+        next failure of any type must start a fresh streak at 1, not
+        silently continue whatever count was already there.
+
+        Mirrors the failure-side `notify_fn` call in the except-block
+        below: a raising `notify_fn`, or any other error in this
+        bookkeeping, must never propagate out of a successful cycle."""
+        try:
+            prior = failure_sentinel.load(sentinel_path)
+            if prior is not None and prior.consecutive_count >= FAILURE_ALERT_THRESHOLD:
+                duration = report.now - prior.first_at
+                message = (
+                    f"investmentagent: RECOVERED -- the {prior.exc_type} "
+                    f"failure that recurred {prior.consecutive_count} times "
+                    f"in a row (since {prior.first_at.isoformat()}) has now "
+                    f"cleared, as of {report.now.isoformat()} (incident "
+                    f"duration: {duration})."
+                )
+                log.info(message)
+                try:
+                    notify_fn(message)
+                except Exception as notify_exc:   # noqa: BLE001 -- a failed
+                    # notification must never mask the recovery itself or
+                    # change this function's own exit code.
+                    log.warning("recovery notification itself failed: %s", notify_exc)
+            failure_sentinel.clear(sentinel_path)
+        except Exception as sentinel_exc:   # noqa: BLE001 -- best-effort
+            # operational convenience, same posture as the failure-side
+            # sentinel bookkeeping in the except-block below.
+            log.warning("failure sentinel recovery bookkeeping itself failed: %s",
+                       sentinel_exc)
+
     try:
         cfg = config_module.load(json.loads(Path(args.config).read_text()))
         secrets_provider = secrets_provider_factory(cfg.mode)
@@ -1403,6 +1496,7 @@ def main(argv: list[str] | None = None, *,
             confirmed=args.confirmed,
             cadence_seconds=cfg.reconciliation_cycle_interval_seconds,
             logger=log, pipeline=pipeline,
+            on_cycle_success=_on_cycle_success,
         )
         return 0
     except Exception as exc:   # noqa: BLE001 -- see agent.run_loop.run_loop's
@@ -1423,7 +1517,8 @@ def main(argv: list[str] | None = None, *,
         # make a genuinely permanent failure never look like a recurrence
         # at all.
         try:
-            sentinel_path = Path(args.audit_log_path).parent / "failure_sentinel.json"
+            # sentinel_path is computed once above, before the try block,
+            # and shared with _on_cycle_success's recovery bookkeeping.
             prior = failure_sentinel.load(sentinel_path)
             record = failure_sentinel.record_failure(
                 prior, exc_type=type(exc).__name__, message=str(exc),

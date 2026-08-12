@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from agent.failure_sentinel import (FailureRecord, load, record_failure,
+from agent.failure_sentinel import (FailureRecord, clear, load, record_failure,
                                     save, should_alert)
 
 T0 = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
@@ -105,13 +105,41 @@ def test_should_not_alert_below_the_threshold():
     assert should_alert(rec, threshold=3) is False
 
 
-def test_should_alert_at_or_above_the_threshold():
+def test_should_alert_exactly_at_the_threshold_crossing():
     rec = FailureRecord(exc_type="RuntimeError", message="boom", first_at=T0,
                        last_at=T0, consecutive_count=3)
     assert should_alert(rec, threshold=3) is True
-    rec2 = FailureRecord(exc_type="RuntimeError", message="boom", first_at=T0,
-                        last_at=T0, consecutive_count=10)
-    assert should_alert(rec2, threshold=3) is True
+
+
+def test_should_not_alert_again_for_every_recurrence_past_the_threshold():
+    """THE DEDUP FIX (notification-noise unit, 2026-08-12): one persistent
+    incident must not generate a macOS notification for every single
+    recurrence -- see agent/run_agent.py's own real-world report of 205
+    notifications for one incident, root-caused to this function's old
+    `>= threshold` behavior alerting on literally every call past the
+    threshold. Counts strictly between milestones never alert."""
+    for count in (4, 6, 7, 10, 24, 26, 99, 101, 205):
+        rec = FailureRecord(exc_type="RuntimeError", message="boom", first_at=T0,
+                           last_at=T0, consecutive_count=count)
+        assert should_alert(rec, threshold=3) is False, count
+
+
+def test_alerts_again_at_each_escalation_milestone():
+    """5, 25, 100 (the default escalation_counts) are the only points past
+    the initial threshold-crossing where this fires again -- an operator
+    watching a still-unresolved incident gets an escalating signal without
+    the volume of one notification per occurrence."""
+    for count in (5, 25, 100):
+        rec = FailureRecord(exc_type="RuntimeError", message="boom", first_at=T0,
+                           last_at=T0, consecutive_count=count)
+        assert should_alert(rec, threshold=3) is True, count
+
+
+def test_escalation_milestones_are_configurable():
+    rec = FailureRecord(exc_type="RuntimeError", message="boom", first_at=T0,
+                       last_at=T0, consecutive_count=50)
+    assert should_alert(rec, threshold=3, escalation_counts=(50,)) is True
+    assert should_alert(rec, threshold=3, escalation_counts=(5, 25, 100)) is False
 
 
 def test_a_single_transient_failure_does_not_alert():
@@ -184,6 +212,21 @@ def test_a_realistic_load_record_save_cycle_across_three_relaunches(tmp_path):
     final = load(path)
     assert final.consecutive_count == 3
     assert should_alert(final, threshold=3) is True
+
+
+def test_clear_removes_the_sentinel_file(tmp_path):
+    """RECOVERY (notification-noise unit, 2026-08-12): once a process
+    resumes succeeding, the incident is over -- the next failure (if any)
+    must start a fresh count at 1, not silently continue the old streak."""
+    path = tmp_path / "failure_sentinel.json"
+    save(path, FailureRecord(exc_type="RuntimeError", message="boom", first_at=T0,
+                            last_at=T0, consecutive_count=5))
+    clear(path)
+    assert load(path) is None
+
+
+def test_clear_of_a_nonexistent_path_is_a_safe_no_op(tmp_path):
+    clear(tmp_path / "nope.json")   # must not raise
 
 
 def test_a_realistic_reconciliation_halt_with_a_drifting_message_still_alerts(tmp_path):

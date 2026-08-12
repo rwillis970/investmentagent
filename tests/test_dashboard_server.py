@@ -365,16 +365,22 @@ def test_api_state_approvals_pending_is_an_empty_list_with_no_requests(tmp_path)
     assert payload["approvals"]["pending"] == []
 
 
-def test_api_state_never_exposes_a_settled_cash_figure(tmp_path):
-    """Whole-queue follow-up (2026-08-10): approval_card_bind.js's own
-    `extractCash` only ever builds a non-null `{settled, floor, earmarked,
-    available}` object if all four are present, and documents that
-    `settled` never resolves because /api/state has no field for it
-    anywhere -- checked directly, not assumed. This test locks that claim
-    in against the real server response, WITH a broker_account supplied so
-    floor/available are populated -- proving `cash` is null because
-    `settled` is specifically and permanently missing, not just because
-    every other figure happened to be missing too."""
+def test_api_state_now_exposes_a_settled_cash_figure(tmp_path):
+    """SUPERSEDES test_api_state_never_exposes_a_settled_cash_figure
+    (whole-queue follow-up, 2026-08-10 -> DASHBOARD FIX, 2026-08-12). That
+    test locked in a real, checked-not-assumed gap: /api/state had no field
+    for the account's current settled-cash figure anywhere, so the
+    dashboard's "Capital"/"Settled cash" panels showed hardcoded sample
+    values ($500/$480) instead of anything real. The DASHBOARD FIX closes
+    exactly that gap -- `risk_gates.settled_cash_usd`/`unsettled_cash_usd`
+    now read `broker_account.settled_cash`/`.unsettled_cash` directly (see
+    agent/dashboard_state.py). This test replaces the old lock-in with the
+    opposite assertion: the real account-state figure IS now present, under
+    exactly the key name the fix added, with the real value from the
+    snapshot -- not a stand-in for every other "settled"-named key (the
+    config policy thresholds `minimum_settled_cash_pct_of_nlv`/
+    `minimum_absolute_settled_cash` are a different concept and untouched
+    by this fix)."""
     runtime, _ = make_runtime(tmp_path)
     runtime.broker_account = AccountSnapshot(
         account_id=ACCT, equity=Decimal("500"), cash=Decimal("500"),
@@ -384,30 +390,10 @@ def test_api_state_never_exposes_a_settled_cash_figure(tmp_path):
     )
     result = route_request(runtime, method="GET", path="/api/state")
     payload = json.loads(result.body)
-    # floor/available ARE populated -- proves this isn't just "no
-    # broker_account at all" producing every risk_gates field as null.
     assert payload["risk_gates"]["required_reserve_usd"] is not None
     assert payload["risk_gates"]["investable_cash_usd"] is not None
-    # settled cash itself (the ACCOUNT-STATE figure, $500 on the snapshot
-    # above) is nowhere in the response, under any key -- walk the whole
-    # payload for any "settled"-named key whose value is that figure.
-    # `minimum_settled_cash_pct_of_nlv`/`minimum_absolute_settled_cash` are
-    # a different concept entirely (config policy thresholds, not a current
-    # account balance) and are excluded by name, not by accident.
-    _POLICY_THRESHOLD_KEYS = {"minimum_settled_cash_pct_of_nlv", "minimum_absolute_settled_cash"}
-
-    def find_settled_cash_value(node, path=""):
-        found = []
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if "settled" in k.lower() and k not in _POLICY_THRESHOLD_KEYS:
-                    found.append((f"{path}.{k}", v))
-                found.extend(find_settled_cash_value(v, f"{path}.{k}"))
-        elif isinstance(node, list):
-            for i, v in enumerate(node):
-                found.extend(find_settled_cash_value(v, f"{path}[{i}]"))
-        return found
-    assert find_settled_cash_value(payload) == []
+    assert payload["risk_gates"]["settled_cash_usd"] == 500.0
+    assert payload["risk_gates"]["unsettled_cash_usd"] == 0.0
 
 
 def test_command_center_html_has_no_support_js_reference(tmp_path):
