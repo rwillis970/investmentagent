@@ -101,6 +101,56 @@ def test_fresh_ledger_reconciles_cleanly_against_a_real_starting_account():
                           broker_account=broker_snapshot)   # no raise
 
 
+# ------------------------------------------------- opening positions (base layer,
+# opening-position-seed unit, 2026-08-12): a plain seeded symbol->qty mapping,
+# fixed at construction, no lot behind it -- see Ledger's own docstring.
+
+def test_fresh_ledger_opening_positions_defaults_to_empty():
+    l = ledger()
+    assert l.positions() == {}
+
+
+def test_opening_positions_are_reported_by_positions():
+    l = Ledger(account_id=ACCT, opening_settled_cash=to_decimal(500.0),
+              policy_registry=registry(), opening_positions={"SPY": to_decimal("0.01")})
+    assert l.positions() == {"SPY": Decimal("0.01")}
+
+
+def test_opening_positions_combine_with_a_later_fill_for_the_same_symbol():
+    """The exact scenario this unit exists for: an opening-seeded 0.01 SPY
+    plus a later real fill for the same symbol sums, rather than one
+    silently overwriting the other."""
+    l = Ledger(account_id=ACCT, opening_settled_cash=to_decimal(500.0),
+              policy_registry=registry(), opening_positions={"SPY": to_decimal("0.01")})
+    l.record_fill(buy(qty="0.017", price=737.986))
+    assert l.positions() == {"SPY": Decimal("0.027")}
+
+
+def test_opening_positions_for_one_symbol_do_not_affect_a_different_symbol():
+    l = Ledger(account_id=ACCT, opening_settled_cash=to_decimal(500.0),
+              policy_registry=registry(), opening_positions={"SPY": to_decimal("0.01")})
+    l.record_fill(buy(symbol="QQQ", lot_id="l2", qty=1.0, price=400.0))
+    assert l.positions() == {"SPY": Decimal("0.01"), "QQQ": Decimal("1")}
+
+
+def test_from_records_threads_opening_positions_through():
+    l = Ledger.from_records(account_id=ACCT, opening_settled_cash=to_decimal(500.0),
+                            policy_registry=registry(),
+                            opening_positions={"SPY": to_decimal("0.01")})
+    assert l.positions() == {"SPY": Decimal("0.01")}
+
+
+def test_opening_positions_are_not_a_lot_and_are_not_sellable():
+    """KNOWN, DISCLOSED LIMITATION (see Ledger's own docstring): an
+    opening-seeded quantity never went through record_fill, so it has no
+    lot_id/holding_policy_version/opened_at -- it satisfies positions()'s
+    aggregate output but is invisible to lots()."""
+    l = Ledger(account_id=ACCT, opening_settled_cash=to_decimal(500.0),
+              policy_registry=registry(), opening_positions={"SPY": to_decimal("0.01")})
+    assert l.positions() == {"SPY": Decimal("0.01")}
+    assert list(l.lots()) == []
+
+
 # ------------------------------------------------------------------- buy fills
 
 def test_a_buy_fill_creates_a_position():

@@ -209,6 +209,8 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+from .accounts import CrossAccountError
+from .broker.base import Position
 from .holding import HoldingPolicyRegistry
 from .ledger import CashAdjustment, Fill, Ledger, OrderRecord
 from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy
@@ -242,6 +244,15 @@ class LedgerStore:
         self._lot_selection_policy = lot_selection_policy
         self._opening: Decimal | None = None
         self._opening_established_at: datetime | None = None
+        # opening-position-seed unit, 2026-08-12 -- see write_opening_
+        # positions's own docstring. Plain dict, never None: "never
+        # seeded" and "seeded to an empty broker snapshot" are both
+        # legitimately {} and need no distinguishing here (unlike
+        # self._opening, to_ledger() never refuses to construct over an
+        # empty positions base the way it refuses over a None opening
+        # balance -- an account with no positions yet is an entirely
+        # ordinary state, not a "never seeded, refuse to guess" one).
+        self._opening_positions: dict[str, Decimal] = {}
         # The validating Ledger's own opening_settled_cash is a PLACEHOLDER
         # -- never read, never exposed. It exists purely so record_fill/
         # record_order_status's existing validation logic can be reused
@@ -348,6 +359,77 @@ class LedgerStore:
         self._opening = backdated
         self._opening_established_at = now
 
+    def write_opening_positions(self, positions: list[Position]) -> None:
+        """Opening-position-seed unit, 2026-08-12: the positions analogue
+        of `write_opening_balance` above -- see `agent.ledger.Ledger`'s own
+        docstring for how the seeded figure combines with fill-derived
+        lots at read time (`positions()`'s BASE LAYER section).
+
+        NOT `write_opening_positions(account_id, positions)` as this
+        unit's own prompt literally specified -- deliberately: every other
+        write method on this class (`write_fill`/`write_order_record`/
+        `write_cash_adjustment`, and `write_opening_balance` above) takes
+        NO `account_id` parameter, because this store is already bound to
+        exactly one `account_id` at construction (see this class's own
+        "REVIEW FIX -- BOUND TO ONE account_id AT CONSTRUCTION" module
+        docstring section) -- adding a second, redundant `account_id`
+        parameter here would be the one write method on this class that
+        could disagree with what the store already knows, for no benefit.
+        Each `Position.account_id` is checked against `self.account_id`
+        below instead, the same defense-in-depth `write_fill`/`Ledger.
+        record_fill` already apply per-row.
+
+        IDEMPOTENT, THE SAME SHAPE AS `write_opening_balance`: a second
+        call with a symbol->qty mapping IDENTICAL to what is already
+        durably recorded is a safe no-op; a second call with a DIFFERENT
+        mapping is a hard error -- opening positions are written exactly
+        once, never re-derived from a later broker read, for the same
+        reason `write_opening_balance` never re-derives its own figure.
+
+        REFUSES PER-SYMBOL IF THIS STORE'S OWN FILL-DERIVED NET POSITION
+        FOR THAT SYMBOL IS ALREADY NONZERO -- the same "enforced in the
+        store, not just the caller" discipline `write_opening_balance`'s
+        own "no fills yet" refusal already establishes for cash (see this
+        module's own docstring's ENFORCED IN THE STORE section): seeding a
+        broker-reported qty for a symbol this ledger already has a real,
+        nonzero fill-derived holding for would double-count that symbol.
+        A symbol with a fill history that nets to EXACTLY zero (bought
+        then fully sold) is not a conflict -- there is nothing already
+        accounted for at that symbol -- and may still be seeded over,
+        exactly the same distinction `agent.account_wiring.
+        build_account_reconciliation`'s own gate (`ledger.positions()` is
+        empty, not `not fills`) makes for calling this at all."""
+        for p in positions:
+            if p.account_id != self.account_id:
+                raise CrossAccountError(self.account_id, p.account_id,
+                                        "LedgerStore.write_opening_positions")
+        new_map = {p.symbol: to_decimal(p.qty) for p in positions}
+        existing_derived = self._ledger.positions()
+        conflicting = {sym: qty for sym, qty in existing_derived.items()
+                      if qty != _ZERO and sym in new_map}
+        if conflicting:
+            raise LedgerStoreError(
+                f"refusing to seed opening positions for {sorted(conflicting)}: "
+                f"this ledger already has a nonzero fill-derived position "
+                f"({conflicting!r}) for at least one of those symbols -- seeding "
+                "a broker-reported opening figure on top of it would "
+                "double-count. Only symbols with no existing nonzero position "
+                "may be seeded this way."
+            )
+        if self._opening_positions:
+            if self._opening_positions == new_map:
+                return   # identical re-seed attempt -- safe, idempotent no-op
+            raise LedgerStoreError(
+                f"opening positions are already durably set to "
+                f"{self._opening_positions!r}; refusing to overwrite with "
+                f"{new_map!r} -- written exactly once, never re-derived from a "
+                "later broker read (see module docstring)"
+            )
+        for p in positions:
+            self._append_row({"kind": "opening_position", "symbol": p.symbol,
+                             "qty": str(to_decimal(p.qty))})
+        self._opening_positions = new_map
+
     def write_fill(self, fill: Fill) -> None:
         """Validated through the internal `Ledger` BEFORE a single byte
         reaches disk -- a rejection raises exactly what a bare `Ledger`
@@ -431,6 +513,7 @@ class LedgerStore:
             lot_selection_policy=self._lot_selection_policy,
             fills=self._ledger.fills, order_records=self._ledger.order_records,
             cash_adjustments=self._ledger.cash_adjustments,
+            opening_positions=self._opening_positions,
         )
 
     def update(self, *a, **k):
@@ -471,6 +554,14 @@ class LedgerStore:
                 ledger.record_order_status(_decode_order_record(row))
             elif kind == "cash_adjustment":
                 ledger.record_cash_adjustment(_decode_cash_adjustment(row))
+            elif kind == "opening_position":
+                # Direct field assignment, NOT re-invoking write_opening_
+                # positions -- same discipline the "opening_balance" branch
+                # above already applies to self._opening: replay sets the
+                # in-memory field straight from the row, it does not re-run
+                # the write method's own idempotency/conflict checks (those
+                # were already satisfied once, at original write time).
+                self._opening_positions[row["symbol"]] = to_decimal(row["qty"])
             else:
                 raise LedgerStoreError(
                     f"unrecognised ledger store row kind {kind!r} -- refusing to "

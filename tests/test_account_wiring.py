@@ -73,6 +73,73 @@ def test_seeding_uses_the_brokers_settled_cash_not_cash_or_equity(tmp_path):
     assert s.load()[0] == b.account().settled_cash == 321.0
 
 
+# --------------------------- opening-position-seed unit, 2026-08-12: same
+# guard as the cash seed immediately above, but for positions.
+
+def test_first_ever_startup_seeds_opening_positions_from_the_broker(tmp_path):
+    b = broker(cash=500.0)
+    b._positions["SPY"] = (to_decimal("0.027087234"), to_decimal("737.986"))
+    s = store(tmp_path / "l.jsonl")
+    rec = build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
+                                       day_trade_guard=guard(), now=NOW)
+    assert rec.local_positions == {"SPY": to_decimal("0.027087234")}
+    assert s.to_ledger().positions() == {"SPY": to_decimal("0.027087234")}
+
+
+def test_a_fresh_account_with_no_broker_positions_seeds_an_empty_mapping(tmp_path):
+    b = broker(cash=500.0)
+    s = store(tmp_path / "l.jsonl")
+    rec = build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
+                                       day_trade_guard=guard(), now=NOW)
+    assert rec.local_positions == {}
+
+
+def test_a_subsequent_call_never_reseeds_positions(tmp_path):
+    """The broker's positions have since moved; a second call must NOT
+    re-derive the opening positions from the new broker snapshot -- the
+    ledger already tracks any change through ordinary fill sync."""
+    path = tmp_path / "l.jsonl"
+    b = broker(cash=500.0)
+    b._positions["SPY"] = (to_decimal("0.01"), to_decimal("700"))
+    s = store(path)
+    build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
+                                 day_trade_guard=guard(), now=NOW)
+
+    s2 = store(path)
+    b2 = broker(cash=500.0)
+    b2._positions["SPY"] = (to_decimal("0.05"), to_decimal("700"))   # moved since
+    rec = build_account_reconciliation(account_id=ACCT, adapter=b2, store=s2,
+                                       day_trade_guard=guard(), now=NOW)
+    assert rec.local_positions == {"SPY": to_decimal("0.01")}   # unchanged -- never re-seeded
+
+
+def test_a_later_fill_for_the_seeded_symbol_sums_rather_than_double_counting(tmp_path):
+    """The exact scenario this unit exists for: an opening-seeded 0.01 SPY
+    plus a later real fill for the same symbol reports the sum, not one
+    silently overwriting the other."""
+    path = tmp_path / "l.jsonl"
+    b = broker(cash=500.0)
+    b._positions["SPY"] = (to_decimal("0.01"), to_decimal("700"))
+    s = store(path)
+    build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
+                                 day_trade_guard=guard(), now=NOW)
+    s.write_fill(Fill(fill_id="f1", account_id=ACCT, symbol="SPY", side="BUY",
+                      qty=to_decimal("0.017"), price=to_decimal("737.986"), filled_at=NOW,
+                      lot_id="l1", holding_policy_version="hp-v1"))
+    rec = build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
+                                       day_trade_guard=guard(), now=NOW)
+    assert rec.local_positions == {"SPY": to_decimal("0.027")}
+
+
+def test_a_freshly_seeded_position_reconciles_cleanly_against_the_broker(tmp_path):
+    b = broker(cash=500.0)
+    b._positions["SPY"] = (to_decimal("0.027087234"), to_decimal("737.986"))
+    s = store(tmp_path / "l.jsonl")
+    rec = build_account_reconciliation(account_id=ACCT, adapter=b, store=s,
+                                       day_trade_guard=guard(), now=NOW)
+    assert rec.local_positions == {p.symbol: p.qty for p in rec.broker_positions}
+
+
 # ----------------------------------------------------- subsequent startups
 
 def test_a_subsequent_call_never_reseeds(tmp_path):

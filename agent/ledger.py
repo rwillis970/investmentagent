@@ -376,18 +376,48 @@ class OrderRecord:
 
 class Ledger:
     """Per-account (see module docstring). Reconstructible from
-    `self.fills` + `self.order_records` + `opening_settled_cash` alone --
-    nothing else here is state that could drift from that record."""
+    `self.fills` + `self.order_records` + `opening_settled_cash` +
+    `opening_positions` alone -- nothing else here is state that could
+    drift from that record.
+
+    OPENING POSITIONS (opening-position-seed unit, 2026-08-12) -- A BASE
+    LAYER, NOT A LOT. `opening_positions` is a plain `symbol -> qty`
+    mapping, seeded at construction exactly once (mirrors
+    `opening_settled_cash`'s own "fixed at construction, never replayed as
+    a delta" shape) -- see `positions()` below for how it combines with
+    fill-derived lots. Deliberately NOT `agent.broker.base.Position` (which
+    also carries `account_id`/`avg_price`/`market_value`, none of which
+    this class has any use for): keeping this a bare `dict[str, Decimal]`
+    avoids giving `Ledger` a new dependency on the broker layer it has
+    never had (no I/O, no knowledge of `LedgerStore` OR of `agent.broker`
+    -- see `from_records`'s own docstring for the first half of that
+    claim). `agent.ledger_store.LedgerStore.write_opening_positions` is
+    what actually accepts a `list[Position]` from a real broker read and
+    narrows it to this shape before it ever reaches here.
+
+    KNOWN, DISCLOSED LIMITATION: an opening-seeded quantity has NO LOT --
+    it never went through `record_fill`, so it has no `lot_id`, no
+    `holding_policy_version`, no `opened_at`. It satisfies
+    `agent.reconciliation.reconcile_positions`'s exact-equality check (the
+    only thing this unit was asked to close), but `agent.holding.
+    sellable_qty`/`Gatekeeper.stage`'s own lot-based SELL path reasons over
+    `self.lots()`, not over this method's aggregate output -- an
+    opening-seeded holding is therefore NOT sellable through this system's
+    normal order path until/unless a future unit gives it a real lot. Not
+    fixed here; named plainly, per this unit's own instruction to report
+    what was and was not done."""
 
     def __init__(self, *, account_id: str, opening_settled_cash: Decimal,
                 policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
-                lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY):
+                lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY,
+                opening_positions: dict[str, Decimal] | None = None):
         if opening_settled_cash < 0:
             raise LedgerError(
                 f"opening_settled_cash must not be negative, got {opening_settled_cash!r}"
             )
         self.account_id = account_id
         self._opening_settled_cash = opening_settled_cash
+        self._opening_positions: dict[str, Decimal] = dict(opening_positions or {})
         self._policy_registry = policy_registry
         self._t_plus = t_plus
         self._lot_selection_policy = lot_selection_policy
@@ -401,20 +431,27 @@ class Ledger:
     def from_records(cls, *, account_id: str, opening_settled_cash: Decimal,
                      policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
                      lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY,
-                     fills=(), order_records=(), cash_adjustments=()) -> "Ledger":
+                     fills=(), order_records=(), cash_adjustments=(),
+                     opening_positions: dict[str, Decimal] | None = None) -> "Ledger":
         """Reconstruct a ledger from a previously-recorded (fills,
-        order_records, cash_adjustments) triple alone -- the directly
-        testable form of "this module's state is reconstructible from the
-        record," not just an architectural claim. See `Ledger.fills`/
-        `Ledger.order_records`/`Ledger.cash_adjustments` for the read side
-        of this round trip. Durable persistence of that record now exists
+        order_records, cash_adjustments) triple, plus `opening_positions`
+        (opening-position-seed unit, 2026-08-12; see `Ledger`'s own
+        docstring) -- the directly testable form of "this module's state
+        is reconstructible from the record," not just an architectural
+        claim. See `Ledger.fills`/`Ledger.order_records`/`Ledger.
+        cash_adjustments`/`Ledger.positions` for the read side of this
+        round trip. Durable persistence of that record now exists
         (`agent.ledger_store.LedgerStore`, its own module) --
         `LedgerStore.to_ledger(...)` is the actual restart path that calls
         this constructor; `Ledger` itself still has no I/O and no
-        knowledge of that store, by design."""
+        knowledge of that store, by design. `opening_positions`, like
+        `opening_settled_cash`, is passed straight to `__init__` -- it is
+        set once, at construction, never replayed as a delta the way
+        fills/order_records/cash_adjustments are below."""
         ledger = cls(account_id=account_id, opening_settled_cash=opening_settled_cash,
                     policy_registry=policy_registry, t_plus=t_plus,
-                    lot_selection_policy=lot_selection_policy)
+                    lot_selection_policy=lot_selection_policy,
+                    opening_positions=opening_positions)
         for f in fills:
             ledger.record_fill(f)
         for r in order_records:
@@ -647,11 +684,20 @@ class Ledger:
         return out
 
     def positions(self) -> dict[str, Decimal]:
-        """Total held qty per symbol, across all OPEN lots -- what a
-        broker's own positions endpoint reports (settled or not). See the
-        module docstring for why this is deliberately NOT
-        `holding.sellable_qty`."""
-        by_symbol: dict[str, Decimal] = {}
+        """Total held qty per symbol -- what a broker's own positions
+        endpoint reports (settled or not). See the module docstring for why
+        this is deliberately NOT `holding.sellable_qty`.
+
+        BASE LAYER, THEN OPEN LOTS (opening-position-seed unit,
+        2026-08-12): starts from `self._opening_positions` (see `Ledger`'s
+        own docstring -- a plain seeded qty, no lot behind it), then ADDS
+        every OPEN lot's own qty on top, per symbol. A symbol present in
+        both sums; a symbol present in only one is reported as-is. This is
+        why the seed and fill-derived quantities combine correctly for the
+        same symbol (an opening-seeded 0.01 SPY plus a later real 0.017 SPY
+        fill reports 0.027 SPY here, not a silent overwrite of one by the
+        other)."""
+        by_symbol: dict[str, Decimal] = dict(self._opening_positions)
         for lot in self.lots():
             if lot.is_open() and lot.account_id == self.account_id:
                 by_symbol[lot.symbol] = by_symbol.get(lot.symbol, _ZERO) + lot.qty

@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from agent.accounts import CrossAccountError
+from agent.broker.base import Position
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry, HoldingViolation
 from agent.ledger import (CashAdjustment, DuplicateCashAdjustmentError,
                           DuplicateFillError, Fill, LotOverdrawnError,
@@ -234,6 +235,91 @@ def test_seeding_before_any_fill_still_works(tmp_path):
     s.write_opening_balance(500.0, at=T0)
     s.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))
     assert s.load()[0] == 500.0
+
+
+# ----------------------- write_opening_positions (opening-position-seed unit,
+# 2026-08-12): the positions analogue of write_opening_balance above.
+
+def position(account_id=ACCT, symbol="SPY", qty="0.01", avg_price="737.986"):
+    return Position(account_id=account_id, symbol=symbol, qty=to_decimal(qty),
+                    avg_price=to_decimal(avg_price),
+                    market_value=to_decimal(qty) * to_decimal(avg_price))
+
+
+def test_opening_positions_round_trip_through_to_ledger(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_opening_positions([position(symbol="SPY", qty="0.01")])
+    assert s.to_ledger().positions() == {"SPY": Decimal("0.01")}
+
+
+def test_opening_positions_survive_a_reload(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    s1 = store(path)
+    s1.write_opening_balance(500.0, at=T0)
+    s1.write_opening_positions([position(symbol="SPY", qty="0.01")])
+
+    s2 = store(path)
+    assert s2.to_ledger().positions() == {"SPY": Decimal("0.01")}
+
+
+def test_writing_the_identical_opening_positions_twice_is_a_no_op(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_opening_positions([position(symbol="SPY", qty="0.01")])
+    s.write_opening_positions([position(symbol="SPY", qty="0.01")])   # safe replay
+    assert s.to_ledger().positions() == {"SPY": Decimal("0.01")}
+
+
+def test_writing_a_different_opening_positions_mapping_is_refused(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_opening_positions([position(symbol="SPY", qty="0.01")])
+    with pytest.raises(LedgerStoreError):
+        s.write_opening_positions([position(symbol="SPY", qty="0.02")])
+
+
+def test_seeding_a_position_for_a_symbol_with_an_existing_nonzero_fill_derived_position_is_refused(tmp_path):
+    """Seeding a broker-reported qty on top of a symbol this ledger already
+    has a real, nonzero fill-derived holding for would double-count it."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))   # SPY, from the shared `fill()` helper
+    with pytest.raises(LedgerStoreError):
+        s.write_opening_positions([position(symbol="SPY", qty="0.01")])
+
+
+def test_seeding_a_position_for_a_symbol_with_a_net_zero_fill_history_is_allowed(tmp_path):
+    """Bought then fully sold nets to zero -- not a conflict, since there is
+    nothing already accounted for at that symbol."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_fill(fill(fill_id="f1", side="BUY", qty=1.0, price=100.0))
+    s.write_fill(fill(fill_id="f2", side="SELL", qty=1.0, price=110.0))
+    s.write_opening_positions([position(symbol="SPY", qty="0.01")])
+    assert s.to_ledger().positions() == {"SPY": Decimal("0.01")}
+
+
+def test_seeding_a_position_for_a_different_unrelated_symbol_is_unaffected_by_an_existing_holding(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_fill(fill(fill_id="f1", qty=1.0, price=100.0))   # SPY
+    s.write_opening_positions([position(symbol="QQQ", qty="2")])
+    assert s.to_ledger().positions() == {"SPY": Decimal("1"), "QQQ": Decimal("2")}
+
+
+def test_write_opening_positions_for_a_different_account_is_refused(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    with pytest.raises(CrossAccountError):
+        s.write_opening_positions([position(account_id=ACCT_B, symbol="SPY", qty="0.01")])
+
+
+def test_writing_no_opening_positions_at_all_is_a_safe_no_op(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance(500.0, at=T0)
+    s.write_opening_positions([])
+    assert s.to_ledger().positions() == {}
 
 
 # ------------------- seed_opening_balance_from_broker (2026-07-30 fix)

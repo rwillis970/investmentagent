@@ -116,9 +116,10 @@ def build_account_reconciliation(*, account_id: str, adapter: BrokerAdapter,
     """Build one account's real `AccountReconciliation`. Raises
     `CrossAccountError` if `adapter`/`store`/`day_trade_guard` are not each
     already bound to `account_id`; raises whatever `LedgerStore.
-    write_opening_balance`/`to_ledger` raise on a first-ever seed that turns
-    out to be unsafe (see module docstring) or a never-seeded store this
-    function's own `opening is None` check somehow didn't catch first."""
+    write_opening_balance`/`write_opening_positions`/`to_ledger` raise on a
+    first-ever seed that turns out to be unsafe (see module docstring) or a
+    never-seeded store this function's own `opening is None` check somehow
+    didn't catch first."""
     if adapter.account_id != account_id:
         raise CrossAccountError(account_id, adapter.account_id,
                                 "build_account_reconciliation adapter")
@@ -152,6 +153,22 @@ def build_account_reconciliation(*, account_id: str, adapter: BrokerAdapter,
             # -- every subsequent call sees `opening is not None` here and
             # skips this entirely.
             store.write_opening_balance(broker_account.settled_cash, at=now)
+
+        # POSITIONS SEED (opening-position-seed unit, 2026-08-12): same
+        # guard as the cash seed immediately above -- only on first
+        # startup, mirrored exactly. Checked via a FRESH
+        # `store.to_ledger().positions()`, not the `fills` list already in
+        # hand above: "empty" here means "no positions recorded at all
+        # yet" (fill-derived OR opening-seeded), and those are two
+        # different questions -- an account with fill history that nets to
+        # zero (bought then fully sold) has `fills` truthy but
+        # `positions()` empty, and should still be seeded here; the
+        # opening-balance branch above only ever asks about `fills`
+        # because IT is bootstrapping cash, not positions. Safe to call
+        # `to_ledger()` here: `self._opening` is already set by one of the
+        # two branches above by the time this line runs.
+        if not store.to_ledger().positions():
+            store.write_opening_positions(list(adapter.positions()))
 
     ledger = store.to_ledger()
 
