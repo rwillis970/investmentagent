@@ -1,0 +1,1 @@
+{"exc_type": "ReconciliationMismatch", "message": "account PA3XZX944LRR: local positions {} do not match broker-reported positions {'SPY': Decimal('0.027087234')}", "first_at": "2026-08-12T16:08:00.004948+00:00", "last_at": "2026-08-12T16:21:55.373544+00:00", "consecutive_count": 2}
