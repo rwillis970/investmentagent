@@ -143,3 +143,24 @@ def test_day_trade_count_present_when_a_guard_is_supplied(tmp_path):
     )
     assert state["reconciliation"]["day_trade_count"] == 0
     assert state["reconciliation"]["day_trade_count_broker_verified"] is None
+
+
+def test_deferred_approvals_is_always_an_empty_list_no_mechanism_exists_yet(tmp_path):
+    # No deferred-approval mechanism exists anywhere in this codebase (see
+    # this unit's own report) -- the field must still be present, shaped as
+    # a list of {proposal_snapshot, reason} dicts (mirroring `pending`), but
+    # it can only ever be empty until such a mechanism is actually built.
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    store.create(
+        account_id=ACCT, run_id="run-1",
+        proposal_snapshot={"symbol": "AAPL", "side": "BUY", "authorized_qty": 0.5,
+                          "limit_price": 100.0, "confidence": 0.7},
+        risk_result={}, price_at_analysis=100.0, price_band_low=99.0,
+        price_band_high=101.0, earmark=50.0, now=T0, expiration=timedelta(minutes=30),
+    )
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, account_id=ACCT,
+    )
+    assert state["approvals"]["deferred"] == []

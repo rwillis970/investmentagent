@@ -36,15 +36,19 @@
  * pending" (see the card's own comment: "An empty pending array is a valid
  * state, not an error").
  *
- * `deferred` -- THE SUPPRESSED-AT-CREATION SET, IF EXPOSED. Checked
- * directly: `agent/dashboard_state.py`'s `build_dashboard_state` has no
- * field anywhere in its output for this (the one similarly-named field,
- * `materiality_screen.suppressed_this_session`, is a per-session SCREENING
- * count that is always null -- a different concept entirely, not a list of
- * suppressed-at-creation approval items). This file therefore always passes
- * an empty array for `deferred`. Per this unit's own instruction, no
- * endpoint, field, or server-side computation was added to produce one --
- * this is a reported gap, not a silently-invented value.
+ * `deferred` -- THE SUPPRESSED-AT-CREATION SET (Unit 18, 2026-08-12).
+ * `agent/dashboard_state.py`'s `build_dashboard_state` now exposes
+ * `approvals.deferred` in every `/api/state` response -- this file reads it
+ * verbatim, exactly like `pending`, and passes the real array through to
+ * `applyQueue`. No mechanism that actually populates this list with real
+ * entries exists yet anywhere in this codebase, so the array is empty in
+ * practice today (see `dashboard_state.py`'s own comment on the field) --
+ * but the wiring is real: the day a deferred mechanism starts writing real
+ * entries, this file requires no further edit. (The one similarly-named
+ * field, `materiality_screen.suppressed_this_session`, is a per-session
+ * SCREENING count and a different concept entirely -- not this list.) If
+ * `approvals.deferred` is ever absent or not an array (an old server, e.g.),
+ * this file falls back to `[]` rather than passing `undefined` through.
  *
  * `cash` -- {settled, floor, earmarked, available}, ONLY IF ALL FOUR ARE
  * PRESENT. Checked directly against `GET /api/state`'s real shape:
@@ -146,7 +150,7 @@
     }
     return {
       pending: approvals.pending,
-      deferred: [],   // not exposed anywhere in /api/state -- see docstring
+      deferred: Array.isArray(approvals.deferred) ? approvals.deferred : [],
       cash: extractCash(state),
     };
   }

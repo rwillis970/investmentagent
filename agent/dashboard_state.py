@@ -171,6 +171,13 @@ def build_dashboard_state(
     approvals = {
         "enabled": config.approval_request_enabled,
         "pending": pending_out,
+        # No deferred-approval mechanism exists anywhere in this codebase
+        # (checked directly, not assumed -- see this unit's own report).
+        # Always empty until one is actually built; shaped as a list of
+        # {proposal_snapshot, reason} dicts, mirroring `pending`'s own
+        # per-request dict shape, so the frontend contract is stable the
+        # day a real mechanism starts populating it.
+        "deferred": [],
         "decided_today": approval_request_store.count_decided_on(session),
         "max_approval_requests_per_day": config.max_approval_requests_per_day,
         "approval_min_display_seconds": config.approval_min_display_seconds,
