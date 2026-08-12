@@ -80,6 +80,7 @@ from agent.broker.selection import select_broker_adapter
 from agent.cost import CostLedger
 from agent.dashboard_server import DashboardRuntime, make_server
 from agent.daytrade import DayTradeGuard
+from agent.execution_quarantine import ExecutionQuarantineStore
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger_store import LedgerStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
@@ -87,7 +88,7 @@ from agent.opportunity_event_tracker import OpportunityEventTracker
 
 def _build_broker_state(
     cfg: config_module.Config, *, account_id: str | None,
-    ledger_store_path: str | Path, now: datetime,
+    ledger_store_path: str | Path, quarantine_store_path: str | Path, now: datetime,
 ) -> tuple[AccountSnapshot | None, tuple[Position, ...], DayTradeGuard | None]:
     """Real, local broker state for `DashboardRuntime`, via `agent.broker.
     selection.select_broker_adapter` -- see this module's own docstring for
@@ -120,9 +121,14 @@ def _build_broker_state(
                             policy_registry=registry)
         guard = DayTradeGuard(account_id=account_id,
                               max_per_5_sessions=cfg.max_day_trades_per_5_sessions)
+        # Constructed fresh here, same reasoning as agent/run_loop.py's own
+        # `quarantine` -- an operator's --admit-execution/--reject-execution
+        # (run out-of-process via scripts/run_agent.py) must be reflected on
+        # this script's very next read, never a stale in-memory PENDING view.
+        quarantine = ExecutionQuarantineStore(quarantine_store_path, account_id=account_id)
         recon = build_account_reconciliation(
             account_id=account_id, adapter=adapter, store=store,
-            day_trade_guard=guard, now=now,
+            day_trade_guard=guard, execution_quarantine=quarantine, now=now,
         )
         return recon.broker_account, recon.broker_positions, recon.day_trade_guard
     except Exception:
@@ -139,6 +145,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
                            opportunity_tracker_path: str | Path,
                            audit_log_path: str | Path,
                            ledger_store_path: str | Path,
+                           quarantine_store_path: str | Path,
                            now: datetime | None = None) -> DashboardRuntime:
     approval_service = ApprovalService(
         expiration=timedelta(minutes=cfg.approval_expiration_minutes),
@@ -148,6 +155,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
     )
     broker_account, broker_positions, day_trade_guard = _build_broker_state(
         cfg, account_id=account_id, ledger_store_path=ledger_store_path,
+        quarantine_store_path=quarantine_store_path,
         now=now or datetime.now(timezone.utc),
     )
     return DashboardRuntime(
@@ -185,12 +193,19 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
 #  independently-named copy of them. `ledger_store_path` joined this group
 #  in the broker-state-wiring unit (2026-08-10), the same unit that made
 #  it the first of these five `_build_broker_state` actually reads from.
+#  `quarantine_store_path` joined this group in the opening-position-seed-
+#  with-quarantine-check unit (2026-08-12), the unit that made
+#  `_build_broker_state` read from it too -- same "SAME directory, SAME
+#  file, not a second independently-named copy" reasoning as every other
+#  entry here, and the SAME filename `scripts/run_agent.py`'s own
+#  `_DEFAULT_STORE_FILENAMES` uses for it.
 _DEFAULT_STORE_FILENAMES = {
     "cost_ledger_path": "cost_ledger.jsonl",
     "approval_request_store_path": "approval_requests.jsonl",
     "opportunity_tracker_path": "opportunity_events.jsonl",
     "audit_log_path": "audit.jsonl",
     "ledger_store_path": "ledger.jsonl",
+    "quarantine_store_path": "quarantine.jsonl",
 }
 
 
@@ -203,7 +218,7 @@ def _parse_args(argv: list[str] | None):
     parser.add_argument("--config", required=True, help="path to config.json")
     parser.add_argument("--account-id", default=None)
     parser.add_argument("--data-dir", default="./data",
-                        help="base directory for the four store/log files below that "
+                        help="base directory for the six store/log files below that "
                              "aren't given an explicit override (resolved to an "
                              "absolute path; created, mkdir -p, if it doesn't exist "
                              "and at least one path below actually defaults into it). "
@@ -222,6 +237,12 @@ def _parse_args(argv: list[str] | None):
                         help="defaults to <data-dir>/ledger.jsonl -- point this at the "
                              "SAME file a running scripts/run_agent.py process writes so "
                              "_build_broker_state's read lands on real, durable state")
+    parser.add_argument("--quarantine-store-path",
+                        help="defaults to <data-dir>/quarantine.jsonl -- point this at the "
+                             "SAME file a running scripts/run_agent.py process reads/writes "
+                             "via --admit-execution/--reject-execution, so the positions "
+                             "seed's pending-quarantine guard (agent.account_wiring) sees "
+                             "real, current review state, never a stale/empty file")
     parser.add_argument("--host", default="127.0.0.1",
                         help="must stay a loopback address (see agent.dashboard_server)")
     parser.add_argument("--port", type=int, default=8765)
@@ -249,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
         opportunity_tracker_path=args.opportunity_tracker_path,
         audit_log_path=args.audit_log_path,
         ledger_store_path=args.ledger_store_path,
+        quarantine_store_path=args.quarantine_store_path,
     )
     server = make_server(runtime, host=args.host, port=args.port)
     print(f"operator dashboard serving on http://{args.host}:{args.port}/ "

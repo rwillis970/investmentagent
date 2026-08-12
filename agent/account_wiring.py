@@ -106,20 +106,35 @@ from datetime import datetime
 from .accounts import CrossAccountError
 from .broker.base import BrokerAdapter
 from .daytrade import DayTradeGuard
+from .execution_quarantine import ExecutionQuarantineStore
 from .ledger_store import LedgerStore
 from .startup import AccountReconciliation
 
 
 def build_account_reconciliation(*, account_id: str, adapter: BrokerAdapter,
                                  store: LedgerStore, day_trade_guard: DayTradeGuard,
+                                 execution_quarantine: ExecutionQuarantineStore,
                                  now: datetime) -> AccountReconciliation:
     """Build one account's real `AccountReconciliation`. Raises
-    `CrossAccountError` if `adapter`/`store`/`day_trade_guard` are not each
-    already bound to `account_id`; raises whatever `LedgerStore.
-    write_opening_balance`/`write_opening_positions`/`to_ledger` raise on a
-    first-ever seed that turns out to be unsafe (see module docstring) or a
-    never-seeded store this function's own `opening is None` check somehow
-    didn't catch first."""
+    `CrossAccountError` if `adapter`/`store`/`day_trade_guard`/
+    `execution_quarantine` are not each already bound to `account_id`;
+    raises whatever `LedgerStore.write_opening_balance`/
+    `write_opening_positions`/`to_ledger` raise on a first-ever seed that
+    turns out to be unsafe (see module docstring) or a never-seeded store
+    this function's own `opening is None` check somehow didn't catch first.
+
+    `execution_quarantine` (opening-position-seed-with-quarantine-check
+    unit, 2026-08-12) exists for exactly one purpose: gating the positions
+    seed below on there being no pending, unreviewed executions for this
+    account -- see that seed's own comment for the full reasoning (the
+    FINDING this parameter closes: an earlier version of the positions
+    seed could silently absorb a position that arose from an execution
+    `agent.execution_quarantine`'s own default-deny admission policy was
+    deliberately holding for operator review, defeating that review
+    requirement for exactly the accounts/timing where it mattered most).
+    This function does not otherwise read or write through it -- sync_fills
+    (agent/run_loop.py's own required ordering, BEFORE this function runs)
+    is the only thing that ever quarantines or admits an execution."""
     if adapter.account_id != account_id:
         raise CrossAccountError(account_id, adapter.account_id,
                                 "build_account_reconciliation adapter")
@@ -129,6 +144,9 @@ def build_account_reconciliation(*, account_id: str, adapter: BrokerAdapter,
     if day_trade_guard.account_id != account_id:
         raise CrossAccountError(account_id, day_trade_guard.account_id,
                                 "build_account_reconciliation day_trade_guard")
+    if execution_quarantine.account_id != account_id:
+        raise CrossAccountError(account_id, execution_quarantine.account_id,
+                                "build_account_reconciliation execution_quarantine")
 
     broker_account = adapter.account()
 
@@ -154,20 +172,42 @@ def build_account_reconciliation(*, account_id: str, adapter: BrokerAdapter,
             # skips this entirely.
             store.write_opening_balance(broker_account.settled_cash, at=now)
 
-        # POSITIONS SEED (opening-position-seed unit, 2026-08-12): same
-        # guard as the cash seed immediately above -- only on first
-        # startup, mirrored exactly. Checked via a FRESH
-        # `store.to_ledger().positions()`, not the `fills` list already in
-        # hand above: "empty" here means "no positions recorded at all
-        # yet" (fill-derived OR opening-seeded), and those are two
-        # different questions -- an account with fill history that nets to
-        # zero (bought then fully sold) has `fills` truthy but
-        # `positions()` empty, and should still be seeded here; the
-        # opening-balance branch above only ever asks about `fills`
+        # POSITIONS SEED (opening-position-seed unit, 2026-08-12; gated on
+        # quarantine, opening-position-seed-with-quarantine-check unit,
+        # 2026-08-12): same guard as the cash seed immediately above --
+        # only on first startup, mirrored exactly -- PLUS a second,
+        # independent guard: `execution_quarantine.pending_count() == 0`.
+        # Checked via a FRESH `store.to_ledger().positions()`, not the
+        # `fills` list already in hand above: "empty" here means "no
+        # positions recorded at all yet" (fill-derived OR opening-seeded),
+        # and those are two different questions -- an account with fill
+        # history that nets to zero (bought then fully sold) has `fills`
+        # truthy but `positions()` empty, and should still be seeded here;
+        # the opening-balance branch above only ever asks about `fills`
         # because IT is bootstrapping cash, not positions. Safe to call
         # `to_ledger()` here: `self._opening` is already set by one of the
         # two branches above by the time this line runs.
-        if not store.to_ledger().positions():
+        #
+        # THE QUARANTINE GUARD, AND WHY IT IS NOT OPTIONAL. Seeding from
+        # `adapter.positions()` trusts the broker's CURRENT snapshot
+        # verbatim, with no lot behind it and no operator review -- exactly
+        # the trust `agent.execution_quarantine` exists to withhold from an
+        # execution with no resolvable local intent (agent/fill_sync.py's
+        # own module docstring: sync_fills quarantines rather than
+        # fabricating a Fill). If a pending, unreviewed execution exists
+        # for this account, its effect is ALREADY present in
+        # `adapter.positions()` (a real broker fill already happened) but
+        # NOT yet in the local ledger by design -- seeding here would
+        # silently launder exactly the review this account is waiting on.
+        # So: any pending quarantine entry blocks the seed entirely (not
+        # per-symbol -- a pending execution on one symbol says nothing
+        # about whether ANOTHER symbol's broker-reported quantity is safe
+        # to trust unreviewed either) and reconciliation is left to halt
+        # on the resulting real mismatch, same as before this unit existed
+        # -- forcing `--admit-execution`/`--reject-execution` first. The
+        # NEXT startup, after that review, seeds against a clean slate.
+        if (not store.to_ledger().positions()
+                and execution_quarantine.pending_count() == 0):
             store.write_opening_positions(list(adapter.positions()))
 
     ledger = store.to_ledger()

@@ -415,7 +415,7 @@ def run_cycle(*, accounts: list[AccountRuntime],
 
         recon = build_account_reconciliation(
             account_id=acct.account_id, adapter=adapter, store=store,
-            day_trade_guard=guard, now=now,
+            day_trade_guard=guard, execution_quarantine=quarantine, now=now,
         )
         reconciliations.append(recon)
         if primary_ledger is None:

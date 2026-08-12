@@ -57,6 +57,7 @@ def test_data_dir_defaults_all_five_store_paths_to_named_files_inside_it(tmp_pat
     assert args.opportunity_tracker_path == str(data_dir / "opportunity_events.jsonl")
     assert args.audit_log_path == str(data_dir / "audit.jsonl")
     assert args.ledger_store_path == str(data_dir / "ledger.jsonl")
+    assert args.quarantine_store_path == str(data_dir / "quarantine.jsonl")
     assert data_dir.is_dir()
 
 
@@ -81,6 +82,7 @@ def test_filenames_match_run_agents_own_defaults_for_the_same_five_stores(tmp_pa
     assert dashboard_args.opportunity_tracker_path == agent_args.opportunity_tracker_path
     assert dashboard_args.audit_log_path == agent_args.audit_log_path
     assert dashboard_args.ledger_store_path == agent_args.ledger_store_path
+    assert dashboard_args.quarantine_store_path == agent_args.quarantine_store_path
 
 
 def test_data_dir_default_is_resolved_to_an_absolute_path(tmp_path, monkeypatch):
@@ -106,6 +108,7 @@ def test_data_dir_is_never_created_when_every_store_path_is_explicit(tmp_path, m
         "--opportunity-tracker-path", str(tmp_path / "ot.jsonl"),
         "--audit-log-path", str(tmp_path / "al.jsonl"),
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
+        "--quarantine-store-path", str(tmp_path / "q.jsonl"),
     ])
     assert not (tmp_path / "data").exists()
 
@@ -119,6 +122,7 @@ def _cfg(**overrides):
 def test_no_account_id_degrades_to_the_null_triple_without_touching_anything(tmp_path):
     broker_account, broker_positions, day_trade_guard = _build_broker_state(
         _cfg(), account_id=None, ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl",
         now=datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),
     )
     assert broker_account is None
@@ -130,7 +134,8 @@ def test_no_account_id_degrades_to_the_null_triple_without_touching_anything(tmp
 def test_happy_path_populates_all_three_from_a_fresh_simulator_paper_account(tmp_path):
     now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
     broker_account, broker_positions, day_trade_guard = _build_broker_state(
-        _cfg(), account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl", now=now,
+        _cfg(), account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
     )
     assert broker_account is not None
     assert broker_account.account_id == "acct-1"
@@ -151,6 +156,7 @@ def test_a_corrupt_ledger_file_degrades_to_the_null_triple_not_a_raised_exceptio
     bad_path.write_text("not valid jsonl at all {{{\n", encoding="utf-8")
     broker_account, broker_positions, day_trade_guard = _build_broker_state(
         _cfg(), account_id="acct-1", ledger_store_path=bad_path,
+        quarantine_store_path=tmp_path / "quarantine.jsonl",
         now=datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),
     )
     assert broker_account is None

@@ -256,6 +256,14 @@ class ExecutionQuarantineStore:
         return tuple(q for eid, q in self._quarantined.items()
                     if eid not in self._resolutions)
 
+    def pending_count(self) -> int:
+        """`len(self.pending())`, named as its own method (opening-position-
+        seed-with-quarantine-check unit, 2026-08-12): `agent.account_wiring.
+        build_account_reconciliation`'s own positions-seed gate reads this
+        rather than materializing and discarding the whole `pending()`
+        tuple just to measure it."""
+        return len(self.pending())
+
     def load(self) -> tuple[tuple[QuarantinedExecution, ...], tuple[ExecutionResolution, ...]]:
         return tuple(self._quarantined.values()), tuple(self._resolutions.values())
 
