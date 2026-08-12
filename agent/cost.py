@@ -46,7 +46,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -165,8 +165,21 @@ class CostLedger:
         hit makes zero API calls and costs nothing, so it does not count
         against the daily analysis-rate cap this feeds -- only entries
         provider='anthropic', operation='analysis', cache_hit=False, on the
-        given day."""
-        on = on or date.today()
+        given day.
+
+        `on`, WHEN NOT SUPPLIED (Unit 15, timezone fix, 2026-08-12). Every
+        `CostEntry.at` this codebase ever constructs is a UTC-aware
+        `datetime.now(timezone.utc)` (agent/analysis.py, agent/
+        materiality_cycle.py, and every real call site). `date.today()`
+        instead reads the PROCESS's LOCAL calendar date -- the two agree
+        except across the local/UTC day boundary, where a process running
+        west of UTC can still report yesterday's local date while its own
+        just-written row is already stamped with today's UTC date,
+        silently excluding that row from `analyses_today`'s count. Falling
+        back to `datetime.now(timezone.utc).date()` instead keeps this
+        comparison in the same calendar `.at` is already stamped in, so it
+        can never disagree with the entries it is being compared against."""
+        on = on or datetime.now(timezone.utc).date()
         return sum(1 for e in self._entries
                    if e.provider == "anthropic" and e.operation == "analysis"
                    and not e.cache_hit and e.at.date() == on)

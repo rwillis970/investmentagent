@@ -67,16 +67,19 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent import config as config_module
 from agent.account_wiring import build_account_reconciliation
+from agent.accounts import BrokerCredentials
 from agent.approval import ApprovalService
 from agent.approval_request_store import ApprovalRequestStore
 from agent.audit import AuditLog
 from agent.broker.base import AccountSnapshot, Position
 from agent.broker.selection import select_broker_adapter
+from agent.broker.transport import Transport
 from agent.cost import CostLedger
 from agent.dashboard_server import DashboardRuntime, make_server
 from agent.daytrade import DayTradeGuard
@@ -84,11 +87,16 @@ from agent.execution_quarantine import ExecutionQuarantineStore
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger_store import LedgerStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
+from agent.secrets_provider import (KeychainSecretsProvider, SecretNotFoundError,
+                                    SecretsProvider)
 
 
 def _build_broker_state(
     cfg: config_module.Config, *, account_id: str | None,
     ledger_store_path: str | Path, quarantine_store_path: str | Path, now: datetime,
+    credentials: BrokerCredentials | None = None,
+    secrets_provider: SecretsProvider | None = None,
+    transport: Transport | None = None,
 ) -> tuple[AccountSnapshot | None, tuple[Position, ...], DayTradeGuard | None]:
     """Real, local broker state for `DashboardRuntime`, via `agent.broker.
     selection.select_broker_adapter` -- see this module's own docstring for
@@ -99,16 +107,39 @@ def _build_broker_state(
     at all" rather than crashing the process that serves the rest of
     `GET /api/state`.
 
-    CREDENTIALS ARE NOT WIRED HERE (config-driven-broker-selection unit,
-    2026-08-10): this script has no `--key-id`/`--secret-ref` flags, so
-    `select_broker_adapter` is always called with `credentials=None`,
-    `secrets_provider=None`. `cfg.broker` defaults to "simulator" (see
-    agent/config.py's own comment), for which neither is needed -- but if
-    an operator ever sets `cfg.broker: "alpaca_paper"` without ALSO adding
-    those flags to this script (out of scope for this unit), selection
-    raises `BrokerSelectionError` for the missing credentials, which the
-    `except Exception` below degrades to the same honest null this
-    function already promises, never a fabricated adapter."""
+    CREDENTIALS, NOW WIRED (broker-credentials unit, Unit 16, 2026-08-12).
+    `credentials`/`secrets_provider` are forwarded to `select_broker_
+    adapter` exactly as given -- `None`/`None` (this function's own
+    defaults) when `--key-id`/`--secret-ref` were not supplied, matching
+    this script's original, unchanged behaviour for `cfg.broker:
+    "simulator"` (the default -- neither is needed there). `main`/
+    `build_dashboard_runtime`, below, are what actually resolve real
+    values from `--key-id`/`--secret-ref`/a real `SecretsProvider` and
+    pass them down to this function; this function itself does no
+    resolving of its own, mirroring `scripts/run_agent.py`'s own
+    credential handling (same secrets_provider_factory, same mode-binding,
+    same `BrokerCredentials` shape) rather than inventing a second one.
+    `cfg.broker: "alpaca_paper"` with no credentials given still raises
+    `BrokerSelectionError` inside `select_broker_adapter`, caught by the
+    `except Exception` below and degraded to the same honest null triple --
+    `main` additionally fails LOUDLY at startup for that exact case (see
+    `_require_credentials_for_alpaca_paper`) so an operator sees it before
+    the process ever gets this far, not only as a silently-null dashboard
+    tile.
+
+    READ-ONLY, DELIBERATELY (Unit 16's own requirement). No `capability_
+    policy` and no `staging_key` are ever passed to `select_broker_adapter`
+    here -- this function (via `build_account_reconciliation`, below) only
+    ever calls `adapter.account()`/`.positions()`/`.open_orders()`, never
+    `.submit()`/`.cancel()`. `staging_key=None` (this function's own,
+    unexposed default) means those two write methods would raise
+    `StagingKeyUnset` if anything here ever tried to call them -- which
+    nothing does; see `agent.broker.base.BrokerAdapter._verify_staged_or_
+    raise` for that refusal and tests/test_run_dashboard.py's own
+    regression test proving it, not just asserting it in prose. `transport`
+    is exposed purely for tests (`agent.broker.transport.ScriptedTransport`,
+    no real network) -- production code never passes one, letting
+    `AlpacaPaperAdapter` construct its own real `UrllibTransport`."""
     if not account_id:
         return None, (), None
     try:
@@ -116,7 +147,10 @@ def _build_broker_state(
             HoldingPolicy(version="config", minimum_holding_period=cfg.minimum_hold,
                          cooldown_period=cfg.cooldown),
         ])
-        adapter = select_broker_adapter(cfg, account_id=account_id, now=now)
+        adapter = select_broker_adapter(
+            cfg, account_id=account_id, credentials=credentials,
+            secrets_provider=secrets_provider, now=now, transport=transport,
+        )
         store = LedgerStore(ledger_store_path, account_id=account_id,
                             policy_registry=registry)
         guard = DayTradeGuard(account_id=account_id,
@@ -146,16 +180,39 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
                            audit_log_path: str | Path,
                            ledger_store_path: str | Path,
                            quarantine_store_path: str | Path,
+                           key_id: str | None = None,
+                           secret_ref: str | None = None,
+                           secrets_provider_factory: Callable[[str], SecretsProvider]
+                               = KeychainSecretsProvider,
+                           credential_preflight: dict | None = None,
                            now: datetime | None = None) -> DashboardRuntime:
+    """CREDENTIALS (Unit 16, 2026-08-12): `key_id`/`secret_ref` are both
+    optional, matching `_parse_args`'s own `--key-id`/`--secret-ref`
+    defaults -- `credentials`/`secrets_provider` below stay `None` unless
+    BOTH `account_id` and both flags are present, so a `cfg.broker:
+    "simulator"` deployment (this script's original, default behaviour) is
+    completely unaffected by adding these two optional flags. When they
+    ARE all present, `secrets_provider_factory(cfg.mode)` is the identical
+    call `scripts/run_agent.py`'s own `main` makes -- same factory
+    injectable for tests (`agent.secrets_provider.InMemorySecretsProvider`,
+    never a real keychain there), same mode-binding off `cfg.mode`, not a
+    second, independently-invented credential path."""
     approval_service = ApprovalService(
         expiration=timedelta(minutes=cfg.approval_expiration_minutes),
         min_display=timedelta(seconds=cfg.approval_min_display_seconds),
         max_per_day=cfg.max_approval_requests_per_day,
         price_band_pct=cfg.price_band_pct,
     )
+    credentials = None
+    secrets_provider = None
+    if account_id and key_id and secret_ref:
+        credentials = BrokerCredentials(account_id=account_id, key_id=key_id,
+                                        secret_ref=secret_ref)
+        secrets_provider = secrets_provider_factory(cfg.mode)
     broker_account, broker_positions, day_trade_guard = _build_broker_state(
         cfg, account_id=account_id, ledger_store_path=ledger_store_path,
         quarantine_store_path=quarantine_store_path,
+        credentials=credentials, secrets_provider=secrets_provider,
         now=now or datetime.now(timezone.utc),
     )
     return DashboardRuntime(
@@ -172,6 +229,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         broker_account=broker_account,
         broker_positions=broker_positions,
         day_trade_guard=day_trade_guard,
+        credential_preflight=credential_preflight or {},
     )
 
 
@@ -217,6 +275,22 @@ def _parse_args(argv: list[str] | None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="path to config.json")
     parser.add_argument("--account-id", default=None)
+    parser.add_argument("--key-id", default=None,
+                        help="Alpaca API key id -- required together with "
+                             "--secret-ref if config.json sets broker=\"alpaca_paper\"; "
+                             "unused (and optional) for the default broker=\"simulator\". "
+                             "Same flag name/meaning as scripts/run_agent.py's own.")
+    parser.add_argument("--secret-ref", default=None,
+                        help="keychain entry name for the Alpaca API secret -- required "
+                             "together with --key-id if config.json sets "
+                             "broker=\"alpaca_paper\". Same flag name/meaning as "
+                             "scripts/run_agent.py's own.")
+    parser.add_argument("--signing-key-secret-ref", default=None,
+                        help="keychain entry name for the gatekeeper signing key -- "
+                             "optional; used ONLY for the /api/credentials preflight "
+                             "status strip (Unit 17). This script never signs or "
+                             "verifies anything itself, so unlike scripts/run_agent.py "
+                             "this flag is never required.")
     parser.add_argument("--data-dir", default="./data",
                         help="base directory for the six store/log files below that "
                              "aren't given an explicit override (resolved to an "
@@ -259,10 +333,84 @@ def _parse_args(argv: list[str] | None):
     return args
 
 
-def main(argv: list[str] | None = None) -> int:
+def _check_credential(secret_ref: str | None, secrets_provider: SecretsProvider) -> dict:
+    """One credential's provisioning status for the `/api/credentials`
+    preflight strip (Unit 17, 2026-08-12). NEVER returns the secret value
+    itself -- only presence and, on failure, `SecretNotFoundError`'s own
+    message, which (see `agent.secrets_provider`'s own docstring) carries
+    only mode and secret_ref, never a resolved value; the `resolve()`
+    return value on success is discarded immediately, the same fail-fast-
+    presence-check-only posture `agent.broker.selection.select_broker_
+    adapter` already takes toward the Alpaca secret.
+
+    `secret_ref=None` (the flag was never given at all -- e.g. no
+    `--signing-key-secret-ref`) is treated as "not present" too, with its
+    own distinct message, rather than calling `secrets_provider.resolve(None)`
+    and letting whatever that raises escape uncaught."""
+    if secret_ref is None:
+        return {"present": False, "error": "no secret_ref configured for this credential"}
+    try:
+        secrets_provider.resolve(secret_ref)
+        return {"present": True, "error": None}
+    except SecretNotFoundError as exc:
+        return {"present": False, "error": str(exc)}
+
+
+def _require_credentials_for_alpaca_paper(cfg: config_module.Config, *,
+                                          key_id: str | None,
+                                          secret_ref: str | None) -> None:
+    """Fails loudly at startup, before anything else is constructed, when
+    `config.json` names `broker: "alpaca_paper"` but this invocation is
+    missing the credential flag(s) that path needs -- mirrors `scripts/
+    run_agent.py`'s own `_parse_args` missing-flags check (its `else`
+    branch's `--key-id`/`--secret-ref` list) in message shape, ported here
+    rather than reused directly because that check lives inside argparse
+    parsing, before `cfg` (which requires reading and loading `--config`)
+    is available at all -- this one runs right after `cfg` is loaded in
+    `main`, still before any store, adapter or server is touched, which is
+    the earliest point this check CAN run. `cfg.broker` defaults to
+    "simulator" (`agent.config.Config.broker`'s own default), for which
+    neither flag is needed at all -- this function is a no-op for every
+    config that doesn't explicitly opt into `alpaca_paper`."""
+    if cfg.broker != "alpaca_paper":
+        return
+    missing = [name for name, val in (("--key-id", key_id), ("--secret-ref", secret_ref))
+              if val is None]
+    if missing:
+        raise SystemExit(
+            "the following arguments are required because config.json sets "
+            "broker=\"alpaca_paper\": " + ", ".join(missing)
+        )
+
+
+def main(argv: list[str] | None = None, *,
+        secrets_provider_factory: Callable[[str], SecretsProvider] = KeychainSecretsProvider,
+        ) -> int:
+    """`secrets_provider_factory` is injectable (default: the real
+    `KeychainSecretsProvider`) purely for tests -- mirrors `scripts/
+    run_agent.py`'s own `main` signature exactly, same reasoning: no real
+    keychain in the test suite."""
     args = _parse_args(argv)
 
     cfg = config_module.load(json.loads(Path(args.config).read_text()))
+    _require_credentials_for_alpaca_paper(cfg, key_id=args.key_id, secret_ref=args.secret_ref)
+
+    # CREDENTIAL PREFLIGHT (Unit 17, 2026-08-12): computed ONCE here, before
+    # the server starts, then served from memory for the process's whole
+    # life -- see DashboardRuntime.credential_preflight's own docstring for
+    # why (the user's own explicit call: a paper pilot restarts the
+    # dashboard after rotating a key, rather than this surface re-resolving
+    # on every poll). Bound to PAPER literally, not cfg.mode -- this pilot's
+    # only real deployment is PAPER, and the point is visibility into what
+    # is provisioned, independent of whatever --key-id/--secret-ref this
+    # particular invocation happened to receive.
+    preflight_secrets_provider = secrets_provider_factory("PAPER")
+    credential_preflight = {
+        "alpaca_api_secret": _check_credential(args.secret_ref, preflight_secrets_provider),
+        "gatekeeper_signing_key": _check_credential(args.signing_key_secret_ref,
+                                                    preflight_secrets_provider),
+    }
+
     runtime = build_dashboard_runtime(
         cfg, config_path=args.config, account_id=args.account_id,
         cost_ledger_path=args.cost_ledger_path,
@@ -271,6 +419,9 @@ def main(argv: list[str] | None = None) -> int:
         audit_log_path=args.audit_log_path,
         ledger_store_path=args.ledger_store_path,
         quarantine_store_path=args.quarantine_store_path,
+        key_id=args.key_id, secret_ref=args.secret_ref,
+        secrets_provider_factory=secrets_provider_factory,
+        credential_preflight=credential_preflight,
     )
     server = make_server(runtime, host=args.host, port=args.port)
     print(f"operator dashboard serving on http://{args.host}:{args.port}/ "

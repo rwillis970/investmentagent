@@ -40,6 +40,19 @@ POSTURES = ("CASH", "MARGIN_UNDER_25K", "MARGIN_OVER_25K", "UNKNOWN")
 # reason this same membership check is repeated there.
 BROKER_TYPES = ("simulator", "alpaca_paper")
 
+# News provider selection (T2 news collector unit, 2026-08-12) -- the single
+# source of truth for "which agent.news_provider.NewsProvider does
+# build_provider construct". Only "null" is a REAL, constructible value
+# today: no news vendor is contracted or credentialed anywhere in this
+# codebase (see agent/news_provider.py's own module docstring). "in_memory"
+# (agent.news_provider.InMemoryNewsProvider) is deliberately NOT a member of
+# this tuple -- it is a test-only class that needs a fixture list at
+# construction, which no config string could ever supply; tests construct it
+# directly, never through build_provider. Adding a real vendor later means
+# adding both a new member here AND a new branch in build_provider, in the
+# same commit (§9.1).
+NEWS_PROVIDER_TYPES = ("null",)
+
 # Platform maxima — §6. Config is validated against these, not the reverse,
 # and rejected at load if it exceeds them — never clamped to them.
 MIN_HOLDING_FLOOR = timedelta(minutes=15)
@@ -132,6 +145,36 @@ class Config:
     # own module docstring for why an unrecognised value must fail loudly
     # rather than silently fall back to this default.
     broker: str = "simulator"
+
+    # T2 news collector (news collector unit, 2026-08-12) -- consumed by
+    # agent.config.build_provider, the one place a string turns into a real
+    # agent.news_provider.NewsProvider, mirroring `broker`/`select_broker_
+    # adapter` immediately above. Defaults to "null" DELIBERATELY: no real
+    # news vendor is contracted or credentialed in this codebase yet, so a
+    # config that never mentions this key gets the safe, always-empty
+    # provider, not an implicitly-live one that would fail confusingly the
+    # first time it tried to call an unconfigured API. See
+    # NEWS_PROVIDER_TYPES above and agent/news_provider.py's own module
+    # docstring.
+    news_feed_provider: str = "null"
+    # Read from config, never hardcoded (§9.1) -- unused by the one real,
+    # buildable provider today (NullNewsProvider needs neither), present so
+    # the next real provider this dispatch function grows a branch for does
+    # not also need a schema change in the same commit. Never logged or
+    # echoed anywhere this codebase's own dashboard/audit surfaces reach
+    # (same "never expose a credential-shaped value" posture agent.
+    # secrets_provider already takes, applied here even though this one is
+    # config-supplied rather than keychain-resolved).
+    news_api_key: str | None = None
+    news_api_endpoint: str | None = None
+    # How far back agent.news_collector.collect_news_events asks a provider
+    # to look on each call (a fetch WINDOW, not a dedup mechanism -- see
+    # that module's own docstring). 24h, UNCALIBRATED, same posture as
+    # edgar_ticker_cik_refresh_interval_hours immediately below in spirit:
+    # a conservative, revisit-later placeholder wide enough that a provider
+    # restart or a missed cycle does not silently lose same-day news, not a
+    # claim about any real vendor's own freshness guarantee.
+    news_lookback_hours: int = 24
 
     minimum_settled_cash_pct_of_nlv: float = 20.0
     minimum_absolute_settled_cash: float = 75.0
@@ -583,6 +626,10 @@ def validate(cfg: Config) -> None:
         err.append(f"assert_account_posture must be one of {POSTURES}")
     if cfg.broker not in BROKER_TYPES:
         err.append(f"broker must be one of {BROKER_TYPES}")
+    if cfg.news_feed_provider not in NEWS_PROVIDER_TYPES:
+        err.append(f"news_feed_provider must be one of {NEWS_PROVIDER_TYPES}")
+    if cfg.news_lookback_hours <= 0:
+        err.append("news_lookback_hours must be positive")
     if not cfg.require_human_trade_approval:
         err.append("require_human_trade_approval cannot be false in this release (§6)")
 
@@ -786,3 +833,64 @@ def validate(cfg: Config) -> None:
 
     if err:
         raise ConfigError("invalid configuration:\n  - " + "\n  - ".join(err))
+
+
+@dataclass(frozen=True)
+class NewsProviderConfig:
+    """Provider-specific settings for whichever `agent.news_provider.
+    NewsProvider` `build_provider` constructs -- bundled into its own small
+    object, rather than `build_provider` taking each field as a bare
+    argument, so a future real provider's own extra settings can grow this
+    one dataclass without growing `build_provider`'s own signature every
+    time a new vendor is added. NOT a field on `Config` itself (every other
+    collector's settings -- `edgar_user_agent`, `market_data_feed`, ... --
+    are flat `Config` fields, not a nested object): `build_provider`
+    constructs one of these internally, from `Config`'s own flat
+    `news_feed_provider`/`news_api_key`/`news_api_endpoint` fields, purely
+    as an internal parameter bundle for dispatch. See this unit's own
+    delivery report for why this deliberately does not introduce a new
+    nested-config-loading pattern into `load()`/`Config` itself.
+
+    `api_key`/`endpoint` are unused by the one real, buildable provider
+    today (`NullNewsProvider` needs neither) -- present now so the next real
+    provider `build_provider` grows a branch for does not also need a
+    schema change in the same commit."""
+    provider: str = "null"
+    api_key: str | None = None
+    endpoint: str | None = None
+
+
+def build_provider(cfg: Config) -> "NewsProvider":
+    """The one place `cfg.news_feed_provider` turns into a real `agent.
+    news_provider.NewsProvider` -- mirrors `agent.broker.selection.
+    select_broker_adapter`'s own role for `cfg.broker`, but lives in THIS
+    module rather than a sibling `agent/news/selection.py`, per this unit's
+    own explicit instruction (a deliberate difference from the broker
+    precedent, not an oversight -- see this unit's own delivery report).
+
+    Imports `agent.news_provider` locally, not at module scope: `agent.
+    news_provider` has no dependency on `agent.config` today and importing
+    it at module scope would be safe, but keeping the import local here (the
+    same posture `agent.broker.selection` takes toward `agent.config`,
+    inverted) keeps this module's own import graph the simplest one that
+    works, with no risk of a future edit to either module introducing a
+    cycle silently.
+
+    AN UNRECOGNISED VALUE RAISES HERE TOO, belt and suspenders alongside
+    `validate`'s own `NEWS_PROVIDER_TYPES` membership check -- a `Config`
+    can be constructed directly (bypassing `load`/`validate`, including in
+    tests), and this function must never fall back to `NullNewsProvider`
+    silently for a value it doesn't recognise."""
+    from .news_provider import NewsProvider, NullNewsProvider  # noqa: F401  (return type)
+
+    settings = NewsProviderConfig(provider=cfg.news_feed_provider,
+                                  api_key=cfg.news_api_key, endpoint=cfg.news_api_endpoint)
+    if settings.provider == "null":
+        return NullNewsProvider()
+
+    raise ConfigError(
+        f"news_feed_provider={settings.provider!r} is not a recognised news "
+        f"provider type -- must be one of {NEWS_PROVIDER_TYPES}. Refusing to "
+        "fall back to NullNewsProvider silently: an unrecognised value must "
+        "fail loudly, never quietly collect nothing while looking healthy."
+    )

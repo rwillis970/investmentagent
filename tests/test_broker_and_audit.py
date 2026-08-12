@@ -755,6 +755,47 @@ def test_analyses_today_defaults_to_todays_date():
     assert led.analyses_today() == 1
 
 
+def test_analyses_today_resolves_an_unsupplied_on_against_utc_not_local_time(monkeypatch):
+    """Unit 15 (cost: fix timezone mismatch in analyses_today). Ledger rows
+    are always stamped with `datetime.now(timezone.utc)` (see every
+    `CostEntry(...)` construction site in agent/analysis.py and
+    agent/materiality_cycle.py) -- but the old `on = on or date.today()`
+    read the PROCESS's LOCAL calendar date to decide what "today" means
+    when no `on` is given. Those two clocks agree except across the
+    local/UTC day boundary, where they can name two different dates for
+    the same instant -- e.g. a process running in a UTC-negative timezone
+    sees local date N while the entry it just wrote is already stamped UTC
+    date N+1. That mismatch makes `analyses_today` undercount right at the
+    boundary, which feeds `agent.materiality.compute_score`'s w6 budget
+    brake a wrong number.
+
+    This test forces exactly that mismatch deterministically -- independent
+    of the real local timezone the suite happens to run in -- by patching
+    `agent.cost.datetime.now` to a fixed UTC instant and recording a row at
+    that same instant. The fixed instant is chosen adjacent to a real
+    day boundary so `date.today()` (this machine's actual local calendar
+    date, whatever it is) is guaranteed not to equal the entry's UTC date."""
+    import agent.cost as cost_module
+
+    fixed_utc_now = datetime(2031, 1, 1, 0, 5, tzinfo=timezone.utc)
+    real_local_today = date.today()
+    assert real_local_today != fixed_utc_now.date(), (
+        "test instant must not collide with whatever date this machine's "
+        "real local clock reports right now"
+    )
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_utc_now
+
+    monkeypatch.setattr(cost_module, "datetime", _FixedDatetime)
+
+    led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0)
+    led.record(CostEntry("anthropic", "analysis", 1, 1.0, fixed_utc_now))
+    assert led.analyses_today() == 1
+
+
 def test_would_exceed_hard_stop_checks_the_estimate_before_recording_anything():
     led = CostLedger(monthly_budget=20.0, warning_at=15.0, hard_stop_at=30.0)
     on = date(2026, 7, 20)

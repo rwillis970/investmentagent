@@ -137,6 +137,7 @@ from .edgar_collector import TickerCikCache, collect_filings
 from .entities import OpportunityEvent
 from .ledger import Ledger
 from .market_data_collector import collect_market_data, read_market_snapshot
+from .news_collector import collect_news_events
 from .materiality_cycle import MaterialityCycleResult, run_materiality_cycle
 from .opportunity_event_tracker import OpportunityEventTracker
 from .pipeline import Gatekeeper
@@ -170,6 +171,18 @@ class PipelineRuntime:
     edgar_client: object | None = None
     ticker_cik_cache: TickerCikCache | None = None
     ticker_cik_refresh_max_age: timedelta = timedelta(hours=24)
+    # T2 news collector (news collector unit, 2026-08-12) -- `object | None`
+    # default, EXACTLY like `market_data_client`/`edgar_client` immediately
+    # above: `None` is only ever read with `data_collection_enabled=False`,
+    # the same guard those two already rely on (see `run_pipeline_stage`'s
+    # own body). A caller wiring this stage with collection ON supplies a
+    # real `agent.news_provider.NewsProvider` (`agent.config.build_provider`
+    # -- typically `NullNewsProvider`, since no real vendor exists yet, see
+    # that module's own docstring), the same way it already supplies a real
+    # `market_data_client`/`edgar_client`. Not constructed here, on `None`:
+    # this dataclass never silently builds its own collaborator.
+    news_provider: object | None = None
+    news_lookback: timedelta = timedelta(hours=24)
 
     # -- Unit 2: screening + dedup tracker ----------------------------------
     materiality_screen_enabled: bool = False
@@ -264,6 +277,17 @@ def run_pipeline_stage(pipeline: PipelineRuntime, *, now: datetime, mode: str,
         collect_filings(pipeline.edgar_client, pipeline.fact_store, pipeline.ticker_cik_cache,
                         symbols, now=now,
                         ticker_cik_refresh_max_age=pipeline.ticker_cik_refresh_max_age)
+        # News collector unit, 2026-08-12: AFTER both (per this unit's own
+        # instruction), BEFORE the materiality screen below -- so a news
+        # Fact this cycle just wrote is already visible to T3 via the same
+        # `pipeline.fact_store.as_of(now)` view the screen reads a few
+        # lines down. `agent.materiality`/`agent.materiality_cycle`
+        # themselves do not read a news Fact today (see this unit's own
+        # delivery report for why that is a disclosed, deliberate scope
+        # boundary, not an oversight) -- this call makes the fact visible
+        # to the store; it does not, by itself, change what T3 scores.
+        collect_news_events(pipeline.news_provider, pipeline.fact_store, symbols, now=now,
+                            lookback=pipeline.news_lookback)
         new_last_collected_at = now
 
     screening: MaterialityCycleResult | None = None

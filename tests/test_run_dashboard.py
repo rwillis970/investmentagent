@@ -34,14 +34,21 @@ cannot make.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from agent import config as config_module
+from agent.accounts import BrokerCredentials
+from agent.broker.base import StagingKeyUnset
+from agent.broker.transport import ScriptedTransport
 from agent.daytrade import DayTradeGuard
-from scripts.run_dashboard import _build_broker_state, _parse_args
+from agent.secrets_provider import InMemorySecretsProvider
+from scripts.run_dashboard import (_build_broker_state, _check_credential,
+                                   _require_credentials_for_alpaca_paper,
+                                   _parse_args, build_dashboard_runtime, main)
 from tests.test_config_fixture import valid_raw_config
 
 
@@ -175,3 +182,248 @@ def test_host_and_port_defaults_are_unaffected(tmp_path):
     args = _parse_args(["--config", "c.json", "--data-dir", str(tmp_path / "data")])
     assert args.host == "127.0.0.1"
     assert args.port == 8765
+
+
+# ---------------------------------------- Unit 16: broker credentials wiring, 2026-08-12
+
+def _alpaca_creds(account_id="acct-1"):
+    return BrokerCredentials(account_id=account_id, key_id="AK1", secret_ref="alpaca-secret")
+
+
+def _alpaca_secrets(mode="PAPER", *, put_secret=True):
+    p = InMemorySecretsProvider(mode=mode)
+    if put_secret:
+        p.put("alpaca-secret", "s3cr3t-value")
+    return p
+
+
+def test_key_id_and_secret_ref_flags_default_to_none():
+    args = _parse_args(["--config", "c.json"])
+    assert args.key_id is None
+    assert args.secret_ref is None
+
+
+def test_key_id_and_secret_ref_flags_are_parsed():
+    args = _parse_args(["--config", "c.json", "--key-id", "AK1",
+                        "--secret-ref", "alpaca-secret"])
+    assert args.key_id == "AK1"
+    assert args.secret_ref == "alpaca-secret"
+
+
+def test_require_credentials_is_a_noop_for_the_default_simulator_broker():
+    _require_credentials_for_alpaca_paper(_cfg(), key_id=None, secret_ref=None)  # no raise
+
+
+def test_require_credentials_raises_naming_both_missing_flags_for_alpaca_paper():
+    cfg = _cfg(broker="alpaca_paper")
+    with pytest.raises(SystemExit, match=r"--key-id, --secret-ref"):
+        _require_credentials_for_alpaca_paper(cfg, key_id=None, secret_ref=None)
+
+
+def test_require_credentials_raises_naming_only_the_one_missing_flag():
+    cfg = _cfg(broker="alpaca_paper")
+    with pytest.raises(SystemExit) as exc_info:
+        _require_credentials_for_alpaca_paper(cfg, key_id="AK1", secret_ref=None)
+    message = str(exc_info.value)
+    assert "--secret-ref" in message
+    assert "--key-id" not in message
+
+
+def test_require_credentials_passes_silently_when_both_are_given():
+    cfg = _cfg(broker="alpaca_paper")
+    _require_credentials_for_alpaca_paper(cfg, key_id="AK1", secret_ref="alpaca-secret")
+
+
+def test_a_real_alpaca_paper_read_populates_all_three_capital_fields(tmp_path):
+    """'A real read' -- via ScriptedTransport, never a real socket (sandbox
+    has no network egress, same constraint tests/test_broker_selection.py's
+    own module docstring already states). Proves credentials/secrets_
+    provider actually reach select_broker_adapter from _build_broker_state,
+    not just accepted as unused parameters -- the populated figures below
+    (12345.67) could only have come from the scripted /v2/account response,
+    never SimulatorBroker's hardcoded $500 default."""
+    transport = ScriptedTransport()
+    transport.enqueue(200, dict(cash="12345.67", equity="12345.67", buying_power="12345.67",
+                                multiplier="1", pattern_day_trader=False, daytrade_count=0))
+    transport.enqueue(200, [])   # positions() call #1 -- account_wiring's opening-seed check
+    transport.enqueue(200, [])   # positions() call #2 -- broker_positions
+    transport.enqueue(200, [])   # open_orders()
+
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+        _cfg(broker="alpaca_paper"), account_id="acct-1",
+        ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+        credentials=_alpaca_creds(), secrets_provider=_alpaca_secrets(),
+        transport=transport,
+    )
+    assert broker_account is not None
+    assert float(broker_account.settled_cash) == 12345.67
+    assert float(broker_account.equity) == 12345.67
+    assert float(broker_account.buying_power) == 12345.67
+    assert broker_positions == ()
+    assert isinstance(day_trade_guard, DayTradeGuard)
+
+
+def test_a_missing_secret_degrades_to_the_null_triple_not_an_exception(tmp_path):
+    """broker=alpaca_paper with credentials pointing at a keychain entry
+    that does not exist -- select_broker_adapter raises BrokerSelectionError
+    (agent/broker/selection.py), which _build_broker_state's own broad
+    except must still degrade to the same honest null triple this module
+    has always promised, never a fabricated number and never a crash that
+    would take the rest of GET /api/state down with it."""
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+        _cfg(broker="alpaca_paper"), account_id="acct-1",
+        ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+        credentials=_alpaca_creds(), secrets_provider=_alpaca_secrets(put_secret=False),
+        transport=ScriptedTransport(),
+    )
+    assert broker_account is None
+    assert broker_positions == ()
+    assert day_trade_guard is None
+
+
+def test_alpaca_paper_with_no_credentials_at_all_still_degrades_to_the_null_triple(tmp_path):
+    """cfg.broker == alpaca_paper but this call was given neither
+    credentials nor secrets_provider (e.g. --key-id/--secret-ref were never
+    passed to main -- main's own _require_credentials_for_alpaca_paper
+    would already have refused to start the real process; this test calls
+    _build_broker_state one layer below that guard, to prove it ALSO fails
+    safe on its own, not only because main happens to stop it first)."""
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+        _cfg(broker="alpaca_paper"), account_id="acct-1",
+        ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+    )
+    assert broker_account is None
+    assert broker_positions == ()
+    assert day_trade_guard is None
+
+
+def test_the_dashboards_own_adapter_construction_never_attaches_a_staging_key():
+    """Unit 16's own read-only requirement: pass no staging_key; if the
+    adapter refuses writes via StagingKeyUnset, that is correct. Verified,
+    not assumed -- constructs the adapter the SAME way _build_broker_state
+    does (agent.broker.selection.select_broker_adapter, credentials/
+    secrets_provider/transport given, no capability_policy, no
+    staging_key), then proves submit() actually refuses a real StagedOrder,
+    mirroring tests/test_broker_selection.py's own equivalent test for the
+    same adapter type."""
+    from agent.accounts import AccountType
+    from agent.broker.selection import select_broker_adapter
+    from agent.daytrade import DayTradeGuard as _DTG
+    from agent.pipeline import Gatekeeper
+    from agent.policy import initial_policy
+    from agent.risk import PortfolioState, RiskPolicy
+
+    acct = "acct-1"
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    transport = ScriptedTransport()
+    adapter = select_broker_adapter(
+        _cfg(broker="alpaca_paper"), account_id=acct,
+        credentials=_alpaca_creds(acct), secrets_provider=_alpaca_secrets(),
+        transport=transport, now=now,
+    )
+    assert adapter._staging_key is None
+
+    gk = Gatekeeper(
+        account_id=acct, account_type=AccountType.TAXABLE,
+        capability_policy=initial_policy(),
+        risk_policy=RiskPolicy("t", max_position_pct=50.0, max_sector_pct=100.0,
+                               min_settled_cash_pct_of_nlv=0.0, min_absolute_settled_cash=0.0),
+        day_trade_guard=_DTG(account_id=acct, max_per_5_sessions=3),
+        signing_key=b"k" * 32,
+    )
+    portfolio = PortfolioState(account_id=acct, nlv=10000.0, settled_cash=10000.0)
+    staged = gk.stage(client_order_id="c1", symbol="SPY", side="BUY", order_type="LIMIT",
+                      time_in_force="DAY", portfolio=portfolio, now=now, posture="CASH",
+                      qty=1.0, price=100.0, limit_price=100.0)
+
+    with pytest.raises(StagingKeyUnset):
+        adapter.submit(staged)
+    assert transport.calls == []   # the refusal happens before any network call is attempted
+
+
+# --------------------------------------- Unit 16: main()'s own startup-time refusal
+
+def test_main_refuses_loudly_at_startup_when_alpaca_paper_is_configured_with_no_flags(
+    tmp_path,
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(valid_raw_config(broker="alpaca_paper")),
+                          encoding="utf-8")
+    with pytest.raises(SystemExit, match=r"--key-id, --secret-ref"):
+        main(["--config", str(config_path), "--data-dir", str(tmp_path / "data"),
+             "--account-id", "acct-1"])
+
+
+# ---------------------------------------- Unit 17: credential preflight strip
+
+def test_signing_key_secret_ref_flag_defaults_to_none():
+    args = _parse_args(["--config", "c.json"])
+    assert args.signing_key_secret_ref is None
+
+
+def test_signing_key_secret_ref_flag_is_parsed():
+    args = _parse_args(["--config", "c.json", "--signing-key-secret-ref", "gk-ref"])
+    assert args.signing_key_secret_ref == "gk-ref"
+
+
+def test_check_credential_reports_present_true_when_resolve_succeeds():
+    sp = _alpaca_secrets()   # has "alpaca-secret" put already
+    result = _check_credential("alpaca-secret", sp)
+    assert result == {"present": True, "error": None}
+
+
+def test_check_credential_reports_present_false_with_the_secretnotfounderror_message():
+    """NEVER the secret value -- only SecretNotFoundError's own message,
+    which (see agent/secrets_provider.py's own docstring) carries only mode
+    and secret_ref, never a resolved value."""
+    sp = _alpaca_secrets(put_secret=False)
+    result = _check_credential("alpaca-secret", sp)
+    assert result["present"] is False
+    assert "alpaca-secret" in result["error"]
+    assert "s3cr3t-value" not in result["error"]   # the value, if it existed, never leaks
+
+
+def test_check_credential_treats_a_missing_secret_ref_as_absent_not_a_crash():
+    """No --secret-ref/--signing-key-secret-ref given at all (both optional,
+    per Unit 16/17) -- this must degrade to the same honest 'not present'
+    shape, never an AttributeError/TypeError from calling resolve(None)."""
+    sp = _alpaca_secrets()
+    result = _check_credential(None, sp)
+    assert result["present"] is False
+    assert result["error"]
+
+
+def _all_store_paths(tmp_path):
+    return dict(
+        cost_ledger_path=tmp_path / "cl.jsonl",
+        approval_request_store_path=tmp_path / "ar.jsonl",
+        opportunity_tracker_path=tmp_path / "ot.jsonl",
+        audit_log_path=tmp_path / "al.jsonl",
+        ledger_store_path=tmp_path / "l.jsonl",
+        quarantine_store_path=tmp_path / "q.jsonl",
+    )
+
+
+def test_build_dashboard_runtime_threads_credential_preflight_through_verbatim(tmp_path):
+    preflight = {
+        "alpaca_api_secret": {"present": True, "error": None},
+        "gatekeeper_signing_key": {"present": False, "error": "not found"},
+    }
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id=None,
+        credential_preflight=preflight, **_all_store_paths(tmp_path),
+    )
+    assert runtime.credential_preflight == preflight
+
+
+def test_build_dashboard_runtime_defaults_credential_preflight_to_empty_dict(tmp_path):
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id=None, **_all_store_paths(tmp_path),
+    )
+    assert runtime.credential_preflight == {}

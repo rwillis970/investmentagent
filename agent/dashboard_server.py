@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -66,7 +66,23 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 class DashboardRuntime:
     """Every real collaborator this surface reads from or writes to. No
     `BrokerAdapter`, no `secrets_provider`, no credential -- see module
-    docstring's "what this surface must never do"."""
+    docstring's "what this surface must never do".
+
+    `credential_preflight` (Unit 17, 2026-08-12) is the ONE exception to
+    "no credential" worth calling out explicitly, and it is not really an
+    exception: it is a plain dict of booleans/error strings -- never a
+    secret value, never a `SecretsProvider`, never anything this module
+    could use to resolve one. `scripts/run_dashboard.py`'s own `main`
+    computes it ONCE, before the server starts (calling
+    `agent.secrets_provider` there, which already legitimately touches
+    that module per Unit 16's own credential wiring), and hands the
+    already-computed dict in here. This module still never imports
+    `agent.secrets_provider` and never calls `.resolve()` -- see
+    `route_request`'s own `GET /api/credentials`, which does nothing but
+    read this field back verbatim, the same way `GET /api/state` reads
+    every other field here. If the operator rotates a credential, this
+    dict is stale until the dashboard process is restarted -- accepted for
+    a paper pilot (see `scripts/run_dashboard.py`'s own docstring)."""
     config: Config
     config_path: str | Path
     cost_ledger: CostLedger
@@ -78,6 +94,7 @@ class DashboardRuntime:
     broker_account: AccountSnapshot | None = None
     broker_positions: tuple[Position, ...] = ()
     day_trade_guard: DayTradeGuard | None = None
+    credential_preflight: dict = field(default_factory=dict)
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
 
@@ -122,6 +139,13 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
     if method == "PATCH" and path == "/api/config":
         return _handle_config_patch(runtime, body=body, now=now)
 
+    if method == "GET" and path == "/api/credentials":
+        # Static read of a dict scripts/run_dashboard.py already computed at
+        # startup -- see DashboardRuntime.credential_preflight's own
+        # docstring for why this route never touches agent.secrets_provider
+        # itself.
+        return _json_result(200, runtime.credential_preflight)
+
     if method == "GET" and path in ("/", "/dashboard"):
         return _serve_static("agent_command_center.html")
     if method == "GET" and path == "/approval-card":
@@ -130,6 +154,8 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         return _serve_static("dashboard_bind.js")
     if method == "GET" and path == "/approval_card_bind.js":
         return _serve_static("approval_card_bind.js")
+    if method == "GET" and path == "/credential_preflight_bind.js":
+        return _serve_static("credential_preflight_bind.js")
 
     return _json_result(404, {"error": f"no route for {method} {path}"})
 

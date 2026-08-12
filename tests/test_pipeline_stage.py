@@ -133,12 +133,26 @@ class RecordingEdgarClient:
         return []
 
 
+class RecordingNewsProvider:
+    """News collector unit, 2026-08-12: the third collector's own recording
+    fake, mirroring `RecordingMarketClient`/`RecordingEdgarClient` immediately
+    above -- this module's own convention for proving a collaborator was
+    actually called, not just wired in."""
+    def __init__(self):
+        self.calls = 0
+
+    def fetch_since(self, symbols, since):
+        self.calls += 1
+        return []
+
+
 def collection_runtime(tmp_path, *, enabled=True, interval=60):
     from agent.edgar_collector import TickerCikCache
     return PipelineRuntime(
         data_collection_enabled=enabled, data_collection_interval_seconds=interval,
         fact_store=FactStore(), market_data_client=RecordingMarketClient(),
         edgar_client=RecordingEdgarClient(), ticker_cik_cache=TickerCikCache(),
+        news_provider=RecordingNewsProvider(),
         symbol_universe=UNIVERSE,
     )
 
@@ -149,6 +163,7 @@ def test_collection_runs_when_enabled_due_and_in_session(tmp_path):
                                 last_collected_at=None, last_screened_at=None)
     assert rt.market_data_client.calls == 1
     assert rt.edgar_client.calls == 1
+    assert rt.news_provider.calls == 1
     assert result.last_collected_at == T0
 
 

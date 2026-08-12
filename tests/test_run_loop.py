@@ -46,6 +46,7 @@ from agent.broker.simulator import SimulatorBroker
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.materiality_cycle import MaterialityCycleResult
 from agent.mode_store import ModeStore
+from agent.news_provider import NullNewsProvider
 from agent.pipeline import Gatekeeper, StagedOrder, sign_staged_order
 from agent import pipeline_stage as pipeline_stage_module
 from agent.pipeline_stage import PipelineRuntime
@@ -540,6 +541,16 @@ def pipeline_runtime(*, data_collection_enabled=False, data_collection_interval_
         data_collection_interval_seconds=data_collection_interval_seconds,
         symbol_universe={"AAPL": "US_EQUITY"},
         fact_store=FactStore(),
+        # News collector unit, 2026-08-12: `collect_market_data`/
+        # `collect_filings` are monkeypatched out per-test below wherever
+        # `data_collection_enabled=True`, but `collect_news_events` is not
+        # -- it's a real call in every test in this section, so this needs
+        # a real, harmless `NewsProvider`, not `None`. `NullNewsProvider`
+        # (the real production default -- see agent/news_provider.py) is
+        # correct here: it always returns zero events, so it changes
+        # nothing about any of this section's own recorded call counts or
+        # cadence assertions.
+        news_provider=NullNewsProvider(),
         materiality_screen_enabled=materiality_screen_enabled,
         opportunity_screen_interval_seconds=opportunity_screen_interval_seconds,
     )

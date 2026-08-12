@@ -143,6 +143,54 @@ def test_broker_membership_is_checked_and_rejects_a_typo_loudly():
     assert cfg.broker == "alpaca_paper"
 
 
+# ------------------------------------------------------- news collector unit, 2026-08-12
+
+def test_news_feed_provider_defaults_to_null():
+    cfg = C.load(base())
+    assert cfg.news_feed_provider == "null"
+
+
+def test_news_feed_provider_membership_is_checked_and_rejects_a_typo_loudly():
+    with pytest.raises(C.ConfigError, match="news_feed_provider must be one of"):
+        C.load(base(news_feed_provider="nul"))
+
+
+def test_news_lookback_hours_defaults_to_24():
+    cfg = C.load(base())
+    assert cfg.news_lookback_hours == 24
+
+
+def test_news_lookback_hours_must_be_positive():
+    with pytest.raises(C.ConfigError, match="news_lookback_hours must be positive"):
+        C.load(base(news_lookback_hours=0))
+
+
+def test_build_provider_defaults_to_null_news_provider():
+    from agent.news_provider import NullNewsProvider
+    cfg = C.load(base())
+    provider = C.build_provider(cfg)
+    assert isinstance(provider, NullNewsProvider)
+
+
+def test_build_provider_raises_for_an_unrecognised_value_bypassing_validate():
+    """`Config` can be constructed directly, bypassing `load`/`validate` --
+    `build_provider` must not fall back to `NullNewsProvider` silently for a
+    value it doesn't recognise, the same belt-and-suspenders posture
+    `select_broker_adapter` takes toward `cfg.broker`."""
+    cfg = C.Config(news_feed_provider="bogus")
+    with pytest.raises(C.ConfigError, match="news_feed_provider=.*not a recognised"):
+        C.build_provider(cfg)
+
+
+def test_news_provider_config_is_never_a_field_on_config_itself():
+    """Deliberate: every other collector's settings are flat Config fields;
+    NewsProviderConfig is an internal bundle build_provider constructs, not
+    part of Config's own schema (see agent/config.py's own docstring on
+    both)."""
+    assert "news_provider" not in {f.name for f in C.fields(C.Config)}
+    assert "news_provider_config" not in {f.name for f in C.fields(C.Config)}
+
+
 def test_paused_is_still_a_valid_config_mode_value():
     """Regression guard for the §9.2 topology fix: PAUSED left agent.mode.
     CHAIN (the four-mode escalation ordering) but remains a real, valid

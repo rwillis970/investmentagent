@@ -76,6 +76,44 @@ def test_get_api_state_returns_200_and_json(tmp_path):
     assert payload["mode"] == "PAPER"
 
 
+# ------------------------------------------------------------ GET /api/credentials
+# Unit 17 (credential preflight strip), 2026-08-12. Deliberately NOT this
+# module's job to resolve anything -- see module docstring's "WHAT THIS
+# SURFACE MUST NEVER DO (item 5): ... never touches agent.secrets_provider".
+# scripts/run_dashboard.py resolves presence once at startup (via
+# _check_credential, PAPER-bound) and hands the already-computed dict to
+# DashboardRuntime; this route is a pure, static read of that dict, exactly
+# like every other DashboardRuntime field GET /api/state already reads.
+
+def test_get_api_credentials_returns_the_runtimes_preflight_dict_verbatim(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    runtime.credential_preflight = {
+        "alpaca_api_secret": {"present": True, "error": None},
+        "gatekeeper_signing_key": {"present": False,
+                                   "error": "no secret found for mode='PAPER' "
+                                            "secret_ref='gk-ref'"},
+    }
+    result = route_request(runtime, method="GET", path="/api/credentials")
+    assert result.status == 200
+    assert result.content_type == "application/json"
+    assert json.loads(result.body) == runtime.credential_preflight
+
+
+def test_get_api_credentials_defaults_to_an_empty_dict_when_never_set(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/api/credentials")
+    assert result.status == 200
+    assert json.loads(result.body) == {}
+
+
+def test_credential_preflight_bind_js_is_reachable_through_serve_static(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/credential_preflight_bind.js")
+    assert result.status == 200
+    assert result.content_type == "text/javascript; charset=utf-8"
+    assert result.body == (STATIC_DIR / "credential_preflight_bind.js").read_bytes()
+
+
 # ------------------------------------------------------------------- approve/reject
 
 def test_post_approve_after_min_display_returns_200_with_token(tmp_path):
@@ -470,17 +508,22 @@ def test_command_center_html_registers_the_real_agent_command_center_contract(tm
 
 
 def test_command_center_html_has_exactly_one_dashboard_bind_script_tag_immediately_before_closing_body(tmp_path):
-    """The one permitted edit to the generated file (see this unit's own
-    report): a single `<script src="dashboard_bind.js"></script>` inserted
-    right before the real, outer document's closing `</body>` -- not the
-    escaped `<\\/body>` that appears as inert text inside the
-    `__bundler/template` JSON string, and not anywhere else in the file."""
+    """The permitted edits to the generated file (see this unit's own
+    report, and Unit 17's own report for the second one): a single
+    `<script src="dashboard_bind.js"></script>`, immediately followed by a
+    single `<script src="credential_preflight_bind.js"></script>` (Unit 17,
+    2026-08-12 -- credential preflight strip), both inserted right before
+    the real, outer document's closing `</body>` -- not the escaped
+    `<\\/body>` that appears as inert text inside the `__bundler/template`
+    JSON string, and not anywhere else in the file."""
     runtime, _ = make_runtime(tmp_path)
     result = route_request(runtime, method="GET", path="/")
     html = result.body.decode("utf-8")
     assert html.count('<script src="dashboard_bind.js"></script>') == 1
+    assert html.count('<script src="credential_preflight_bind.js"></script>') == 1
     assert html.rstrip().endswith(
-        '<script src="dashboard_bind.js"></script>\n</body>\n</html>'
+        '<script src="dashboard_bind.js"></script>\n'
+        '<script src="credential_preflight_bind.js"></script>\n</body>\n</html>'
     )
 
 
