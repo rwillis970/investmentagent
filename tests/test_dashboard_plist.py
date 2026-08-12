@@ -80,5 +80,5 @@ def test_program_arguments_parse_against_the_real_parser(tmp_path):
     args = _parse_args(argv)
     assert args.account_id == "acct-real"
     assert args.host == "127.0.0.1"
-    assert args.cost_ledger_path == str(tmp_path / "state" / "cost_ledger.jsonl")
-    assert args.audit_log_path == str(tmp_path / "state" / "audit.jsonl")
+    assert args.cost_ledger_path == str(tmp_path / "data" / "cost_ledger.jsonl")
+    assert args.audit_log_path == str(tmp_path / "data" / "audit.jsonl")

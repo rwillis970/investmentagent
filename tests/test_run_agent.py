@@ -26,7 +26,9 @@ from agent.execution_quarantine import ADMITTED, REJECTED, ExecutionQuarantineSt
 from agent.ledger_store import LedgerStore
 from agent.mode_store import ModeStore
 from agent.secrets_provider import InMemorySecretsProvider
-from scripts.run_agent import build_account_runtime, main
+from scripts.run_agent import (DataDirConflict, _account_ids_in,
+                               _check_data_dir_sanity, build_account_runtime,
+                               main)
 
 
 def base_config(**over):
@@ -371,7 +373,15 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
     (a second process, or a second main() call in a test) sees the same
     history. Exercised end-to-end here: two separate main() calls against
     the SAME audit log path, the first appending an event via a fake
-    run_loop_fn, the second reloading and finding it."""
+    run_loop_fn, the second reloading and finding it.
+
+    Runtime-recovery unit (2026-08-13): main() now also appends its own
+    "data_dir_resolved" row on every real invocation, BEFORE run_loop_fn is
+    ever called (see main()'s own comment) -- so each of the two main()
+    calls below contributes one of those in addition to whatever
+    run_loop_fn itself appends. Three rows total, not one; asserted by
+    action name/order, not just count, so this stays a real regression
+    check rather than a magic number."""
     config_path = tmp_path / "config.json"
     config_path.write_text(__import__("json").dumps(base_config()))
     audit_path = tmp_path / "audit.jsonl"
@@ -408,8 +418,9 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
     main(argv, run_loop_fn=inspecting_run_loop,
         secrets_provider_factory=_secrets_provider_factory)
     reloaded = captured["audit_log"]
-    assert len(reloaded) == 1
-    assert reloaded.events[0].action == "test_event"
+    assert len(reloaded) == 3
+    actions = [ev.action for ev in reloaded.events]
+    assert actions == ["data_dir_resolved", "test_event", "data_dir_resolved"]
     assert reloaded.verify() is True
 
 
@@ -1666,3 +1677,165 @@ def test_submit_approved_is_idempotent_across_two_separate_invocations(tmp_path,
     assert submitted[0].after["broker_order_id"] == submitted[1].after["broker_order_id"]
     # ...but exactly ONE real order at the broker.
     assert len(shared_adapter._orders) == 1
+
+
+# --------------------------------------------- data-dir sanity guard (runtime-recovery unit, 2026-08-13)
+# The defect this closes: a real Alpaca fill was admitted into one data
+# directory's ledger while a SIBLING directory, also usable as --data-dir,
+# never saw that admission -- so the same broker position reconciled
+# correctly under one directory and stayed permanently quarantined under
+# the other, and nothing ever noticed the two directories disagreed about
+# the account's own history. See this unit's own report for the full,
+# real-evidence trail (not reproduced here as a fixture).
+
+def _write_jsonl(path, rows):
+    import json
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+def test_account_ids_in_an_empty_or_missing_directory_is_empty(tmp_path):
+    assert _account_ids_in(tmp_path / "does-not-exist") == frozenset()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert _account_ids_in(empty) == frozenset()
+
+
+def test_account_ids_in_reads_top_level_and_nested_after_account_id(tmp_path):
+    d = tmp_path / "d"
+    d.mkdir()
+    _write_jsonl(d / "ledger.jsonl", [
+        {"kind": "opening_balance", "amount": 500.0, "at": "2026-01-01T00:00:00+00:00"},
+        {"kind": "fill", "account_id": "acct-x", "symbol": "SPY"},
+    ])
+    _write_jsonl(d / "mode_state.jsonl", [
+        {"seq": 1, "mode": "PAPER"},
+    ])
+    _write_jsonl(d / "audit.jsonl", [
+        {"seq": 1, "actor": "system", "action": "execution_quarantined",
+         "after": {"account_id": "acct-y"}},
+    ])
+    assert _account_ids_in(d) == frozenset({"acct-x", "acct-y"})
+
+
+def test_account_ids_in_tolerates_a_malformed_line(tmp_path):
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "ledger.jsonl").write_text(
+        'not valid json {{{\n{"kind": "fill", "account_id": "acct-z"}\n', encoding="utf-8")
+    assert _account_ids_in(d) == frozenset({"acct-z"})
+
+
+def test_data_dir_sanity_passes_with_no_siblings_at_all(tmp_path):
+    data_dir = tmp_path / "only-child" / "data"
+    data_dir.mkdir(parents=True)
+    _check_data_dir_sanity(data_dir, account_id="acct-a")   # no raise
+
+
+def test_data_dir_sanity_passes_when_a_sibling_agrees_on_the_same_account(tmp_path):
+    parent = tmp_path / "parent"
+    data_dir = parent / "data"
+    sibling = parent / "backup"
+    data_dir.mkdir(parents=True)
+    sibling.mkdir()
+    _write_jsonl(sibling / "ledger.jsonl", [{"kind": "fill", "account_id": "acct-a"}])
+    _check_data_dir_sanity(data_dir, account_id="acct-a")   # no raise
+
+
+def test_data_dir_sanity_passes_when_a_sibling_has_no_recognizable_files(tmp_path):
+    parent = tmp_path / "parent"
+    data_dir = parent / "data"
+    sibling = parent / "not_a_data_dir"
+    data_dir.mkdir(parents=True)
+    sibling.mkdir()
+    (sibling / "readme.txt").write_text("hello", encoding="utf-8")
+    _check_data_dir_sanity(data_dir, account_id="acct-a")   # no raise
+
+
+def test_data_dir_sanity_refuses_when_a_sibling_records_a_different_account(tmp_path):
+    """The exact shape of the real defect: a sibling directory (like the
+    real state/ this unit found and archived) recording a DIFFERENT
+    account_id must refuse to start, not silently proceed."""
+    parent = tmp_path / "parent"
+    data_dir = parent / "data"
+    sibling = parent / "state"
+    data_dir.mkdir(parents=True)
+    sibling.mkdir()
+    _write_jsonl(sibling / "ledger.jsonl", [{"kind": "fill", "account_id": "acct-OTHER"}])
+    import pytest
+    with pytest.raises(DataDirConflict, match="acct-OTHER"):
+        _check_data_dir_sanity(data_dir, account_id="acct-a")
+
+
+def test_data_dir_sanity_ignores_a_sibling_with_no_account_id_recorded_yet(tmp_path):
+    """A sibling that LOOKS like a data directory (has the right filenames)
+    but has never actually recorded any account_id yet (e.g. an empty file,
+    or one with only opening_balance/mode rows with no account_id field at
+    all) is not evidence of a conflict."""
+    parent = tmp_path / "parent"
+    data_dir = parent / "data"
+    sibling = parent / "fresh"
+    data_dir.mkdir(parents=True)
+    sibling.mkdir()
+    _write_jsonl(sibling / "ledger.jsonl", [
+        {"kind": "opening_balance", "amount": 500.0, "at": "2026-01-01T00:00:00+00:00"},
+    ])
+    _check_data_dir_sanity(data_dir, account_id="acct-a")   # no raise
+
+
+def test_main_refuses_to_start_via_data_dir_when_a_sibling_conflicts(tmp_path):
+    """End-to-end through main() itself, using --data-dir (not individual
+    store-path flags) -- proves the guard is actually wired into the real
+    startup path, not just unit-tested in isolation."""
+    import json as json_module
+    parent = tmp_path / "parent"
+    data_dir = parent / "data"
+    sibling = parent / "state"
+    data_dir.mkdir(parents=True)
+    sibling.mkdir()
+    _write_jsonl(sibling / "ledger.jsonl", [{"kind": "fill", "account_id": "acct-OTHER"}])
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    argv = [
+        "--config", str(config_path),
+        "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
+        "--data-dir", str(data_dir),
+    ]
+    code = main(argv, secrets_provider_factory=_secrets_provider_factory)
+    assert code == 1
+    # Never reached run_loop_fn / opened any store -- refused before any of
+    # that, so no files were ever created inside data_dir.
+    assert not (data_dir / "ledger.jsonl").exists()
+
+
+def test_main_starts_normally_via_data_dir_when_no_sibling_conflicts(tmp_path):
+    import json as json_module
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    argv = [
+        "--config", str(config_path),
+        "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
+        "--data-dir", str(data_dir),
+    ]
+    code = main(argv, run_loop_fn=lambda **kw: None,
+               secrets_provider_factory=_secrets_provider_factory)
+    assert code == 0
+    audit = AuditLog(path=data_dir / "audit.jsonl")
+    assert audit.events[0].action == "data_dir_resolved"
+    assert audit.events[0].after["data_dir"] == str(data_dir.resolve())
+    assert audit.events[0].after["account_id"] == "acct-a"
+
+
+def test_data_dir_relevant_stays_false_when_every_store_path_is_explicit(tmp_path):
+    """The class of regression this must never reintroduce (see
+    _default_relevant_paths's own long-standing comment): a caller who
+    supplies every one of the eleven store paths explicitly must never
+    have the (possibly unrelated, possibly cwd-relative) --data-dir
+    default checked for sibling conflicts."""
+    from scripts.run_agent import _parse_args
+    argv = _argv(tmp_path, tmp_path / "config.json")
+    args = _parse_args(argv)
+    assert args.data_dir_relevant is False

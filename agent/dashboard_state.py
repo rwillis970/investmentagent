@@ -26,6 +26,7 @@ rather than reaching for a broker connection itself.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from . import market_calendar
@@ -37,6 +38,7 @@ from .broker.base import AccountSnapshot, Position
 from .config import Config
 from .cost import CostLedger
 from .daytrade import DayTradeGuard
+from .ledger import Ledger
 from .opportunity_event_tracker import OpportunityEventTracker
 from .risk import PortfolioState, investable_cash, required_reserve
 
@@ -71,6 +73,7 @@ def build_dashboard_state(
     broker_account: AccountSnapshot | None = None,
     broker_positions: tuple[Position, ...] = (),
     day_trade_guard: DayTradeGuard | None = None,
+    ledger: Ledger | None = None,
     audit_recent_limit: int = 20,
 ) -> dict:
     """Assemble the single JSON document the dashboard's GET /api/state
@@ -149,10 +152,17 @@ def build_dashboard_state(
             # hardcoded sample values instead of these.
             **_prefixed("settled_cash_usd", _present(float(broker_account.settled_cash))),
             **_prefixed("unsettled_cash_usd", _present(float(broker_account.unsettled_cash))),
+            # DASHBOARD FIX follow-up (2026-08-12): agent_command_center.html's
+            # footer "CAPITAL" figure is the account's total equity/NLV, not
+            # settled cash -- the same `portfolio.nlv` this function already
+            # computes reserve_pct against above, just never previously
+            # exposed as its own field. Genuinely new (there was no existing
+            # risk_gates field this could reuse without misrepresenting it).
+            **_prefixed("nlv_usd", _present(float(broker_account.equity))),
         })
     else:
         for name in ("current_reserve_pct", "required_reserve_usd", "investable_cash_usd",
-                     "settled_cash_usd", "unsettled_cash_usd"):
+                     "settled_cash_usd", "unsettled_cash_usd", "nlv_usd"):
             risk_gates.update(_prefixed(name, _null(
                 "no broker_account was supplied to build_dashboard_state for this cycle"
             )))
@@ -237,11 +247,39 @@ def build_dashboard_state(
         **_prefixed("sessions_recorded", _null(_NOT_BUILT)),
         "note": "§12: no code path exists behind an improvement loop yet",
     }
-    performance = {
-        **_prefixed("closed_positions", _null(_NOT_BUILT)),
-        **_prefixed("attribution", _null(_NOT_BUILT)),
-        "note": "§13: not implemented; nothing to evaluate against a benchmark yet",
-    }
+    # Performance-plumbing unit (2026-08-13): `closed_positions`/
+    # `realized_pnl_usd` are now real, computed from `ledger.closed_lots()`
+    # (agent/ledger.py -- reconstructed from the fill log, which never
+    # discards a fill; see that method's own docstring). `attribution`
+    # stays permanently _NOT_BUILT here -- a benchmark-relative, tax-aware,
+    # since-inception comparison is a genuinely separate, much larger
+    # feature this unit's scope does not cover (see the panel's own design
+    # copy: "the highest-value thing left to build"). Zero closed lots is
+    # a real, honest, present value (0), NOT the same as "not built" --
+    # the two must not be conflated: a fresh account with no sells yet
+    # correctly reports closed_positions=0, not null.
+    if ledger is not None:
+        closed = ledger.closed_lots()
+        realized_pnl = sum((lot.realized_pnl for lot in closed), start=Decimal("0"))
+        performance = {
+            **_prefixed("closed_positions", _present(len(closed))),
+            **_prefixed("realized_pnl_usd", _present(float(realized_pnl))),
+            **_prefixed("attribution", _null(_NOT_BUILT)),
+            "note": "§13: attribution vs. a benchmark is not implemented; "
+                    "closed_positions/realized_pnl_usd are real, computed from "
+                    "the ledger's own fill log",
+        }
+    else:
+        performance = {
+            **_prefixed("closed_positions", _null(
+                "no ledger was supplied to build_dashboard_state for this cycle"
+            )),
+            **_prefixed("realized_pnl_usd", _null(
+                "no ledger was supplied to build_dashboard_state for this cycle"
+            )),
+            **_prefixed("attribution", _null(_NOT_BUILT)),
+            "note": "§13: not implemented; nothing to evaluate against a benchmark yet",
+        }
 
     return {
         "generated_at": now.isoformat(),

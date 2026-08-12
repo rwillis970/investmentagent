@@ -28,6 +28,17 @@
   ever needs to name the directory, never any individual file inside it.
   An explicit override flag for a single store path is still accepted here
   if you ever need one store to live somewhere else; ordinarily you won't.
+
+  CANONICAL DIRECTORY IS `data/`, NOT `state/` (runtime-recovery unit,
+  2026-08-13). This template previously named `.../state` here, which was
+  stale: the real deployment had already moved to a directory named
+  `data` (evidenced by that directory's own most recent writes; `state/`
+  had not been touched in 12 days) by the time this was corrected, but
+  this checked-in template was never updated to match. `state/` has been
+  archived to `state-archive-2026-07-31/` (never deleted, see repo root)
+  specifically so nothing can silently default into it again. If your own
+  deployment's actual data-dir flag value differs from either name, use
+  YOUR real absolute path here, not this comment's example.
 -->
 <plist version="1.0">
 <dict>
@@ -49,7 +60,7 @@
         <string>--signing-key-secret-ref</string>
         <string>REPLACE_WITH_SIGNING_KEY_SECRET_REF</string>
         <string>--data-dir</string>
-        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/data</string>
         <string>--account-type</string>
         <string>TAXABLE</string>
     </array>

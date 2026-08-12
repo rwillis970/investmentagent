@@ -12,10 +12,19 @@ notification path -- the reconciliation loop itself has no other GUI
 dependency -- but it is the reason this must load as an agent, in the
 logged-in user's own session, not as a daemon at boot.
 
-## 1. Create the state and log directories
+## 1. Create the data and log directories
+
+CANONICAL DIRECTORY IS `data/`, NOT `state/` (runtime-recovery unit,
+2026-08-13). Earlier revisions of this doc used `~/investmentagent/state`
+as the example `--data-dir` throughout; the real deployment moved to a
+directory named `data` at some point and this doc was never updated to
+match, which let a `state/` directory linger with its own separate,
+conflicting account history. `state/` has been archived (see repo root's
+`state-archive-2026-07-31/`) specifically so nothing can default into it
+again. Use `data`, not `state`, below.
 
 ```sh
-mkdir -p ~/investmentagent/state ~/investmentagent/logs
+mkdir -p ~/investmentagent/data ~/investmentagent/logs
 ```
 
 `~/investmentagent/logs` must exist and be writable *before* the job is
@@ -23,7 +32,7 @@ loaded -- launchd itself creates `StandardOutPath`/`StandardErrorPath` but
 not a missing parent directory for them, and this script has no way to
 create that directory on launchd's behalf.
 
-`~/investmentagent/state` (the directory you'll pass as `--data-dir` in
+`~/investmentagent/data` (the directory you'll pass as `--data-dir` in
 step 2) does NOT strictly need to be pre-created any more: `scripts/
 run_agent.py` now creates it itself (`mkdir -p`, equivalent to the command
 above) the moment any store path defaults into it. Creating it here
@@ -68,7 +77,7 @@ replace every `/REPLACE/...` value:
   that same module docstring's CUTOVER section for the operator remedy
   (`ApprovalRequestStore.invalidate` on anything still DECIDED but not yet
   submitted; anything still PENDING is unaffected).
-- `--data-dir`: an absolute path to the `state/` directory created in
+- `--data-dir`: an absolute path to the `data/` directory created in
   step 1. Every durable store/log file `scripts/run_agent.py` needs
   (ledger, quarantine, cash-quarantine, fact store, cost ledger,
   extraction cache, analysis-result store, approval-request store,
@@ -114,7 +123,7 @@ before it ever reaches a running launchd job.
 
 ## 3. Advance the persisted mode to PAPER (fresh install only)
 
-A brand-new `state/mode_state.jsonl` starts DISABLED, and §9.2's one-step
+A brand-new `data/mode_state.jsonl` starts DISABLED, and §9.2's one-step
 rule means PAPER cannot be reached in one step -- and setting
 `mode: RESEARCH` (or `PAPER`) in `config.json` and just loading the job
 does NOT work either: the loop always constructs a broker adapter bound to
@@ -123,8 +132,8 @@ commands once, from the repo root, before loading the job for the first
 time (`--confirmed` is not needed for either step):
 
 ```sh
-python3 scripts/run_agent.py --data-dir ~/investmentagent/state --advance-mode-to RESEARCH
-python3 scripts/run_agent.py --data-dir ~/investmentagent/state --advance-mode-to PAPER
+python3 scripts/run_agent.py --data-dir ~/investmentagent/data --advance-mode-to RESEARCH
+python3 scripts/run_agent.py --data-dir ~/investmentagent/data --advance-mode-to PAPER
 ```
 
 (`--data-dir` here resolves to the exact same `mode_state.jsonl`/`audit.jsonl`
@@ -227,7 +236,7 @@ so two things happen:
      current PID (if running) and its last exit code.
    - Tail `StandardErrorPath` (the `.err.log` file from step 2) to see the
      actual repeating traceback/message.
-   - The sentinel file itself (`state/failure_sentinel.json`) is plain
+   - The sentinel file itself (`data/failure_sentinel.json`) is plain
      JSON: `exc_type`, `message`, `first_at`, `last_at`, `consecutive_count`
      -- readable directly if you want the recurrence history without
      digging through logs.

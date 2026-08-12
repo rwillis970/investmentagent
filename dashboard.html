@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Investment Agent Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0e1a; color: #e0e0e0; padding: 20px; }
+    .container { max-width: 1400px; margin: 0 auto; }
+    h1 { font-size: 24px; margin-bottom: 30px; color: #fff; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; margin-bottom: 30px; }
+    .card { background: #1a2332; border: 1px solid #2a3f5f; border-radius: 8px; padding: 20px; }
+    .card h2 { font-size: 14px; font-weight: 600; text-transform: uppercase; color: #7a9bc4; margin-bottom: 16px; letter-spacing: 0.5px; }
+    .card-content { display: flex; flex-direction: column; gap: 12px; }
+    .field { display: flex; justify-content: space-between; align-items: center; }
+    .field-label { font-size: 13px; color: #9a9a9a; }
+    .field-value { font-size: 16px; font-weight: 500; color: #fff; font-family: 'Monaco', monospace; }
+    .field-value.null { color: #666; font-style: italic; }
+    .field-value.positive { color: #4ade80; }
+    .field-value.negative { color: #f87171; }
+    .list-item { font-size: 13px; padding: 8px; background: #0f1620; border-radius: 4px; border-left: 2px solid #2a5a7f; }
+    .list-item-symbol { color: #7a9bc4; font-weight: 600; }
+    .list-item-detail { color: #888; font-size: 12px; margin-top: 2px; }
+    .status-ok { color: #4ade80; }
+    .status-unavailable { color: #888; }
+    .error { background: #2a1515; border: 1px solid #5c2b2e; color: #ff8a80; padding: 12px; border-radius: 4px; margin-bottom: 20px; }
+    .loading { color: #666; font-style: italic; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    td { padding: 8px; border-bottom: 1px solid #2a3f5f; }
+    td:first-child { color: #9a9a9a; width: 40%; }
+    td:last-child { text-align: right; font-family: 'Monaco', monospace; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Investment Agent Dashboard</h1>
+    <div id="error"></div>
+    <div id="loading" class="loading">Loading state...</div>
+    <div id="content" style="display: none;">
+      <!-- Capital & Risk -->
+      <div class="grid">
+        <div class="card">
+          <h2>Capital</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Settled Cash</span>
+              <span class="field-value" id="settled-cash">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Unsettled Cash</span>
+              <span class="field-value" id="unsettled-cash">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Investable (Available)</span>
+              <span class="field-value" id="investable-cash">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Required Reserve</span>
+              <span class="field-value" id="required-reserve">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Reserve %</span>
+              <span class="field-value" id="reserve-pct">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cost Control -->
+        <div class="card">
+          <h2>Cost Control (T4 Analysis)</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Month to Date</span>
+              <span class="field-value" id="mtd-cost">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Monthly Budget</span>
+              <span class="field-value" id="monthly-budget">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Budget State</span>
+              <span class="field-value" id="budget-state">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Analyses Today</span>
+              <span class="field-value" id="analyses-today">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Max per Day</span>
+              <span class="field-value" id="max-analyses">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Cache Hit Rate</span>
+              <span class="field-value" id="cache-hit">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Data Collection -->
+        <div class="card">
+          <h2>Data Collection</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Enabled</span>
+              <span class="field-value" id="dc-enabled">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Interval</span>
+              <span class="field-value" id="dc-interval">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Materiality Screen -->
+        <div class="card">
+          <h2>Materiality Screen (T3)</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Enabled</span>
+              <span class="field-value" id="ms-enabled">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Threshold</span>
+              <span class="field-value" id="ms-threshold">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Threshold Version</span>
+              <span class="field-value" id="ms-version">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Analysis (T4) -->
+        <div class="card">
+          <h2>Analysis (T4 Model)</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Enabled</span>
+              <span class="field-value" id="analysis-enabled">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Model ID</span>
+              <span class="field-value" id="analysis-model">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Approvals -->
+        <div class="card">
+          <h2>Approvals</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Enabled</span>
+              <span class="field-value" id="approval-enabled">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Pending Requests</span>
+              <span class="field-value" id="pending-count">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Deferred Requests</span>
+              <span class="field-value" id="deferred-count">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Decided Today</span>
+              <span class="field-value" id="decided-today">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Outstanding Earmarks</span>
+              <span class="field-value" id="outstanding-earmarks">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Reconciliation -->
+        <div class="card">
+          <h2>Reconciliation</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Cycle Interval</span>
+              <span class="field-value" id="recon-interval">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Day Trades (Local)</span>
+              <span class="field-value" id="day-trades">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Audit -->
+        <div class="card">
+          <h2>Audit Chain</h2>
+          <div class="card-content">
+            <div class="field">
+              <span class="field-label">Chain Verified</span>
+              <span class="field-value" id="audit-verified">—</span>
+            </div>
+            <div class="field">
+              <span class="field-label">Recent Events (Last 10)</span>
+              <span class="field-value" id="audit-count">—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Broker Positions -->
+      <div class="card">
+        <h2>Current Positions</h2>
+        <div id="positions-list" class="card-content"></div>
+      </div>
+
+      <!-- Pending Approvals -->
+      <div class="card" id="pending-card" style="display: none;">
+        <h2>Pending Approval Requests</h2>
+        <div id="pending-list" class="card-content"></div>
+      </div>
+
+      <!-- Recent Audit Events -->
+      <div class="card">
+        <h2>Recent Audit Events</h2>
+        <table id="audit-table">
+          <tr style="color: #7a9bc4; border-bottom: 2px solid #2a3f5f;">
+            <td>Time</td>
+            <td>Actor</td>
+            <td>Action</td>
+            <td>Object</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const apiUrl = 'http://localhost:8765/api/state';
+    const pollInterval = 5000; // 5 seconds
+    let lastUpdate = null;
+
+    function formatUSD(val) {
+      if (val === null || val === undefined) return 'N/A';
+      return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
+    }
+
+    function formatPct(val) {
+      if (val === null || val === undefined) return 'N/A';
+      return (parseFloat(val).toFixed(2)) + '%';
+    }
+
+    function formatTime(isoStr) {
+      const d = new Date(isoStr);
+      return d.toLocaleTimeString();
+    }
+
+    function render(state) {
+      if (!state) return;
+
+      const rg = state.risk_gates || {};
+      const cost = state.cost || {};
+      const dc = state.data_collection || {};
+      const ms = state.materiality_screen || {};
+      const analysis = state.analysis || {};
+      const app = state.approvals || {};
+      const recon = state.reconciliation || {};
+      const audit = state.audit || {};
+
+      // Capital
+      setText('settled-cash', formatUSD(rg.settled_cash_usd), !rg.settled_cash_usd_unavailable_reason);
+      setText('unsettled-cash', formatUSD(rg.unsettled_cash_usd), !rg.unsettled_cash_usd_unavailable_reason);
+      setText('investable-cash', formatUSD(rg.investable_cash_usd), !rg.investable_cash_usd_unavailable_reason);
+      setText('required-reserve', formatUSD(rg.required_reserve_usd), !rg.required_reserve_usd_unavailable_reason);
+      setText('reserve-pct', formatPct(rg.current_reserve_pct), !rg.current_reserve_pct_unavailable_reason);
+
+      // Cost
+      setText('mtd-cost', formatUSD(cost.month_to_date_usd));
+      setText('monthly-budget', formatUSD(cost.monthly_budget_usd));
+      setText('budget-state', cost.budget_state || 'N/A');
+      setText('analyses-today', cost.analyses_today || 0);
+      setText('max-analyses', cost.max_model_analyses_per_day || 0);
+      setText('cache-hit', formatPct(cost.cache_hit_rate * 100));
+
+      // Data Collection
+      setText('dc-enabled', dc.enabled ? 'Yes' : 'No');
+      setText('dc-interval', dc.interval_seconds ? Math.round(dc.interval_seconds / 60) + ' min' : 'N/A');
+
+      // Materiality
+      setText('ms-enabled', ms.enabled ? 'Yes' : 'No');
+      setText('ms-threshold', ms.threshold || 'N/A');
+      setText('ms-version', ms.threshold_version || 'N/A');
+
+      // Analysis
+      setText('analysis-enabled', analysis.enabled ? 'Yes' : 'No');
+      setText('analysis-model', analysis.model_id || 'N/A');
+
+      // Approvals
+      setText('approval-enabled', app.enabled ? 'Yes' : 'No');
+      setText('pending-count', (app.pending || []).length);
+      setText('deferred-count', (app.deferred || []).length);
+      setText('decided-today', app.decided_today || 0);
+      setText('outstanding-earmarks', formatUSD(app.outstanding_earmarks_usd), !app.outstanding_earmarks_usd_unavailable_reason);
+
+      // Reconciliation
+      setText('recon-interval', recon.cycle_interval_seconds ? Math.round(recon.cycle_interval_seconds / 60) + ' min' : 'N/A');
+      setText('day-trades', recon.day_trade_count !== null ? recon.day_trade_count : 'N/A', recon.day_trade_count !== null);
+
+      // Audit
+      setText('audit-verified', audit.hash_chain_verified ? 'Yes ✓' : 'No ✗');
+      setText('audit-count', (audit.recent || []).length);
+
+      // Positions
+      const posList = document.getElementById('positions-list');
+      posList.innerHTML = '';
+      const positions = rg.broker_positions || [];
+      if (positions.length > 0) {
+        positions.forEach(p => {
+          const item = document.createElement('div');
+          item.className = 'list-item';
+          item.innerHTML = `<div class="list-item-symbol">${p.symbol}</div><div class="list-item-detail">${p.qty} shares @ $${parseFloat(p.market_value).toFixed(2)}</div>`;
+          posList.appendChild(item);
+        });
+      } else {
+        posList.innerHTML = '<div style="color: #666;">No open positions</div>';
+      }
+
+      // Pending Approvals
+      const pendingCard = document.getElementById('pending-card');
+      const pendingList = document.getElementById('pending-list');
+      pendingList.innerHTML = '';
+      const pending = app.pending || [];
+      if (pending.length > 0) {
+        pendingCard.style.display = 'block';
+        pending.forEach(p => {
+          const item = document.createElement('div');
+          item.className = 'list-item';
+          const conf = p.confidence ? ` (${(p.confidence * 100).toFixed(0)}%)` : '';
+          item.innerHTML = `<div class="list-item-symbol">${p.side} ${p.authorized_qty} ${p.symbol}${conf}</div><div class="list-item-detail">Limit: $${p.limit_price || 'market'} | Earmark: $${formatUSD(p.earmark).replace('$', '')}</div>`;
+          pendingList.appendChild(item);
+        });
+      } else {
+        pendingCard.style.display = 'none';
+      }
+
+      // Audit Events
+      const auditTable = document.getElementById('audit-table');
+      const rows = auditTable.querySelectorAll('tr');
+      for (let i = rows.length - 1; i > 0; i--) rows[i].remove();
+      (audit.recent || []).reverse().slice(0, 10).forEach(ev => {
+        const row = document.createElement('tr');
+        row.innerHTML = `<td>${formatTime(ev.timestamp)}</td><td>${ev.actor}</td><td>${ev.action}</td><td>${ev.object_type}/${ev.object_id}</td>`;
+        auditTable.appendChild(row);
+      });
+
+      lastUpdate = new Date().toLocaleTimeString();
+    }
+
+    function setText(id, val, isGood) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = val;
+      if (isGood === false) el.classList.add('null');
+      else el.classList.remove('null');
+    }
+
+    async function fetch_state() {
+      try {
+       const resp = await fetch(apiUrl);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const state = await resp.json();
+        document.getElementById('error').textContent = '';
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('content').style.display = 'block';
+        render(state);
+      } catch (err) {
+        document.getElementById('error').innerHTML = `<strong>Error:</strong> ${err.message}`;
+        document.getElementById('loading').style.display = 'none';
+      }
+    }
+
+    // Initial fetch
+    fetch_state();
+
+    // Poll every 5 seconds
+    setInterval(fetch_state, pollInterval);
+  </script>
+</body>
+</html>

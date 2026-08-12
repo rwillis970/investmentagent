@@ -53,12 +53,21 @@ here. See this unit's own report for the exact fields this produces.
 
 FAILS SAFE TO THE SAME NULL, NEVER AN EXCEPTION, NEVER A FABRICATED NUMBER.
 `_build_broker_state` never raises: no `account_id`, a corrupt ledger file,
-or any other failure all resolve to `(None, (), None)` -- exactly what
-`agent.dashboard_state.build_dashboard_state` already treats as "no
-broker_account was supplied," so `GET /api/state` degrades to the same
-honest null + `_unavailable_reason` it always has, never a stale or
-partially-populated read (see that module's own docstring for why that
+or any other failure all resolve to `(None, (), None, None)` -- exactly
+what `agent.dashboard_state.build_dashboard_state` already treats as "no
+broker_account"/"no ledger" was supplied, so `GET /api/state` degrades to
+the same honest null + `_unavailable_reason` it always has, never a stale
+or partially-populated read (see that module's own docstring for why that
 null is the whole point, not a gap).
+
+LEDGER, NOW RETURNED TOO (performance-plumbing unit, 2026-08-13).
+`_build_broker_state` also constructs and returns the same `agent.ledger.
+Ledger` (via `store.to_ledger()`) that `recon.broker_account`/
+`.broker_positions` above are already derived from -- one `LedgerStore`
+read, not two -- so `DashboardRuntime.ledger` can feed the "Performance"
+panel's real `closed_positions`/`realized_pnl_usd` figures (see agent/
+dashboard_state.py's own performance-plumbing docstring) from the exact
+same durable fill log the rest of this function already reads.
 """
 from __future__ import annotations
 
@@ -85,6 +94,7 @@ from agent.dashboard_server import DashboardRuntime, make_server
 from agent.daytrade import DayTradeGuard
 from agent.execution_quarantine import ExecutionQuarantineStore
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+from agent.ledger import Ledger
 from agent.ledger_store import LedgerStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.secrets_provider import (KeychainSecretsProvider, SecretNotFoundError,
@@ -97,14 +107,14 @@ def _build_broker_state(
     credentials: BrokerCredentials | None = None,
     secrets_provider: SecretsProvider | None = None,
     transport: Transport | None = None,
-) -> tuple[AccountSnapshot | None, tuple[Position, ...], DayTradeGuard | None]:
+) -> tuple[AccountSnapshot | None, tuple[Position, ...], DayTradeGuard | None, Ledger | None]:
     """Real, local broker state for `DashboardRuntime`, via `agent.broker.
     selection.select_broker_adapter` -- see this module's own docstring for
     what this is and is not. Never raises: any failure (including "no
     account_id to scope any of this to" at all) returns the same `(None,
-    (), None)` triple `DashboardRuntime`'s own field defaults already
-    produce, so a broker-state failure degrades exactly like "never wired
-    at all" rather than crashing the process that serves the rest of
+    (), None, None)` quadruple `DashboardRuntime`'s own field defaults
+    already produce, so a broker-state failure degrades exactly like "never
+    wired at all" rather than crashing the process that serves the rest of
     `GET /api/state`.
 
     CREDENTIALS, NOW WIRED (broker-credentials unit, Unit 16, 2026-08-12).
@@ -141,7 +151,7 @@ def _build_broker_state(
     no real network) -- production code never passes one, letting
     `AlpacaPaperAdapter` construct its own real `UrllibTransport`."""
     if not account_id:
-        return None, (), None
+        return None, (), None, None
     try:
         registry = HoldingPolicyRegistry([
             HoldingPolicy(version="config", minimum_holding_period=cfg.minimum_hold,
@@ -164,13 +174,16 @@ def _build_broker_state(
             account_id=account_id, adapter=adapter, store=store,
             day_trade_guard=guard, execution_quarantine=quarantine, now=now,
         )
-        return recon.broker_account, recon.broker_positions, recon.day_trade_guard
+        # Same `store` build_account_reconciliation just read from -- one
+        # LedgerStore, one on-disk read, not a second independent one.
+        ledger = store.to_ledger()
+        return recon.broker_account, recon.broker_positions, recon.day_trade_guard, ledger
     except Exception:
         # Deliberately broad: ANY failure here -- a corrupt ledger file, a
         # cross-account mismatch, anything else -- must degrade to the same
         # honest null this module's docstring promises, never propagate and
         # take the rest of the dashboard process down with it.
-        return None, (), None
+        return None, (), None, None
 
 
 def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Path,
@@ -209,7 +222,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         credentials = BrokerCredentials(account_id=account_id, key_id=key_id,
                                         secret_ref=secret_ref)
         secrets_provider = secrets_provider_factory(cfg.mode)
-    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         cfg, account_id=account_id, ledger_store_path=ledger_store_path,
         quarantine_store_path=quarantine_store_path,
         credentials=credentials, secrets_provider=secrets_provider,
@@ -229,6 +242,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         broker_account=broker_account,
         broker_positions=broker_positions,
         day_trade_guard=day_trade_guard,
+        ledger=ledger,
         credential_preflight=credential_preflight or {},
     )
 

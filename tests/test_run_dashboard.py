@@ -126,8 +126,8 @@ def _cfg(**overrides):
     return config_module.load(valid_raw_config(**overrides))
 
 
-def test_no_account_id_degrades_to_the_null_triple_without_touching_anything(tmp_path):
-    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+def test_no_account_id_degrades_to_the_null_quadruple_without_touching_anything(tmp_path):
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         _cfg(), account_id=None, ledger_store_path=tmp_path / "ledger.jsonl",
         quarantine_store_path=tmp_path / "quarantine.jsonl",
         now=datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),
@@ -135,12 +135,13 @@ def test_no_account_id_degrades_to_the_null_triple_without_touching_anything(tmp
     assert broker_account is None
     assert broker_positions == ()
     assert day_trade_guard is None
+    assert ledger is None
     assert not (tmp_path / "ledger.jsonl").exists()   # nothing was constructed at all
 
 
-def test_happy_path_populates_all_three_from_a_fresh_simulator_paper_account(tmp_path):
+def test_happy_path_populates_all_four_from_a_fresh_simulator_paper_account(tmp_path):
     now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
-    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         _cfg(), account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl",
         quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
     )
@@ -151,9 +152,15 @@ def test_happy_path_populates_all_three_from_a_fresh_simulator_paper_account(tmp
     assert broker_positions == ()   # a fresh simulator has no positions
     assert isinstance(day_trade_guard, DayTradeGuard)
     assert day_trade_guard.account_id == "acct-1"
+    # Performance-plumbing unit (2026-08-13): the SAME LedgerStore
+    # build_account_reconciliation just seeded, reconstructed via
+    # to_ledger() -- a fresh account has no fills yet, so no closed lots.
+    assert ledger is not None
+    assert ledger.account_id == "acct-1"
+    assert ledger.closed_lots() == []
 
 
-def test_a_corrupt_ledger_file_degrades_to_the_null_triple_not_a_raised_exception(tmp_path):
+def test_a_corrupt_ledger_file_degrades_to_the_null_quadruple_not_a_raised_exception(tmp_path):
     """The whole honesty contract this unit exists to preserve: a broker
     read that cannot complete becomes null + (implicitly, via
     agent.dashboard_state) an unavailable_reason, never an exception that
@@ -161,7 +168,7 @@ def test_a_corrupt_ledger_file_degrades_to_the_null_triple_not_a_raised_exceptio
     fabricated number."""
     bad_path = tmp_path / "ledger.jsonl"
     bad_path.write_text("not valid jsonl at all {{{\n", encoding="utf-8")
-    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         _cfg(), account_id="acct-1", ledger_store_path=bad_path,
         quarantine_store_path=tmp_path / "quarantine.jsonl",
         now=datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),
@@ -169,6 +176,7 @@ def test_a_corrupt_ledger_file_degrades_to_the_null_triple_not_a_raised_exceptio
     assert broker_account is None
     assert broker_positions == ()
     assert day_trade_guard is None
+    assert ledger is None
 
 
 def test_config_is_still_required(tmp_path):
@@ -250,7 +258,7 @@ def test_a_real_alpaca_paper_read_populates_all_three_capital_fields(tmp_path):
     transport.enqueue(200, [])   # open_orders()
 
     now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
-    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         _cfg(broker="alpaca_paper"), account_id="acct-1",
         ledger_store_path=tmp_path / "ledger.jsonl",
         quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
@@ -263,17 +271,19 @@ def test_a_real_alpaca_paper_read_populates_all_three_capital_fields(tmp_path):
     assert float(broker_account.buying_power) == 12345.67
     assert broker_positions == ()
     assert isinstance(day_trade_guard, DayTradeGuard)
+    assert ledger is not None
+    assert ledger.account_id == "acct-1"
 
 
-def test_a_missing_secret_degrades_to_the_null_triple_not_an_exception(tmp_path):
+def test_a_missing_secret_degrades_to_the_null_quadruple_not_an_exception(tmp_path):
     """broker=alpaca_paper with credentials pointing at a keychain entry
     that does not exist -- select_broker_adapter raises BrokerSelectionError
     (agent/broker/selection.py), which _build_broker_state's own broad
-    except must still degrade to the same honest null triple this module
+    except must still degrade to the same honest null quadruple this module
     has always promised, never a fabricated number and never a crash that
     would take the rest of GET /api/state down with it."""
     now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
-    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         _cfg(broker="alpaca_paper"), account_id="acct-1",
         ledger_store_path=tmp_path / "ledger.jsonl",
         quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
@@ -283,9 +293,10 @@ def test_a_missing_secret_degrades_to_the_null_triple_not_an_exception(tmp_path)
     assert broker_account is None
     assert broker_positions == ()
     assert day_trade_guard is None
+    assert ledger is None
 
 
-def test_alpaca_paper_with_no_credentials_at_all_still_degrades_to_the_null_triple(tmp_path):
+def test_alpaca_paper_with_no_credentials_at_all_still_degrades_to_the_null_quadruple(tmp_path):
     """cfg.broker == alpaca_paper but this call was given neither
     credentials nor secrets_provider (e.g. --key-id/--secret-ref were never
     passed to main -- main's own _require_credentials_for_alpaca_paper
@@ -293,7 +304,7 @@ def test_alpaca_paper_with_no_credentials_at_all_still_degrades_to_the_null_trip
     _build_broker_state one layer below that guard, to prove it ALSO fails
     safe on its own, not only because main happens to stop it first)."""
     now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
-    broker_account, broker_positions, day_trade_guard = _build_broker_state(
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         _cfg(broker="alpaca_paper"), account_id="acct-1",
         ledger_store_path=tmp_path / "ledger.jsonl",
         quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
@@ -301,6 +312,7 @@ def test_alpaca_paper_with_no_credentials_at_all_still_degrades_to_the_null_trip
     assert broker_account is None
     assert broker_positions == ()
     assert day_trade_guard is None
+    assert ledger is None
 
 
 def test_the_dashboards_own_adapter_construction_never_attaches_a_staging_key():
@@ -427,3 +439,25 @@ def test_build_dashboard_runtime_defaults_credential_preflight_to_empty_dict(tmp
         _cfg(), config_path="c.json", account_id=None, **_all_store_paths(tmp_path),
     )
     assert runtime.credential_preflight == {}
+
+
+def test_build_dashboard_runtime_ledger_is_none_with_no_account_id(tmp_path):
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id=None, **_all_store_paths(tmp_path),
+    )
+    assert runtime.ledger is None
+
+
+def test_build_dashboard_runtime_wires_a_real_ledger_when_account_id_is_given(tmp_path):
+    """Performance-plumbing unit (2026-08-13): DashboardRuntime.ledger must
+    actually be set from _build_broker_state's new fourth return value, not
+    left at its default -- proven via the same real SimulatorBroker path
+    test_happy_path_populates_all_four_from_a_fresh_simulator_paper_account
+    already exercises one layer down."""
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id="acct-1", now=now,
+        **_all_store_paths(tmp_path),
+    )
+    assert runtime.ledger is not None
+    assert runtime.ledger.account_id == "acct-1"

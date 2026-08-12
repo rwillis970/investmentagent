@@ -5,8 +5,10 @@ lives in the pure `route_request` function and never in `_Handler`.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -396,6 +398,39 @@ def test_api_state_now_exposes_a_settled_cash_figure(tmp_path):
     assert payload["risk_gates"]["unsettled_cash_usd"] == 0.0
 
 
+def test_api_state_threads_runtime_ledger_into_performance(tmp_path):
+    """Performance-plumbing unit (2026-08-13): route_request's /api/state
+    handler must forward runtime.ledger into build_dashboard_state so the
+    "Performance" panel's closed_positions/realized_pnl_usd figures can be
+    computed from real closed lots instead of permanently returning null.
+    No ledger set on the runtime (the default) -> still null+reason, same
+    as before this unit."""
+    from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+    from agent.ledger import Fill, Ledger
+    from agent.money import to_decimal
+
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/api/state")
+    payload = json.loads(result.body)
+    assert payload["performance"]["closed_positions"] is None
+    assert payload["performance"]["closed_positions_unavailable_reason"]
+
+    reg = HoldingPolicyRegistry([HoldingPolicy("hp-v1", timedelta(hours=1), timedelta(days=30))])
+    ledger = Ledger(account_id=ACCT, opening_settled_cash=to_decimal(500.0), policy_registry=reg)
+    ledger.record_fill(Fill(fill_id="f-buy", account_id=ACCT, symbol="SPY", side="BUY",
+                            qty=to_decimal(1.0), price=to_decimal(100.0), filled_at=T0,
+                            lot_id="l1", holding_policy_version="hp-v1"))
+    ledger.record_fill(Fill(fill_id="f-sell", account_id=ACCT, symbol="SPY", side="SELL",
+                            qty=to_decimal(1.0), price=to_decimal(110.0),
+                            filled_at=T0 + timedelta(days=4), lot_id="l1",
+                            holding_policy_version=None))
+    runtime.ledger = ledger
+    result = route_request(runtime, method="GET", path="/api/state")
+    payload = json.loads(result.body)
+    assert payload["performance"]["closed_positions"] == 1
+    assert payload["performance"]["realized_pnl_usd"] == 10.0
+
+
 def test_command_center_html_has_no_support_js_reference(tmp_path):
     """Follow-up unit, 2026-08-03: `agent_command_center.html` was replaced
     with the standalone build (template runtime, React, and fonts inlined)
@@ -561,3 +596,81 @@ def test_make_server_accepts_127_0_0_1(tmp_path):
         assert server.server_address[0] == "127.0.0.1"
     finally:
         server.server_close()
+
+
+# --------------------------------------------------------- CORS (dashboard-CORS unit, 2026-08-12)
+#
+# route_request itself has no header concept (RouteResult is status/
+# content_type/body only, by design -- see module docstring) -- CORS is set
+# at the wire level in _Handler, so these are the only tests in this file
+# that need a real socket, mirroring test_make_server_accepts_127_0_0_1's
+# own pattern of an ephemeral port (port=0) rather than a fixed one.
+
+def _serving(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    server = make_server(runtime, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _stop(server, thread):
+    server.shutdown()
+    thread.join(timeout=5)
+    server.server_close()
+
+
+def test_a_real_get_response_carries_cors_headers(tmp_path):
+    server, thread = _serving(tmp_path)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request("GET", "/api/state")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        assert resp.status == 200
+        assert resp.getheader("Access-Control-Allow-Origin") == "*"
+        # PATCH is included even though the original request's own snippet
+        # only listed GET/OPTIONS/POST -- /api/config is a real PATCH route
+        # here (_handle_config_patch); omitting it would silently
+        # CORS-block that endpoint under a real cross-origin preflight.
+        assert resp.getheader("Access-Control-Allow-Methods") == "GET, POST, PATCH, OPTIONS"
+        assert resp.getheader("Access-Control-Allow-Headers") == "Content-Type"
+        assert json.loads(body)   # a real JSON body, not an empty/broken response
+    finally:
+        _stop(server, thread)
+
+
+def test_an_options_preflight_returns_204_with_cors_headers_and_no_body(tmp_path):
+    server, thread = _serving(tmp_path)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request("OPTIONS", "/api/state")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        assert resp.status == 204
+        assert body == b""
+        assert resp.getheader("Access-Control-Allow-Origin") == "*"
+        assert resp.getheader("Access-Control-Allow-Methods") == "GET, POST, PATCH, OPTIONS"
+        assert resp.getheader("Access-Control-Allow-Headers") == "Content-Type"
+    finally:
+        _stop(server, thread)
+
+
+def test_an_options_preflight_on_an_unknown_path_still_returns_204(tmp_path):
+    """A preflight is a request ABOUT a future request, not the request
+    itself -- route_request never sees it (no path-based 404 possible
+    here), matching every real browser's own expectation that OPTIONS
+    always succeeds regardless of whether the real request that follows
+    will."""
+    server, thread = _serving(tmp_path)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request("OPTIONS", "/api/nonexistent")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 204
+    finally:
+        _stop(server, thread)

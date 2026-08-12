@@ -333,6 +333,34 @@ class DisposalRecord:
     at: datetime
 
 
+@dataclass(frozen=True)
+class ClosedLot:
+    """One BUY lot that has been fully sold (performance-plumbing unit,
+    2026-08-13) -- the two figures a realized-P&L/closed-trade-count figure
+    needs (`cost_basis`, `proceeds`) that `Lot` deliberately does not carry
+    for a closed position (see `Ledger.lots`'s own docstring: a fully-sold
+    `Lot.cost_basis` is correctly 0.0 there, "nothing remains open to hold
+    a basis," and adding a second field to the SHARED `holding.Lot`
+    dataclass for a value nothing read yet was explicitly deferred, not
+    forgotten). This is a separate, narrower, read-only dataclass for
+    exactly the reporting need `lots()`'s own docstring named as future
+    work: "the cost basis of whatever was SOLD is always exactly
+    reconstructable from self.fills alone... a future tax-classification
+    unit can compute realised gain per sale directly from the fill log.\""""
+    lot_id: str
+    account_id: str
+    symbol: str
+    qty: Decimal
+    cost_basis: Decimal
+    proceeds: Decimal
+    opened_at: datetime
+    closed_at: datetime
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        return self.proceeds - self.cost_basis
+
+
 class _OpenLotRef:
     """Minimal duck-typed stand-in for `agent.lot_selection.disposal_order`,
     which only needs `.lot_id` and `.opened_at` -- deliberately not a real
@@ -642,6 +670,41 @@ class Ledger:
             closed_at = last_sell_at.get(lot_id) if remaining <= _ZERO else None
             out.append(replace(base_lot, qty=remaining, cost_basis=remaining_cost_basis,
                                closed_at=closed_at))
+        return out
+
+    def closed_lots(self) -> list[ClosedLot]:
+        """Every BUY lot fully sold (performance-plumbing unit, 2026-08-13,
+        the first reader of the fill log's realized-gain information that
+        `lots()`'s own docstring named as reconstructable but never built).
+        Read-only, pure, derived fresh from `self._fills` on every call --
+        same replay discipline as `lots()`/`positions()`/`settled_cash()`
+        above, never a second running total that could drift from the fill
+        log. A lot with ANY remaining open qty (zero sells, or a partial
+        sale) is excluded -- this reports fully CLOSED positions only,
+        mirroring `lots()`'s own `closed_at` gate (`remaining <= _ZERO`)."""
+        buys: dict[str, Fill] = {}
+        proceeds: dict[str, Decimal] = {}
+        sold_qty: dict[str, Decimal] = {}
+        last_sell_at: dict[str, datetime] = {}
+        for f in self._fills:
+            if f.side.upper() == "BUY":
+                buys[f.lot_id] = f
+            else:
+                sold_qty[f.lot_id] = sold_qty.get(f.lot_id, _ZERO) + f.qty
+                proceeds[f.lot_id] = proceeds.get(f.lot_id, _ZERO) + _cash_notional(f.qty, f.price)
+                last_sell_at[f.lot_id] = f.filled_at
+
+        out: list[ClosedLot] = []
+        for lot_id, buy_fill in buys.items():
+            sold = sold_qty.get(lot_id, _ZERO)
+            if sold < buy_fill.qty:
+                continue   # still open, or only partially sold -- not closed
+            out.append(ClosedLot(
+                lot_id=lot_id, account_id=buy_fill.account_id, symbol=buy_fill.symbol,
+                qty=buy_fill.qty, cost_basis=buy_fill.qty * buy_fill.price,
+                proceeds=proceeds[lot_id], opened_at=buy_fill.filled_at,
+                closed_at=last_sell_at[lot_id],
+            ))
         return out
 
     def disposal_records(self) -> list[DisposalRecord]:

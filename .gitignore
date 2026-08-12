@@ -1,7 +1,6 @@
+data/
 state/
-logs/
-config.json
-state/
+state-archive-*/
 logs/
 config.json
 __pycache__/

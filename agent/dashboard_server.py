@@ -10,6 +10,16 @@ module-level discussion in this unit's own report for why re-auth below is
 a boolean flag, not a credential check) and must never be reachable off the
 operator's own machine.
 
+CORS IS WILDCARD-OPEN (dashboard-CORS unit, 2026-08-12), NOT THE SAME THING
+AS "still local-only" -- see `_Handler`'s own docstring for the fuller
+security-model note. Loopback-only binding stops a remote MACHINE from
+reaching this port; `Access-Control-Allow-Origin: *` separately means any
+locally-open browser TAB, on any origin, can now read (and, via the
+approve/reject/config routes, write to) this surface with no credential
+check. Acceptable for the pilot this was requested for; not a substitute
+for real auth if this surface is ever exposed beyond a single operator's
+own machine.
+
 `route_request` IS PURE DISPATCH, NO SOCKET CONCEPT -- the actual
 `http.server.BaseHTTPRequestHandler` subclass (`_Handler`) below is a thin
 adapter that reads real request bytes and writes a real response; ALL of
@@ -56,6 +66,7 @@ from .dashboard_config import apply_config_patch
 from .dashboard_decisions import DecisionConflict, DecisionError, approve, reject
 from .dashboard_state import build_dashboard_state
 from .daytrade import DayTradeGuard
+from .ledger import Ledger
 from .opportunity_event_tracker import OpportunityEventTracker
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "static"
@@ -94,6 +105,7 @@ class DashboardRuntime:
     broker_account: AccountSnapshot | None = None
     broker_positions: tuple[Position, ...] = ()
     day_trade_guard: DayTradeGuard | None = None
+    ledger: Ledger | None = None
     credential_preflight: dict = field(default_factory=dict)
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
@@ -128,6 +140,7 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
             broker_account=runtime.broker_account,
             broker_positions=runtime.broker_positions,
             day_trade_guard=runtime.day_trade_guard,
+            ledger=runtime.ledger,
         )
         return _json_result(200, state)
 
@@ -262,8 +275,50 @@ def _serve_static(filename: str) -> RouteResult:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """Thin adapter over `route_request` -- no business logic here."""
+    """Thin adapter over `route_request` -- no business logic here.
+
+    CORS (dashboard-CORS unit, 2026-08-12): a request to add this arrived
+    written for Flask (`@app.before_request`/`@app.after_request`,
+    `app.route(...)`) -- this module has no Flask `app` object anywhere
+    (see module docstring: it is a plain `http.server.BaseHTTPRequestHandler`
+    subclass, chosen so `route_request` stays pure dispatch, callable from
+    tests with no socket at all). CORS headers are themselves a wire-level
+    concern with no equivalent in `route_request`'s pure `RouteResult`
+    (status/content_type/body, no headers) -- `_send_cors_headers` here,
+    called from every real dispatch AND from the new `do_OPTIONS` preflight
+    handler below, is the actual equivalent of a Flask after_request hook
+    for this server. `Access-Control-Allow-Methods` includes PATCH (the
+    original request's snippet only listed GET/OPTIONS/POST) because
+    `/api/config` is a real PATCH route here (`_handle_config_patch`) --
+    omitting it would silently CORS-block that endpoint the moment a
+    cross-origin preflight covered it.
+
+    SECURITY MODEL, NOT JUST "unauthenticated read" (see this unit's own
+    report for the fuller version): `Access-Control-Allow-Origin: *` does
+    NOT reopen the loopback-only bind `make_server` still enforces above --
+    a remote machine still cannot reach this port. What it DOES do is let
+    ANY page open in the operator's own browser, on any origin (including a
+    malicious tab with no relationship to this app), issue JS `fetch()`
+    calls against `http://localhost:8765/...` and read the response. That
+    is broader than "read /api/state": `POST /api/approval/<id>/approve`
+    is also a real route here, and `GET /api/state` already returns pending
+    request_ids in plaintext -- so a malicious page open locally could, in
+    principle, discover a pending request_id and drive an approve/reject
+    itself, with no credential check anywhere in this module (module
+    docstring: "no authentication of its own... single-operator pilot").
+    This was true before this unit in the sense that nothing stopped a
+    same-origin page from doing it; wildcard CORS is what newly allows a
+    page that is NOT this dashboard to do it too. Acceptable for a
+    localhost-only pilot per the request that asked for this change --
+    genuinely not acceptable un-hardened in production (an explicit origin
+    allowlist, or real auth on the approve/reject/config routes, would be
+    the fix -- neither exists today)."""
     runtime: DashboardRuntime   # set by `make_server` before the server starts
+
+    def _send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _dispatch(self, method: str) -> None:
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -272,6 +327,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(result.status)
         self.send_header("Content-Type", result.content_type)
         self.send_header("Content-Length", str(len(result.body)))
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(result.body)
 
@@ -283,6 +339,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         self._dispatch("PATCH")
+
+    def do_OPTIONS(self) -> None:
+        """CORS preflight -- a browser sends this ahead of any cross-origin
+        request whose method/headers require one (every POST/PATCH here,
+        since they all carry `Content-Type: application/json`). No
+        `route_request` dispatch: a preflight has no body and expects no
+        payload, only the headers `_send_cors_headers` sets. 204 (No
+        Content), matching the exact response the original request asked
+        for."""
+        self.send_response(204)
+        self._send_cors_headers()
+        self.end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:   # noqa: A002
         pass   # quiet by default -- agent.audit.AuditLog is this surface's real trail

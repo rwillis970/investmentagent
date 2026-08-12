@@ -147,6 +147,32 @@ def test_risk_gates_settled_and_unsettled_cash_reflect_the_real_broker_account(t
     assert state["risk_gates"]["unsettled_cash_usd_unavailable_reason"] is None
 
 
+def test_risk_gates_nlv_usd_is_null_with_no_broker_account(tmp_path):
+    """DASHBOARD FIX follow-up (2026-08-12): agent_command_center.html's
+    footer "CAPITAL" figure needs total equity/NLV -- same broker_account
+    gating as settled_cash_usd/unsettled_cash_usd."""
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+    )
+    assert state["risk_gates"]["nlv_usd"] is None
+    assert state["risk_gates"]["nlv_usd_unavailable_reason"]
+
+
+def test_risk_gates_nlv_usd_reflects_the_real_broker_account_equity(tmp_path):
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    account = _account_snapshot(equity=Decimal("512.34"))
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, broker_account=account,
+    )
+    assert state["risk_gates"]["nlv_usd"] == 512.34
+    assert state["risk_gates"]["nlv_usd_unavailable_reason"] is None
+
+
 def test_risk_gates_broker_positions_reflect_the_real_positions_tuple(tmp_path):
     cfg = _cfg()
     cost_ledger, tracker, store, audit = _stores(tmp_path)
@@ -167,6 +193,86 @@ def test_risk_gates_broker_positions_reflect_the_real_positions_tuple(tmp_path):
         {"symbol": "SPY", "qty": 0.25, "market_value": 150.0},
     ]
     assert state["risk_gates"]["broker_positions_unavailable_reason"] is None
+
+
+def _closed_lot_fill_pair(lot_id="l1", symbol="SPY", qty=1.0,
+                          buy_price=100.0, sell_price=110.0):
+    """Two Fills (a BUY then a SELL) that together fully close one lot --
+    same shape tests/test_ledger.py's own buy()/sell() helpers build,
+    reused here rather than re-deriving the Fill schema."""
+    from agent.money import to_decimal
+    from agent.ledger import Fill
+    buy_fill = Fill(fill_id=f"fill-{lot_id}-buy", account_id=ACCT, symbol=symbol,
+                    side="BUY", qty=to_decimal(qty), price=to_decimal(buy_price),
+                    filled_at=T0, lot_id=lot_id, holding_policy_version="hp-v1")
+    sell_fill = Fill(fill_id=f"fill-{lot_id}-sell", account_id=ACCT, symbol=symbol,
+                     side="SELL", qty=to_decimal(qty), price=to_decimal(sell_price),
+                     filled_at=T0 + timedelta(days=4), lot_id=lot_id,
+                     holding_policy_version=None)
+    return buy_fill, sell_fill
+
+
+def _ledger_with(*fills):
+    from agent.holding import HoldingPolicy, HoldingPolicyRegistry
+    from agent.ledger import Ledger
+    reg = HoldingPolicyRegistry([HoldingPolicy("hp-v1", timedelta(hours=1), timedelta(days=30))])
+    l = Ledger(account_id=ACCT, opening_settled_cash=Decimal("500.00"), policy_registry=reg)
+    for f in fills:
+        l.record_fill(f)
+    return l
+
+
+def test_performance_closed_positions_is_null_with_no_ledger_supplied(tmp_path):
+    """Performance-plumbing unit (2026-08-13): closed_positions/
+    realized_pnl_usd share the same supplied-or-not gating as
+    broker_account -- no fabricated figure when no ledger was given."""
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+    )
+    assert state["performance"]["closed_positions"] is None
+    assert state["performance"]["closed_positions_unavailable_reason"]
+    assert state["performance"]["realized_pnl_usd"] is None
+    assert state["performance"]["realized_pnl_usd_unavailable_reason"]
+    # attribution stays permanently unbuilt regardless of ledger.
+    assert state["performance"]["attribution"] is None
+
+
+def test_performance_closed_positions_is_zero_not_null_with_a_ledger_and_no_closed_lots(tmp_path):
+    """A fresh account with only an open lot (or no fills at all) is a
+    real, honest zero -- not the same as "not built"."""
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    buy_fill, _sell_fill = _closed_lot_fill_pair()
+    l = _ledger_with(buy_fill)  # open lot only, never sold
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, ledger=l,
+    )
+    assert state["performance"]["closed_positions"] == 0
+    assert state["performance"]["closed_positions_unavailable_reason"] is None
+    assert state["performance"]["realized_pnl_usd"] == 0.0
+    assert state["performance"]["realized_pnl_usd_unavailable_reason"] is None
+
+
+def test_performance_closed_positions_reflects_real_closed_lots_and_realized_pnl(tmp_path):
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    buy1, sell1 = _closed_lot_fill_pair(lot_id="l1", qty=2.0, buy_price=100.0, sell_price=110.0)
+    buy2, sell2 = _closed_lot_fill_pair(lot_id="l2", symbol="AAPL", qty=1.0,
+                                        buy_price=200.0, sell_price=190.0)
+    l = _ledger_with(buy1, sell1, buy2, sell2)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, ledger=l,
+    )
+    # l1: (2 * 110) - (2 * 100) = +20.  l2: (1 * 190) - (1 * 200) = -10.
+    assert state["performance"]["closed_positions"] == 2
+    assert state["performance"]["realized_pnl_usd"] == 10.0
+    assert state["performance"]["attribution"] is None
+    assert state["performance"]["attribution_unavailable_reason"]
 
 
 def test_pending_approvals_are_listed_with_real_fields(tmp_path):

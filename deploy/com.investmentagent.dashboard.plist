@@ -39,6 +39,11 @@
   agent/dashboard_state.py's own module docstring). See this unit's own
   report for the fuller list of what this dashboard does NOT wire up yet
   (broker_account, broker_positions, day_trade_guard).
+
+  CANONICAL DIRECTORY IS `data/`, NOT `state/`; see com.investmentagent.
+  reconcile-loop.plist's own comment for why this template's example
+  changed (runtime-recovery unit, 2026-08-13). Point this at the SAME
+  absolute path you give that job's own data-dir flag.
 -->
 <plist version="1.0">
 <dict>
@@ -54,7 +59,7 @@
         <string>--account-id</string>
         <string>REPLACE_WITH_ACCOUNT_ID</string>
         <string>--data-dir</string>
-        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/state</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/data</string>
         <string>--host</string>
         <string>127.0.0.1</string>
         <string>--port</string>

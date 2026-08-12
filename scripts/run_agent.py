@@ -1040,6 +1040,96 @@ _DEFAULT_STORE_FILENAMES = {
 }
 
 
+class DataDirConflict(Exception):
+    """Runtime-recovery unit (2026-08-13): raised by `_check_data_dir_
+    sanity` -- see that function's own docstring. Deliberately a plain
+    Exception, not a SystemExit: this must flow through main()'s existing
+    `except Exception` handler exactly like any other startup failure (a
+    StartupHalted, a locked keychain), so it is logged, recorded in the
+    failure sentinel, and eligible for the same "recurred N times" operator
+    alert -- a silently-selected wrong data directory is exactly the kind
+    of uncertainty Appendix E's fail-safe-to-NO-TRADE applies to, not a
+    special case that bypasses it."""
+
+
+def _account_ids_in(directory: Path) -> frozenset[str]:
+    """Every distinct `account_id` mentioned in `directory`'s own
+    `ledger.jsonl`/`mode_state.jsonl`, read as plain, tolerant JSONL --
+    NOT via `LedgerStore`/`ModeStore` (those validate and would raise on
+    exactly the kind of stale/foreign directory this check exists to
+    detect, before this check ever got a chance to report anything useful
+    about it). A missing directory, a missing file, or a line that isn't
+    parseable JSON is silently skipped, not an error: this function's job
+    is "does this look like an active investmentagent data directory, and
+    if so, whose account", not full validation -- `LedgerStore`/`ModeStore`
+    themselves still validate everything for real once a real store is
+    opened."""
+    ids: set[str] = set()
+    if not directory.is_dir():
+        return frozenset()
+    for filename in ("ledger.jsonl", "mode_state.jsonl", "audit.jsonl"):
+        path = directory / filename
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            after = row.get("after") if isinstance(row, dict) else None
+            for candidate in (row.get("account_id") if isinstance(row, dict) else None,
+                             after.get("account_id") if isinstance(after, dict) else None):
+                if isinstance(candidate, str) and candidate:
+                    ids.add(candidate)
+    return frozenset(ids)
+
+
+def _check_data_dir_sanity(data_dir: Path, *, account_id: str) -> None:
+    """Runtime-recovery unit (2026-08-13). The defect this closes: a real
+    Alpaca fill was admitted into one data directory's ledger (with an
+    operator-supplied holding_policy_version) while a SIBLING directory,
+    also passed as --data-dir on other invocations, never saw that
+    admission at all -- so the exact same broker position was reconciled
+    correctly under one directory and permanently quarantined under the
+    other, and nothing before this check ever noticed the two directories
+    disagreed about the account's own history (see this unit's own
+    report). This does not prevent multiple directories from existing --
+    only from one being silently chosen while a SIBLING that recorded
+    conflicting history for a DIFFERENT account_id sits right next to it.
+
+    A sibling that is not a directory, has none of {ledger.jsonl,
+    mode_state.jsonl, audit.jsonl}, or agrees with `account_id` (or has no
+    account_id of its own recorded yet) is not a conflict. Only a sibling
+    that positively records a DIFFERENT account_id trips this."""
+    parent = data_dir.parent
+    if not parent.is_dir():
+        return
+    for sibling in sorted(parent.iterdir()):
+        if sibling.resolve() == data_dir.resolve() or not sibling.is_dir():
+            continue
+        sibling_ids = _account_ids_in(sibling)
+        conflicting = sibling_ids - {account_id}
+        if conflicting:
+            raise DataDirConflict(
+                f"refusing to start: sibling directory {sibling} looks like "
+                f"another investmentagent data directory and records "
+                f"account_id(s) {sorted(conflicting)!r}, different from "
+                f"--data-dir {data_dir}'s own account_id {account_id!r}. "
+                "This is exactly the data/ vs state/ split found and fixed "
+                "2026-08-13 -- see deploy/README.md's CANONICAL DIRECTORY "
+                "section. If this sibling is genuinely abandoned history, "
+                "archive it (rename it out of this parent directory) rather "
+                "than leaving it next to the directory actually in use."
+            )
+
+
 def _parse_args(argv: list[str] | None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",
@@ -1234,8 +1324,10 @@ def _parse_args(argv: list[str] | None):
     # of this fix defaulted-and-created a real `./data` in the repo root on
     # every one of those tests).
     args.data_dir = str(Path(args.data_dir).resolve())
+    # See the "else" branch below, the only place this is ever set True.
+    args.data_dir_relevant = False
 
-    def _default_relevant_paths(attrs: tuple[str, ...]) -> None:
+    def _default_relevant_paths(attrs: tuple[str, ...]) -> bool:
         used = False
         for attr in attrs:
             if getattr(args, attr) is None:
@@ -1243,6 +1335,7 @@ def _parse_args(argv: list[str] | None):
                 used = True
         if used:
             Path(args.data_dir).mkdir(parents=True, exist_ok=True)
+        return used
 
     if args.admit_execution is not None and args.reject_execution is not None:
         parser.error("--admit-execution and --reject-execution are mutually exclusive")
@@ -1305,7 +1398,17 @@ def _parse_args(argv: list[str] | None):
                 "--admit-execution/--reject-execution/--admit-cash-event/"
                 "--reject-cash-event/--submit-approved is given: " + ", ".join(missing)
             )
-        _default_relevant_paths(tuple(_DEFAULT_STORE_FILENAMES))
+        # Runtime-recovery unit (2026-08-13): data_dir_relevant reflects
+        # whether --data-dir actually defaulted at least one store path
+        # THIS call -- not merely "we took the full main-loop branch". A
+        # caller who supplies every one of the eleven store paths
+        # explicitly (every existing test in this file included) never
+        # actually uses --data-dir at all, and _check_data_dir_sanity must
+        # never run against that irrelevant, possibly-cwd-relative default
+        # -- see _default_relevant_paths's own long-standing comment for
+        # why unscoped defaulting was already rejected once before, for
+        # the exact same reason.
+        args.data_dir_relevant = _default_relevant_paths(tuple(_DEFAULT_STORE_FILENAMES))
     return args
 
 
@@ -1447,6 +1550,16 @@ def main(argv: list[str] | None = None, *,
                        sentinel_exc)
 
     try:
+        # Runtime-recovery unit (2026-08-13): the data-dir sanity guard
+        # runs BEFORE anything else in this block -- before config is even
+        # read -- so a conflicting sibling directory is refused as early as
+        # possible, never after a store has already been opened against it.
+        # Gated on data_dir_relevant (see _parse_args's own comment): a
+        # caller who supplied every individual store path explicitly never
+        # actually used --data-dir, so there is nothing meaningful to check.
+        if getattr(args, "data_dir_relevant", False):
+            _check_data_dir_sanity(Path(args.data_dir), account_id=args.account_id)
+
         cfg = config_module.load(json.loads(Path(args.config).read_text()))
         secrets_provider = secrets_provider_factory(cfg.mode)
         signing_key = _resolve_gatekeeper_signing_key(secrets_provider,
@@ -1462,6 +1575,19 @@ def main(argv: list[str] | None = None, *,
 
         mode_store = ModeStore(args.mode_store_path)
         audit_log = AuditLog(path=args.audit_log_path)
+        # Runtime-recovery unit (2026-08-13): one row per process start,
+        # recording exactly which absolute directory this run resolved
+        # --data-dir to -- an operator reading audit.jsonl after the fact
+        # (or comparing two directories' own audit logs, the way this
+        # unit's own investigation had to) no longer has to infer it from
+        # file mtimes.
+        audit_log.append(
+            actor="system", action="data_dir_resolved", object_type="startup",
+            object_id="system",
+            after={"data_dir": str(Path(args.data_dir).resolve()),
+                  "account_id": args.account_id},
+            timestamp=now_fn(),
+        )
         approval_service = ApprovalService(
             expiration=timedelta(minutes=cfg.approval_expiration_minutes),
             min_display=timedelta(seconds=cfg.approval_min_display_seconds),

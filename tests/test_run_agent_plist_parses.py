@@ -73,10 +73,13 @@ def test_the_checked_in_templates_program_arguments_parse_against_the_real_parse
 
 
 def test_the_templates_data_dir_is_substituted_to_an_absolute_tmp_path(tmp_path):
+    """Runtime-recovery unit (2026-08-13): the template's --data-dir value
+    changed from `.../state` to `.../data` (data/ is the canonical
+    directory; state/ was archived -- see the plist's own comment)."""
     argv = _substituted_argv(tmp_path)
     args = _parse_args(argv)
     assert Path(args.data_dir).is_absolute()
-    assert args.data_dir == str(tmp_path / "state")
+    assert args.data_dir == str(tmp_path / "data")
 
 
 def test_every_store_path_defaults_correctly_from_the_templates_data_dir(tmp_path):
@@ -86,15 +89,15 @@ def test_every_store_path_defaults_correctly_from_the_templates_data_dir(tmp_pat
     _DEFAULT_STORE_FILENAMES table promises."""
     argv = _substituted_argv(tmp_path)
     args = _parse_args(argv)
-    state_dir = tmp_path / "state"
-    assert args.ledger_store_path == str(state_dir / "ledger.jsonl")
-    assert args.quarantine_store_path == str(state_dir / "quarantine.jsonl")
-    assert args.cash_quarantine_store_path == str(state_dir / "cash_quarantine.jsonl")
-    assert args.fact_store_path == str(state_dir / "facts.jsonl")
-    assert args.cost_ledger_path == str(state_dir / "cost_ledger.jsonl")
-    assert args.extraction_cache_path == str(state_dir / "extraction_cache.jsonl")
-    assert args.analysis_result_store_path == str(state_dir / "analysis_results.jsonl")
-    assert args.approval_request_store_path == str(state_dir / "approval_requests.jsonl")
-    assert args.opportunity_tracker_path == str(state_dir / "opportunity_events.jsonl")
-    assert args.mode_store_path == str(state_dir / "mode_state.jsonl")
-    assert args.audit_log_path == str(state_dir / "audit.jsonl")
+    data_dir = tmp_path / "data"
+    assert args.ledger_store_path == str(data_dir / "ledger.jsonl")
+    assert args.quarantine_store_path == str(data_dir / "quarantine.jsonl")
+    assert args.cash_quarantine_store_path == str(data_dir / "cash_quarantine.jsonl")
+    assert args.fact_store_path == str(data_dir / "facts.jsonl")
+    assert args.cost_ledger_path == str(data_dir / "cost_ledger.jsonl")
+    assert args.extraction_cache_path == str(data_dir / "extraction_cache.jsonl")
+    assert args.analysis_result_store_path == str(data_dir / "analysis_results.jsonl")
+    assert args.approval_request_store_path == str(data_dir / "approval_requests.jsonl")
+    assert args.opportunity_tracker_path == str(data_dir / "opportunity_events.jsonl")
+    assert args.mode_store_path == str(data_dir / "mode_state.jsonl")
+    assert args.audit_log_path == str(data_dir / "audit.jsonl")

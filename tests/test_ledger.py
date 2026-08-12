@@ -260,6 +260,90 @@ def test_a_fully_sold_lot_has_zero_remaining_cost_basis():
     assert lot.is_open() is False
 
 
+# ------------------------------------------------------------------ closed_lots
+# (performance-plumbing unit, 2026-08-13): the realized-P&L figure
+# `test_a_fully_sold_lot_has_zero_remaining_cost_basis` above documents as
+# "fully reconstructable from Ledger.fills... but this ledger never
+# discards a fill" -- these tests are that reconstruction's first caller.
+
+def test_a_fresh_ledger_has_no_closed_lots():
+    assert ledger().closed_lots() == []
+
+
+def test_an_open_lot_with_no_sells_is_not_a_closed_lot():
+    l = ledger()
+    l.record_fill(buy(qty=2.0, price=100.0, at=FRI))
+    assert l.closed_lots() == []
+
+
+def test_a_partially_sold_lot_is_not_a_closed_lot():
+    l = ledger()
+    l.record_fill(buy(qty=5.0, price=100.0, at=FRI))
+    l.record_fill(sell(qty=2.0, price=110.0, at=FRI, fill_id="s1"))
+    assert l.closed_lots() == []
+
+
+def test_a_fully_sold_lot_is_a_closed_lot_with_the_original_cost_basis_and_proceeds():
+    l = ledger()
+    l.record_fill(buy(qty=2.0, price=100.0, at=FRI))          # cost_basis 200.0
+    l.record_fill(sell(qty=2.0, price=110.0, at=TUE, fill_id="s1"))  # proceeds 220.0
+    closed = l.closed_lots()
+    assert len(closed) == 1
+    lot = closed[0]
+    assert lot.symbol == "SPY"
+    assert lot.qty == 2.0
+    assert lot.cost_basis == 200.0
+    assert lot.proceeds == 220.0
+    assert lot.realized_pnl == 20.0
+    assert lot.opened_at == FRI
+    assert lot.closed_at == TUE
+
+
+def test_a_fully_sold_lot_at_a_loss_has_negative_realized_pnl():
+    l = ledger()
+    l.record_fill(buy(qty=2.0, price=100.0, at=FRI))          # cost_basis 200.0
+    l.record_fill(sell(qty=2.0, price=90.0, at=TUE, fill_id="s1"))   # proceeds 180.0
+    lot = l.closed_lots()[0]
+    assert lot.realized_pnl == -20.0
+
+
+def test_two_successive_sells_that_together_fully_close_a_lot_sum_proceeds():
+    l = ledger()
+    l.record_fill(buy(qty=10.0, price=10.0, at=FRI))                  # cost_basis 100.0
+    l.record_fill(sell(qty=4.0, price=12.0, at=FRI, fill_id="s1"))    # still open (6 left)
+    assert l.closed_lots() == []
+    l.record_fill(sell(qty=6.0, price=15.0, at=TUE, fill_id="s2"))    # closes it
+    closed = l.closed_lots()
+    assert len(closed) == 1
+    lot = closed[0]
+    # proceeds = 4*12 + 6*15 = 48 + 90 = 138; cost_basis = 100
+    assert lot.proceeds == 138.0
+    assert lot.cost_basis == 100.0
+    assert lot.realized_pnl == 38.0
+    assert lot.closed_at == TUE   # the LAST sell that closed it, not the first
+
+
+def test_closed_lots_excludes_still_open_lots_but_includes_closed_ones_together():
+    l = ledger()
+    l.record_fill(buy(lot_id="l1", qty=2.0, price=100.0, at=FRI))
+    l.record_fill(sell(lot_id="l1", qty=2.0, price=110.0, at=TUE, fill_id="s1"))
+    l.record_fill(buy(lot_id="l2", symbol="QQQ", qty=1.0, price=400.0, at=FRI))
+    closed = l.closed_lots()
+    assert len(closed) == 1
+    assert closed[0].lot_id == "l1"
+
+
+def test_closed_lots_does_not_mutate_lots_own_zero_cost_basis_reporting():
+    """closed_lots() is a SEPARATE dataclass -- lots()'s own reporting of a
+    fully-sold Lot.cost_basis as 0.0 (see the test right above this
+    section) must stay unchanged; this is additive, not a replacement."""
+    l = ledger()
+    l.record_fill(buy(qty=2.0, price=100.0, at=FRI))
+    l.record_fill(sell(qty=2.0, price=110.0, at=FRI, fill_id="s1"))
+    assert l.lots()[0].cost_basis == 0.0
+    assert l.closed_lots()[0].cost_basis == 200.0
+
+
 def test_selling_more_than_a_lot_holds_is_rejected():
     l = ledger()
     l.record_fill(buy(qty=2.0, price=100.0))
