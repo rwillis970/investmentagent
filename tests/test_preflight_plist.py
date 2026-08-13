@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 
 from deploy.preflight_plist import check_plist, main
+from scripts.run_agent import _parse_args as run_agent_parse_args
+from scripts.run_dashboard import _parse_args as run_dashboard_parse_args
 
 
 def _installed_plist(tmp_path: Path, *, program_args_override=None,
@@ -81,6 +83,55 @@ def _installed_plist(tmp_path: Path, *, program_args_override=None,
         plist["StandardErrorPath"] = standard_error_path or str(log_dir / "reconcile-loop.err.log")
 
     plist_path = tmp_path / "installed.plist"
+    with plist_path.open("wb") as fh:
+        plistlib.dump(plist, fh)
+    return plist_path, paths
+
+
+def _installed_dashboard_plist(tmp_path: Path, *, program_args_override=None,
+                               plist_name="installed_dashboard.plist"):
+    """The dashboard job's own equivalent of `_installed_plist` above --
+    same real-on-disk-supporting-files philosophy, but wired to `scripts/
+    run_dashboard.py`'s own flag set (including `--host`/`--port`, which
+    `scripts.run_agent._parse_args` does not recognize -- exactly the
+    dashboard-only flags this file's own CLI-type-awareness tests need)."""
+    log_dir = tmp_path / "dash_logs"
+    log_dir.mkdir(exist_ok=True)
+
+    if program_args_override is not None:
+        program_args = program_args_override
+        paths = {"log_dir": log_dir}
+    else:
+        script = tmp_path / "run_dashboard.py"
+        script.write_text("# stand-in for scripts/run_dashboard.py\n")
+        config = tmp_path / "dash_config.json"
+        config.write_text("{}")
+        data_dir = tmp_path / "dash_data"
+        data_dir.mkdir()
+        program_args = [
+            "/usr/bin/python3", str(script),
+            "--config", str(config),
+            "--account-id", "acct-real",
+            "--key-id", "key-real",
+            "--secret-ref", "alpaca_secret_key",
+            "--signing-key-secret-ref", "gatekeeper_signing_key",
+            "--data-dir", str(data_dir),
+            "--host", "127.0.0.1",
+            "--port", "8765",
+        ]
+        paths = {"script": script, "config": config, "data_dir": data_dir, "log_dir": log_dir}
+
+    plist = {
+        "Label": "com.investmentagent.dashboard",
+        "ProgramArguments": program_args,
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 60,
+        "StandardOutPath": str(log_dir / "dashboard.out.log"),
+        "StandardErrorPath": str(log_dir / "dashboard.err.log"),
+        "ProcessType": "Background",
+    }
+    plist_path = tmp_path / plist_name
     with plist_path.open("wb") as fh:
         plistlib.dump(plist, fh)
     return plist_path, paths
@@ -410,3 +461,159 @@ def test_cli_exits_0_and_prints_ok_on_a_good_plist(tmp_path, capsys):
     assert code == 0
     captured = capsys.readouterr()
     assert "OK" in captured.out
+
+
+# ------------------------------------------------- CLI type-awareness (preflight-CLI-parser-bug follow-up)
+
+def test_reconcile_plist_validates_against_the_run_agent_parser_via_explicit_type(tmp_path, capsys):
+    plist_path, _ = _installed_plist(tmp_path)
+    code = main([str(plist_path), "--type", "reconcile-loop"])
+    assert code == 0
+    assert "OK" in capsys.readouterr().out
+
+
+def test_reconcile_plist_auto_detects_its_own_type_from_label(tmp_path, capsys):
+    plist_path, _ = _installed_plist(tmp_path)
+    code = main([str(plist_path)])   # no --type -- must auto-detect from Label
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "OK" in captured.out
+    assert "type=reconcile-loop" in captured.out
+
+
+def test_dashboard_plist_validates_against_the_run_dashboard_parser_via_explicit_type(tmp_path, capsys):
+    plist_path, _ = _installed_dashboard_plist(tmp_path)
+    code = main([str(plist_path), "--type", "dashboard"])
+    assert code == 0
+    assert "OK" in capsys.readouterr().out
+
+
+def test_dashboard_plist_auto_detects_its_own_type_from_label(tmp_path, capsys):
+    plist_path, _ = _installed_dashboard_plist(tmp_path)
+    code = main([str(plist_path)])   # no --type -- must auto-detect from Label
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "OK" in captured.out
+    assert "type=dashboard" in captured.out
+
+
+def test_dashboard_only_arguments_do_not_falsely_fail_under_the_dashboard_parser(tmp_path):
+    """The exact regression this follow-up closes: --host/--port are
+    DASHBOARD-only flags. Validating them against the correct parser
+    (scripts.run_dashboard._parse_args) must produce zero failures --
+    check_plist's own check 2 (ProgramArguments parses)."""
+    plist_path, _ = _installed_dashboard_plist(tmp_path)
+    failures = check_plist(plist_path, run_dashboard_parse_args)
+    assert failures == []
+
+
+def test_dashboard_plist_validated_against_the_wrong_reconcile_loop_parser_fails(tmp_path):
+    """Before this follow-up, the CLI always used
+    scripts.run_agent._parse_args, which does not recognize --host/--port
+    -- this is the failure this file's own CLI-level tests below prove is
+    now avoided by default (auto-detection) and avoidable outright
+    (--type dashboard). This test proves the OTHER half: forcing the wrong
+    parser must still fail, so the mapping itself is meaningfully
+    different, not just a plumbing no-op."""
+    plist_path, _ = _installed_dashboard_plist(tmp_path)
+    failures = check_plist(plist_path, run_agent_parse_args)
+    assert any("unrecognized arguments" in f for f in failures)
+
+
+def test_reconcile_plist_validated_against_the_wrong_dashboard_parser_fails(tmp_path):
+    """The inverse cross-wiring: --account-type and the required
+    --signing-key-secret-ref/--secret-ref-is-required shape of the
+    reconcile-loop's own flags are not what scripts.run_dashboard._parse_args
+    expects either -- a genuinely cross-wired plist must fail, not
+    coincidentally validate."""
+    plist_path, _ = _installed_plist(tmp_path)
+    failures = check_plist(plist_path, run_dashboard_parse_args)
+    assert any("unrecognized arguments" in f for f in failures)
+
+
+def test_cli_refuses_to_guess_when_the_label_is_unrecognized_and_no_type_is_given(tmp_path, capsys):
+    """AMBIGUOUS AUTO-DETECTION -- MUST NOT GUESS. A plist with a Label
+    this CLI does not recognize (and no explicit --type) must exit 1 and
+    ask for --type explicitly, never silently fall back to either
+    parser -- this is the actual defect this follow-up closes, not just
+    the --host/--port symptom."""
+    plist_path, _ = _installed_plist(tmp_path)
+    with plist_path.open("rb") as fh:
+        plist = plistlib.load(fh)
+    plist["Label"] = "com.investmentagent.something-else-entirely"
+    with plist_path.open("wb") as fh:
+        plistlib.dump(plist, fh)
+
+    code = main([str(plist_path)])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "--type" in captured.err
+    assert "could not determine" in captured.err
+
+
+def test_cli_refuses_to_guess_when_the_label_is_missing_entirely(tmp_path, capsys):
+    plist_path, _ = _installed_plist(tmp_path)
+    with plist_path.open("rb") as fh:
+        plist = plistlib.load(fh)
+    del plist["Label"]
+    with plist_path.open("wb") as fh:
+        plistlib.dump(plist, fh)
+
+    code = main([str(plist_path)])
+    assert code == 1
+    assert "--type" in capsys.readouterr().err
+
+
+def test_explicit_type_always_wins_over_a_mismatched_label(tmp_path, capsys):
+    """An operator's own explicit --type is trusted over auto-detection --
+    even a Label that would auto-detect differently. This is a deliberate
+    override, not a silent inconsistency: it lets an operator validate a
+    plist mid-edit (Label not updated yet) or diagnose a genuinely
+    cross-wired file by choosing the type on purpose."""
+    plist_path, _ = _installed_dashboard_plist(tmp_path)   # Label says "dashboard"
+    # Forced to validate as reconcile-loop despite the dashboard Label --
+    # must fail (dashboard's own --host/--port are unrecognized by
+    # scripts.run_agent._parse_args), proving --type actually took effect
+    # rather than the Label winning silently.
+    code = main([str(plist_path), "--type", "reconcile-loop"])
+    assert code == 1
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_a_malformed_plist_still_fails_cleanly_under_explicit_type(tmp_path):
+    """Cross-wired/malformed check, at the check_plist layer directly: a
+    dashboard ProgramArguments list missing its own required --config
+    entirely must fail under the dashboard parser too -- type-awareness
+    does not relax any of check_plist's existing validation."""
+    args = [
+        "/usr/bin/python3", str(tmp_path / "run_dashboard.py"),
+        "--host", "127.0.0.1", "--port", "8765",
+    ]
+    (tmp_path / "run_dashboard.py").write_text("# stand-in\n")
+    plist_path, _ = _installed_dashboard_plist(tmp_path, program_args_override=args)
+    failures = check_plist(plist_path, run_dashboard_parse_args)
+    assert any("required" in f or "the following arguments are required" in f
+              for f in failures)
+
+
+def test_unresolved_placeholders_fail_regardless_of_type(tmp_path):
+    """check 3 (no lingering REPLACE placeholder) is orthogonal to which
+    parser check 2 uses -- proven here against the DASHBOARD plist
+    specifically, since the existing placeholder coverage above is all
+    against the reconcile-loop plist."""
+    script = tmp_path / "run_dashboard.py"
+    script.write_text("# stand-in\n")
+    config = tmp_path / "dash_config.json"
+    config.write_text("{}")
+    data_dir = tmp_path / "dash_data"
+    data_dir.mkdir()
+    args = [
+        "/usr/bin/python3", str(script),
+        "--config", str(config),
+        "--account-id", "REPLACE_WITH_ACCOUNT_ID",   # never filled in
+        "--data-dir", str(data_dir),
+        "--host", "127.0.0.1", "--port", "8765",
+    ]
+    plist_path, _ = _installed_dashboard_plist(tmp_path, program_args_override=args)
+    failures = check_plist(plist_path, run_dashboard_parse_args)
+    assert any("placeholder" in f for f in failures)

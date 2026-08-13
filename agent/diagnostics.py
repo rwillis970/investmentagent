@@ -495,9 +495,30 @@ def maybe_mark_recovered(report: DiagnosticReport, *, sentinel_path: str | Path,
     docstring). Marks the failure sentinel recovered iff EVERY component in
     `report` is PASS or WARN -- never on a single FAIL, and never touching
     anything but this narrow, disposable operational file. Returns whether
-    a recovery was actually recorded (False if there was nothing to recover
-    from, or if any component FAILed)."""
+    a NEW recovery was actually recorded THIS call (False if there was
+    nothing to recover from, if any component FAILed, or if the sentinel
+    was ALREADY recovered by an earlier call).
+
+    THE REPEAT-CALL CASE, FOUND VERIFYING THE LIVE-ADAPTER-PARSING-FAILURE
+    FIX (2026-08-13): `failure_sentinel.mark_recovered` is itself correctly
+    idempotent -- calling it again once a sentinel is already RECOVERED
+    performs no second write and does not bump `recovered_at` (see that
+    function's own docstring) -- but it still returns the existing,
+    non-None record in that case, which an earlier version of THIS function
+    read as "a recovery happened" on every subsequent call, forever. The
+    durable state was never actually noisy (no repeated writes, no bumped
+    timestamp), but `scripts/diagnose_runtime.py`'s own `if recovered:
+    print(...)` line, which trusts this function's return value, WOULD have
+    printed "marked RECOVERED by this diagnostic run" on every single
+    successful run after the first, forever -- exactly the "noisy recovery
+    churn" this unit's own item 7 asked to rule out. Distinguishing "a
+    recovery happened just now" from "was already recovered" requires
+    reading the PRIOR state before calling `mark_recovered` -- a second,
+    harmless `load()` (this file is tiny, and this function is called at
+    most once per diagnostic run, never in a hot loop)."""
     if any(c.status == FAIL for c in report.components):
         return False
+    prior = failure_sentinel.load(sentinel_path)
+    already_recovered = prior is not None and prior.status == failure_sentinel.RECOVERED
     result = failure_sentinel.mark_recovered(sentinel_path, now=now)
-    return result is not None
+    return result is not None and not already_recovered

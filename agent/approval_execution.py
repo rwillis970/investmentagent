@@ -125,6 +125,65 @@ build a dashboard route, does not wire into `agent.run_loop.run_loop` or
 the unattended scheduled loop, and is operator-invoked only via
 `scripts/run_agent.py --submit-approved` this unit.
 
+SESSION GATE (session-gate unit, 2026-08-13). Before this unit, NOTHING in
+this function's own call path -- nor anywhere in `scripts/run_agent.py
+--submit-approved` -- checked whether the account's permitted trading
+session was open before calling `adapter.submit(...)`. `agent.run_loop.
+run_loop` has always gated the SCHEDULED loop's own reconciliation/pipeline
+cycle behind `in_session_now`, but `--submit-approved` is a completely
+separate, operator-invoked CLI path that never went anywhere near that
+gate -- an operator (or a script driving this CLI) could submit an
+already-approved order at any hour, with only Alpaca's own, uninspected
+acceptance behavior as a backstop. This was flagged as a disclosed defect
+in the overnight-hardening unit's own final report (item 11) and is closed
+here.
+
+REUSED, NOT REIMPLEMENTED. `_session_permits_submission` below calls
+`agent.run_loop.in_session_now` -- the SAME function `run_loop.run_loop`
+already gates the scheduled loop with -- rather than defining a second,
+independently-drifting notion of "market hours" in this module. There is
+meant to be exactly one authoritative session definition in this codebase
+(`agent.market_calendar`, via `agent.run_loop.in_session_now`); this
+module adds a caller, not a competing implementation.
+
+CHECKED IMMEDIATELY BEFORE THE ONLY CALL THAT CAN PLACE A REAL ORDER, NOT
+AT APPROVAL-CREATION TIME. `agent.approval.ApprovalToken`'s own `shown_at`/
+`expiration` already answer "was this approval created/shown recently
+enough" -- a separate question from "is the session open RIGHT NOW, at the
+literal instant of submission." A request can be approved during a live
+session and then sit DECIDED for a while (an operator steps away, a script
+queues it) before `--submit-approved` is actually run; checking the
+session only once, back when the request was staged or approved, would
+not catch that the world has since crossed into a closed session. The
+check below runs as the LAST thing before `adapter.submit(...)` --
+after every other gate in this function (signature verification,
+idempotency, drift, `verify_modification_within_bounds`, staging-key/
+token-consumption-sink wiring) -- so nothing about this fix skips, weakens,
+or reorders any of them; it adds one more hard stop in front of the one
+call that matters, using the SAME `adapter.clock()` instant `BrokerAdapter.
+submit` itself derives `now` from immediately afterward (module docstring,
+top: "No `now` parameter... a `now` accepted and threaded through here
+would be silently ignored at the one place it would matter" -- this reuses
+that same reasoning: this gate reads `adapter.clock()` fresh, it does not
+invent its own clock).
+
+FAIL CLOSED ON "CANNOT BE DETERMINED," NOT JUST ON "CLOSED."
+`_session_permits_submission` treats ANY exception from `in_session_now`
+(an out-of-range calendar date -- `agent.market_calendar.
+CalendarCoverageError` -- a naive datetime, or anything else) the same way
+it treats a genuinely closed session: refuse. This is this codebase's own
+fail-safe-to-NO-TRADE invariant applied to a NEW kind of uncertainty
+(session state), not a new invariant.
+
+DOES NOT DEPEND ON THE BROKER TO ENFORCE THIS. Alpaca's own acceptance (or
+rejection) of an order placed outside its accepted hours is a separate,
+uninspected mechanism this codebase has never relied on for anything else
+(see this module's own "PRICE BAND: NOT RE-DERIVED HERE EITHER" section
+for the identical posture applied to price bands: this codebase decides
+its own policy locally and does not lean on the broker's own enforcement
+of a DIFFERENT policy to stand in for it) -- this gate runs and refuses
+entirely locally, before the broker is ever contacted for this call.
+
 TOKEN CONSUMPTION IS NOW DURABLE, WIRED HERE (durable-consumption unit,
 2026-08-09). Immediately before `adapter.submit(...)` (alongside the
 existing `attach_staging_key` call), this function now also calls
@@ -177,12 +236,15 @@ was not needed.
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from .approval import ApprovalToken, verify_modification_within_bounds
 from .approval_bridge import encode_token
 from .approval_request_store import ApprovalRequestStore
 from .approval_trigger import staged_order_from_snapshot
 from .broker.base import BrokerAdapter, BrokerOrder
 from .pipeline import Gatekeeper
+from .run_loop import in_session_now
 
 # Same tolerance style as agent.approval_bridge's own qty-override guard
 # (1e-9) -- floating-point notional/qty comparisons, not a real risk
@@ -199,6 +261,19 @@ class DriftDetected(ExecutionError):
     see this module's own "DRIFT CHECKS" docstring section."""
 
 
+class SessionClosed(ExecutionError):
+    """`execute_approved_request` refused to submit because, at the instant
+    submission was actually attempted, this account's permitted trading
+    session was not open -- or could not be determined at all. See this
+    module's own "SESSION GATE" docstring section for the full reasoning
+    (session-gate unit, 2026-08-13, closing a defect named in the
+    overnight-hardening unit's own final report: this CLI path had no
+    session enforcement of its own before this unit). No override exists
+    today; a future capability that explicitly permits after-hours
+    submission would need its own, independently-gated, default-deny
+    check -- this exception does not become bypassable by accident."""
+
+
 class StagingSignatureInvalid(ExecutionError):
     """The persisted `StagedOrder`'s signature does not verify against this
     `Gatekeeper`'s (now-durable) `signing_key`. A hard stop -- no fallback
@@ -212,6 +287,26 @@ class StagingSignatureInvalid(ExecutionError):
     nothing below this check may trust `staged`'s fields -- this is why it
     is raised immediately after reconstruction, before even
     `staged.client_order_id` is read."""
+
+
+def _session_permits_submission(now: datetime) -> bool:
+    """True iff `now` falls within the SAME authoritative session
+    definition `agent.run_loop.in_session_now` already uses for the
+    scheduled reconciliation loop -- the only real "regular session"
+    notion this codebase's calendar defines (`agent.market_calendar`).
+    Reused, not reimplemented -- see module docstring's "SESSION GATE"
+    section.
+
+    ANY exception from `in_session_now` (an out-of-range calendar date --
+    `agent.market_calendar.CalendarCoverageError` -- a naive datetime, or
+    anything else) is treated as "cannot determine the session" and
+    returns `False` -- fail CLOSED, per this codebase's own fail-safe-to-
+    NO-TRADE invariant (session state is exactly the kind of policy/
+    process-health uncertainty that invariant already covers)."""
+    try:
+        return in_session_now(now)
+    except Exception:
+        return False
 
 
 def execute_approved_request(
@@ -336,5 +431,21 @@ def execute_approved_request(
             request_id, token_snapshot=encode_token(tok), now=tok.consumed_at,
         )
     )
+
+    # SESSION GATE (module docstring's own "SESSION GATE" section). The
+    # LAST check before the one call in this function that can place a
+    # real order -- reads `adapter.clock()` fresh, right here, so a
+    # request that sat DECIDED for a while is checked against the CURRENT
+    # instant, not whatever instant it was approved or staged at. No
+    # override; fails closed on "cannot be determined" exactly like
+    # "closed".
+    now = adapter.clock()
+    if not _session_permits_submission(now):
+        raise SessionClosed(
+            f"request {request_id}: refusing to submit at {now.isoformat()} "
+            "-- outside a permitted trading session, or the session could "
+            "not be determined. No override exists; see this module's own "
+            "SESSION GATE docstring section."
+        )
 
     return adapter.submit(staged, approval_token=token, reference_price=reference_price)

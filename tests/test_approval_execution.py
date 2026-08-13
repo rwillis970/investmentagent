@@ -13,14 +13,16 @@ from __future__ import annotations
 import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pytest
 
+import agent.approval_execution as approval_execution_module
 from agent.accounts import AccountType
 from agent.approval import ApprovalService, PriceOutOfBand
 from agent.approval_bridge import mint_approval_token
 from agent.approval_execution import (DriftDetected, ExecutionError,
-                                      StagingSignatureInvalid,
+                                      SessionClosed, StagingSignatureInvalid,
                                       execute_approved_request)
 from agent.approval_request_store import ApprovalRequestStore
 from agent.approval_trigger import MissingStagedOrder, request_approval_for_analysis
@@ -173,6 +175,28 @@ def broker(*, cash=500.0, now=None):
     # why execute_approved_request accepts no `now` parameter of its own).
     # Defaults comfortably past shown_at (NOW) + min_display (10s).
     return SimulatorBroker(account_id=ACCT, cash=cash, now=now or DECIDE_AT + timedelta(seconds=10))
+
+
+def submit_spy(b):
+    """Wraps `b.submit` (a bound method inherited from `BrokerAdapter`) in a
+    `MagicMock` that still calls through to the real implementation, and
+    assigns it as an INSTANCE attribute on `b` -- Python's normal attribute
+    lookup then finds this instance attribute before the class method, so
+    every call site in `agent.approval_execution` that calls `adapter.
+    submit(...)` transparently goes through the spy. Used to prove, directly
+    against a call count, that a blocked session-gate path never reaches
+    `adapter.submit` at all -- not just that it raises the right exception."""
+    spy = MagicMock(wraps=b.submit)
+    b.submit = spy
+    return spy
+
+
+# NYSE regular session on 2026-07-20 (a real trading Monday, confirmed
+# elsewhere in this file via NOW): 13:30-20:00 UTC (market_calendar.
+# session_times). OUTSIDE_SESSION is the same trading day, after close --
+# deliberately not a weekend/holiday, so this specifically exercises "a
+# real trading day, just the wrong hour," not "no session exists at all."
+OUTSIDE_SESSION = datetime(2026, 7, 20, 21, 0, tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------- happy path
@@ -467,3 +491,119 @@ def test_a_reference_price_outside_the_approved_band_is_refused(tmp_path):
             result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
             reference_price=200.0,
         )
+
+
+# ------------------------------------------------------------------- session gate
+
+def test_an_approved_submit_during_a_permitted_session_proceeds_to_the_existing_downstream_gates(tmp_path):
+    """In-session: the session gate itself must be a no-op, and every
+    existing downstream gate (signature verify, idempotency, drift,
+    price band, token consumption, the actual broker submit) must still
+    run exactly as before this unit -- proven here by an explicit spy on
+    adapter.submit, not just by the order coming back filled."""
+    gk = gatekeeper()
+    s, result = make_buy(tmp_path, gk=gk)
+    token = token_for(s, result.request.request_id)
+    b = broker()   # default clock is well within the 2026-07-20 session
+    b.set_price("AAPL", 100.0)
+    spy = submit_spy(b)
+
+    order = execute_approved_request(
+        result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+        reference_price=100.0,
+    )
+    assert order.status == "filled"
+    spy.assert_called_once()
+    assert token.consumed_at is not None   # downstream token-consumption gate ran
+
+
+def test_an_approved_submit_outside_the_permitted_session_cannot_reach_broker_submit(tmp_path):
+    gk = gatekeeper()
+    s, result = make_buy(tmp_path, gk=gk)
+    token = token_for(s, result.request.request_id)
+    b = broker(now=OUTSIDE_SESSION)
+    b.set_price("AAPL", 100.0)
+    spy = submit_spy(b)
+
+    with pytest.raises(SessionClosed):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            reference_price=100.0,
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None   # never touched either
+
+
+def test_a_session_lookup_failure_blocks_submission_without_reaching_broker_submit(tmp_path, monkeypatch):
+    """"Cannot be determined" must refuse exactly like "closed" -- fail
+    CLOSED on uncertainty, not open. Simulated here by making the reused
+    `in_session_now` call raise (standing in for a real
+    `agent.market_calendar.CalendarCoverageError`, e.g. an out-of-range
+    calendar date) -- this module must not treat that as "session open"."""
+    gk = gatekeeper()
+    s, result = make_buy(tmp_path, gk=gk)
+    token = token_for(s, result.request.request_id)
+    b = broker()   # would otherwise be comfortably in-session
+    b.set_price("AAPL", 100.0)
+    spy = submit_spy(b)
+
+    def _boom(now):
+        raise RuntimeError("calendar table does not cover this date")
+
+    monkeypatch.setattr(approval_execution_module, "in_session_now", _boom)
+
+    with pytest.raises(SessionClosed):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            reference_price=100.0,
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_stale_approval_crossing_the_session_boundary_is_blocked(tmp_path):
+    """The approval itself was granted while a real session was open
+    (DECIDE_AT, inside NOW's own session) -- but by the time submission is
+    actually attempted, the session has since closed. The session gate
+    must catch THIS case specifically: it is not enough to have been valid
+    when approved, because this function checks the CURRENT instant
+    (`adapter.clock()`), not the approval's own creation/decision time."""
+    gk = gatekeeper()
+    s, result = make_buy(tmp_path, gk=gk)
+    token = token_for(s, result.request.request_id)   # minted while in-session
+    assert token.consumed_at is None
+    # The broker's own clock -- what execute_approved_request's session
+    # check and BrokerAdapter.submit's own `now` both derive from -- is set
+    # PAST the same trading day's close, simulating a submit attempted well
+    # after the approval was granted.
+    b = broker(now=OUTSIDE_SESSION)
+    b.set_price("AAPL", 100.0)
+    spy = submit_spy(b)
+
+    with pytest.raises(SessionClosed):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            reference_price=100.0,
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_weekend_instant_is_also_blocked_not_just_after_hours_on_a_trading_day(tmp_path):
+    """A second, independent "closed" shape -- no session exists at all
+    that day, as opposed to a real trading day outside its own hours
+    (the other blocked-path tests above)."""
+    gk = gatekeeper()
+    s, result = make_buy(tmp_path, gk=gk)
+    token = token_for(s, result.request.request_id)
+    saturday = datetime(2026, 7, 25, 15, 0, tzinfo=timezone.utc)   # confirmed Saturday
+    b = broker(now=saturday)
+    b.set_price("AAPL", 100.0)
+    spy = submit_spy(b)
+
+    with pytest.raises(SessionClosed):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            reference_price=100.0,
+        )
+    spy.assert_not_called()

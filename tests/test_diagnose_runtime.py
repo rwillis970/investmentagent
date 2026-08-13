@@ -236,6 +236,112 @@ def test_diagnose_runtime_module_never_imports_an_execution_path():
         )
 
 
+# ------------------------------------------------------------ --debug-shapes
+
+def _run_capturing_adapter_factory_kwargs(tmp_path, *, extra_args=()):
+    """Like `_run`, but injects a fake `adapter_factory` that records every
+    kwarg it was called with (instead of the real credential-resolving one)
+    -- lets these tests assert on exactly what `main()` threads through to
+    the adapter factory without needing a real keychain or a real Alpaca
+    fixture."""
+    calls = []
+
+    def fake_adapter_factory(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    config_path = _config_path(tmp_path)
+    data_dir = tmp_path / "data"
+    argv = [
+        "--config", str(config_path), "--account-id", ACCT,
+        "--key-id", "fake-key", "--secret-ref", "fake-secret-ref",
+        "--data-dir", str(data_dir),
+        *extra_args,
+    ]
+    diagnose_runtime.main(
+        argv, secrets_provider_factory=_no_secrets_factory, now_fn=lambda: T0,
+        adapter_factory=fake_adapter_factory,
+        diagnose_fn=_fake_diagnose(diagnostics.PASS),
+    )
+    return calls
+
+
+def test_debug_shapes_flag_passes_a_real_sink_to_the_adapter_factory(tmp_path):
+    calls = _run_capturing_adapter_factory_kwargs(tmp_path, extra_args=("--debug-shapes",))
+    assert len(calls) == 1
+    assert calls[0]["shape_debug_sink"] is diagnose_runtime._print_shape_line
+
+
+def test_without_debug_shapes_the_adapter_factory_gets_no_sink(tmp_path):
+    calls = _run_capturing_adapter_factory_kwargs(tmp_path)
+    assert len(calls) == 1
+    assert calls[0]["shape_debug_sink"] is None
+
+
+def test_debug_shapes_flag_prints_an_enabled_banner(tmp_path, capsys):
+    _run_capturing_adapter_factory_kwargs(tmp_path, extra_args=("--debug-shapes",))
+    out = capsys.readouterr().out
+    assert "[debug-shapes] enabled" in out
+
+
+def test_without_debug_shapes_no_banner_is_printed(tmp_path, capsys):
+    _run_capturing_adapter_factory_kwargs(tmp_path)
+    out = capsys.readouterr().out
+    assert "[debug-shapes]" not in out
+
+
+def test_print_shape_line_dict_shape_never_includes_a_field_value(capsys):
+    """The sink itself must only ever render KEY NAMES for a dict shape,
+    never a value -- this is the actual safety property module docstring's
+    --DEBUG-SHAPES section promises. `"super-secret-equity-value"` standing
+    in for what a real (never logged) field VALUE would look like -- it
+    must not appear anywhere in the printed line, only the key name
+    `"equity"` itself."""
+    diagnose_runtime._print_shape_line({
+        "endpoint": "GET /v2/account", "http_status": 200,
+        "top_level_type": "dict", "dict_keys": ["cash", "equity"],
+    })
+    out = capsys.readouterr().out
+    assert "GET /v2/account" in out
+    assert "http_status=200" in out
+    assert "equity" in out          # the KEY name is fine to print
+    assert "cash" in out
+    assert "super-secret" not in out  # no VALUE was ever passed in to begin with
+
+
+def test_print_shape_line_list_shape_prints_length_not_elements(capsys):
+    diagnose_runtime._print_shape_line({
+        "endpoint": "GET /v2/positions", "http_status": 200,
+        "top_level_type": "list", "list_length": 3, "first_element_type": "dict",
+    })
+    out = capsys.readouterr().out
+    assert "GET /v2/positions" in out
+    assert "list_length=3" in out
+    assert "first_element_type=dict" in out
+
+
+def test_debug_shapes_is_still_read_only_and_submit_incapable(tmp_path):
+    """--debug-shapes changes NOTHING about this script's structural
+    inability to submit/cancel an order (module docstring's STRUCTURALLY
+    INCAPABLE section) -- the AST-based import-graph proof and the
+    real-adapter-construction path (no capability_policy/staging_key) are
+    exercised identically whether or not this flag is set; this test is a
+    narrow, explicit confirmation for THIS flag specifically, on top of the
+    two structural tests below that already cover the whole module."""
+    credentials = diagnose_runtime.BrokerCredentials(
+        account_id=ACCT, key_id="k", secret_ref="fake-secret-ref")
+    from agent.secrets_provider import InMemorySecretsProvider
+    secrets_provider = InMemorySecretsProvider("PAPER", {"fake-secret-ref": "s"})
+    adapter = diagnose_runtime._build_real_adapter(
+        account_id=ACCT, key_id="k", secret_ref="fake-secret-ref",
+        secrets_provider=secrets_provider,
+        shape_debug_sink=diagnose_runtime._print_shape_line,
+    )
+    assert adapter is not None
+    assert adapter._capability_policy is None
+    assert adapter._staging_key is None
+
+
 def test_diagnose_runtime_does_not_import_scripts_run_agent():
     """Deliberately does NOT reuse scripts.run_agent's own adapter-factory
     helpers -- see this script's own module docstring for why importing

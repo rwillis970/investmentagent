@@ -434,6 +434,49 @@ def test_maybe_mark_recovered_never_recovers_on_a_single_fail(tmp_path):
     assert loaded.status == failure_sentinel.ACTIVE
 
 
+def test_maybe_mark_recovered_returns_false_on_a_repeat_call_no_churn(tmp_path):
+    """Live-adapter-parsing-failure unit, item 7 (2026-08-13): a diagnostic
+    run AFTER the sentinel is already RECOVERED must not report a fresh
+    recovery a second time -- `scripts/diagnose_runtime.py` prints "marked
+    RECOVERED by this diagnostic run" only when this function returns True,
+    and would otherwise print that on every single successful run forever
+    (see this function's own updated docstring). The underlying
+    `failure_sentinel.json` itself was always idempotent (recovered_at
+    never bumped) -- this test is about the RETURN VALUE distinguishing
+    "recovered just now" from "already recovered", not about the file."""
+    paths = _paths(tmp_path)
+    sentinel_path = paths["audit_log_path"].parent / "failure_sentinel.json"
+    failure_sentinel.save(sentinel_path, failure_sentinel.record_failure(
+        None, exc_type="TypeError", message="string indices must be integers",
+        now=T0 - timedelta(hours=6)))
+
+    _seeded_store(tmp_path)
+    _seed_mode_and_audit(tmp_path)
+    adapter = _CallTrackingAdapter(ACCT, account=_snapshot(), positions=[], open_orders=[])
+    report = diagnose_account(account_id=ACCT, adapter=adapter, policy_registry=_registry(),
+                              max_day_trades_per_5_sessions=3, now=T0, **paths)
+    assert report.overall_status in (PASS, WARN)
+
+    first_call = maybe_mark_recovered(report, sentinel_path=sentinel_path, now=T0)
+    assert first_call is True
+    recovered_at_after_first_call = failure_sentinel.load(sentinel_path).recovered_at
+
+    later = T0 + timedelta(hours=1)
+    second_call = maybe_mark_recovered(report, sentinel_path=sentinel_path, now=later)
+    assert second_call is False   # THE FIX: no longer reports a fresh recovery
+
+    loaded = failure_sentinel.load(sentinel_path)
+    assert loaded.status == failure_sentinel.RECOVERED
+    # recovered_at is the FIRST recovery instant, never bumped forward by
+    # a later, purely-observational successful run.
+    assert loaded.recovered_at == recovered_at_after_first_call == T0
+
+    # historical evidence (exc_type/message/first_at/consecutive_count of
+    # the ORIGINAL incident) is retained, not cleared, by either call.
+    assert loaded.exc_type == "TypeError"
+    assert loaded.message == "string indices must be integers"
+
+
 def test_maybe_mark_recovered_is_a_safe_no_op_with_nothing_to_recover_from(tmp_path):
     paths = _paths(tmp_path)
     sentinel_path = paths["audit_log_path"].parent / "failure_sentinel.json"

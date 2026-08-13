@@ -158,25 +158,34 @@ it has no way to see what you actually typed into your own copy at
 `~/Library/LaunchAgents/`. This has already gone wrong once: an installed
 copy was missing `--signing-key-secret-ref` entirely and crash-looped on
 argparse every `ThrottleInterval` (60s) after `launchctl bootstrap`, with
-nothing checking it first. Run this against your OWN installed file, not
-the template, before every `bootstrap`:
+nothing checking it first. Run this against your OWN installed files, not the templates, before every
+`bootstrap` -- BOTH jobs, each against its OWN script's argument parser
+(`--type reconcile-loop` uses `scripts/run_agent.py`'s parser;
+`--type dashboard` uses `scripts/run_dashboard.py`'s -- they are different
+flag sets, e.g. `--host`/`--port` are dashboard-only, so validating one
+plist against the other job's parser will false-fail or, worse, false-pass
+a genuinely cross-wired file). `--type` is optional -- this script
+auto-detects from the plist's own `Label` key if you omit it, and refuses
+to guess (exits 1, asks for `--type` explicitly) if the Label is missing
+or unrecognized -- but pass it explicitly, as below, so there is never any
+ambiguity about which script's parser validated which file:
 
 ```sh
-python3 deploy/preflight_plist.py ~/Library/LaunchAgents/com.investmentagent.reconcile-loop.plist
+python3 deploy/preflight_plist.py --type reconcile-loop ~/Library/LaunchAgents/com.investmentagent.reconcile-loop.plist
+python3 deploy/preflight_plist.py --type dashboard ~/Library/LaunchAgents/com.investmentagent.dashboard.plist
 ```
 
-It checks three things: `ProgramArguments` parses against the real
-`scripts/run_agent.py` argument parser (the exact check that would have
-caught the missing-flag incident above); every path the plist names --
-the script, `--config`, `--data-dir`, and the `StandardOutPath`/
-`StandardErrorPath` log directories -- actually exists on this machine;
-and no `REPLACE_`/`/REPLACE/...` placeholder was left unfilled anywhere
-(a placeholder like `REPLACE_WITH_ACCOUNT_ID` parses fine as a string, so
-only this third check catches it). It prints `preflight OK` and exits 0 on
-success; on any failure it exits 1 and lists every problem it found, one
-per line, each naming the specific flag/key and -- where the plist's own
-one-`<string>`-per-line convention makes it unambiguous -- the line number
-to fix.
+Each checks three things: `ProgramArguments` parses against the correct
+script's real argument parser (the exact check that would have caught the
+missing-flag incident above); every path the plist names -- the script,
+`--config`, `--data-dir`, and the `StandardOutPath`/`StandardErrorPath` log
+directories -- actually exists on this machine; and no `REPLACE_`/
+`/REPLACE/...` placeholder was left unfilled anywhere (a placeholder like
+`REPLACE_WITH_ACCOUNT_ID` parses fine as a string, so only this third check
+catches it). Each prints `preflight OK` and exits 0 on success; on any
+failure it exits 1 and lists every problem it found, one per line, each
+naming the specific flag/key and -- where the plist's own one-`<string>`-
+per-line convention makes it unambiguous -- the line number to fix.
 
 **Does not need your keychain entry provisioned or unlocked first** -- it
 never resolves `--secret-ref`/`--signing-key-secret-ref`, only checks that

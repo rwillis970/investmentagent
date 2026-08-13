@@ -61,7 +61,24 @@ manual check against a data directory you don't want touched at all).
 
 EXIT CODE reflects `DiagnosticReport.overall_status`: 0 for PASS, 1 for
 WARN or UNAVAILABLE, 2 for FAIL -- so this script is usable directly in a
-shell conditional or a monitoring check, not just for human reading."""
+shell conditional or a monitoring check, not just for human reading.
+
+--DEBUG-SHAPES (live-adapter-parsing-failure unit, 2026-08-13). Prints one
+line per real HTTP response this run's `AlpacaPaperAdapter` receives --
+endpoint, HTTP status, and a bounded/redacted shape summary (top-level JSON
+type; dict key names or list length -- never a field VALUE, never a request
+header, never the API key/secret; see agent/broker/alpaca.py's own
+`_shape_summary`/module docstring "SAFE DIAGNOSTIC SHAPE LOGGING" section
+for the exact bound). This is the ONE command Ray needs to capture the real
+wire shape of `account()`/`positions()`/`open_orders()`/`fills()` against
+the live paper account without guessing: it wires a printing
+`shape_debug_sink` into the SAME adapter this script already constructs
+read-only and capability-policy-free (module docstring above) -- it adds
+NO new network call, NO new adapter, and does not change whether this
+script can submit or cancel an order (it structurally cannot, regardless of
+this flag; see STRUCTURALLY INCAPABLE OF SUBMITTING OR CANCELLING AN ORDER
+above). Off by default; add `--debug-shapes` to a normal, otherwise-
+unmodified invocation to get this output alongside the usual report."""
 from __future__ import annotations
 
 import argparse
@@ -91,8 +108,29 @@ _STATUS_TO_EXIT_CODE = {
 }
 
 
+def _print_shape_line(summary: dict) -> None:
+    """The real, printing `shape_debug_sink` for `--debug-shapes` -- see
+    module docstring's "--DEBUG-SHAPES" section and agent/broker/alpaca.py's
+    own `_shape_summary`/`AlpacaPaperAdapter.__init__` docstrings for
+    exactly what `summary` can and cannot contain (never a field value,
+    never a credential/header, only shape). One line per HTTP response."""
+    endpoint = summary.get("endpoint", "?")
+    status = summary.get("http_status", "?")
+    top_level_type = summary.get("top_level_type", "?")
+    if top_level_type == "dict":
+        detail = f"dict_keys={summary.get('dict_keys')}"
+    elif top_level_type == "list":
+        detail = (f"list_length={summary.get('list_length')} "
+                 f"first_element_type={summary.get('first_element_type')}")
+    else:
+        detail = ""
+    print(f"[debug-shapes] {endpoint}  http_status={status}  "
+         f"top_level_type={top_level_type}  {detail}")
+
+
 def _build_real_adapter(*, account_id: str, key_id: str, secret_ref: str,
-                        secrets_provider: SecretsProvider) -> BrokerAdapter | None:
+                        secrets_provider: SecretsProvider,
+                        shape_debug_sink=None) -> BrokerAdapter | None:
     """A fresh `AlpacaPaperAdapter`, or `None` if credentials cannot be
     resolved (a locked keychain, a missing entry) -- `agent.diagnostics.
     diagnose_account` already treats `adapter=None` as a first-class,
@@ -100,12 +138,16 @@ def _build_real_adapter(*, account_id: str, key_id: str, secret_ref: str,
     UNAVAILABLE with that reason), so this function itself never needs to
     decide whether that's acceptable; it only decides whether an adapter
     could be built at all. NEVER attaches `capability_policy`/
-    `_staging_key` -- see module docstring."""
+    `_staging_key` -- see module docstring. `shape_debug_sink`, when given
+    (only by `--debug-shapes`; `None` by default, meaning no behaviour
+    change at all), is threaded straight through to `AlpacaPaperAdapter`'s
+    own optional constructor parameter -- see that class's docstring."""
     credentials = BrokerCredentials(account_id=account_id, key_id=key_id,
                                     secret_ref=secret_ref)
     try:
         return AlpacaPaperAdapter(account_id=account_id, credentials=credentials,
-                                  secrets_provider=secrets_provider)
+                                  secrets_provider=secrets_provider,
+                                  shape_debug_sink=shape_debug_sink)
     except (SecretNotFoundError, Exception):   # noqa: BLE001 -- deliberately
         # broad: ANY failure to construct a real adapter (locked keychain,
         # wrong-mode secrets_provider, a transport misconfiguration) must
@@ -236,6 +278,14 @@ def _parse_args(argv: list[str] | None):
     parser.add_argument("--no-write", action="store_true",
                         help="print the report only; skip writing runtime_status.json and "
                              "skip failure_sentinel recovery marking")
+    parser.add_argument("--debug-shapes", action="store_true",
+                        help="print a bounded, redacted shape summary (endpoint, HTTP "
+                             "status, top-level JSON type, dict key names / list length) "
+                             "for every real broker HTTP response this run makes -- never "
+                             "a field value, a credential, or a request header; see module "
+                             "docstring's --DEBUG-SHAPES section. Read-only, "
+                             "submit/cancel-incapable, same as every other invocation of "
+                             "this script")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -294,7 +344,12 @@ def main(argv: list[str] | None = None, *,
     adapter = adapter_factory(
         account_id=args.account_id, key_id=args.key_id, secret_ref=args.secret_ref,
         secrets_provider=secrets_provider,
+        shape_debug_sink=_print_shape_line if args.debug_shapes else None,
     )
+    if args.debug_shapes:
+        print("[debug-shapes] enabled -- printing a bounded, redacted shape "
+             "summary for every real broker HTTP response below (never a "
+             "field value, credential, or header)\n")
 
     # HoldingPolicy's own fields are `timedelta`, not the raw ISO-8601
     # strings `Config` stores them as -- `cfg.minimum_hold`/`cfg.cooldown`

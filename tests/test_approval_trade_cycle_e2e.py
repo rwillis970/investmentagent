@@ -135,25 +135,31 @@ def _adapter(transport):
 
 
 def test_full_paper_approval_and_trade_cycle(tmp_path):
-    # A REAL, FRESH now() -- not a fixed historical literal (found running
-    # this test with a fixed 2026-07-20 "now": `AlpacaPaperAdapter`, unlike
-    # `SimulatorBroker` elsewhere in this codebase's tests, has no
-    # injectable fake clock -- `BrokerAdapter.submit()`'s own `self.clock()`
-    # call always reads real wall-clock time (agent/broker/base.py's own
-    # `clock()`, unchanged). A token minted against a fixed past literal
-    # expired the instant `submit()` compared it to the REAL current time,
-    # long after that literal (tests/test_broker_alpaca.py's own
-    # `approved_token` fixture hit and documented this identical issue).
-    # Every step below runs within the same test, milliseconds apart, so
-    # one shared, real `now()` -- offset 20s into the past for the staging
-    # step specifically -- keeps everything self-consistent without needing
-    # a fake clock anywhere in this path: `shown_at` (set at staging,
-    # below) must be >= 10s before `execute_approved_request` -> `adapter.
-    # submit()` reads the REAL wall clock (§10's `verify_minimum_display_
-    # time`, re-checked at submission against the server-recorded
-    # shown_at, exactly as designed); 20s of headroom comfortably covers
-    # this test's own real (sub-second) execution time between the two.
-    NOW = datetime.now(timezone.utc) - timedelta(seconds=20)
+    # A FIXED, CONFIRMED-IN-SESSION historical literal (session-gate unit,
+    # 2026-08-13 -- superseding the real-wall-clock approach this test used
+    # previously). `agent.approval_execution.execute_approved_request` now
+    # refuses to submit outside a real, permitted trading session (see that
+    # module's own "SESSION GATE" docstring section) by reading `adapter.
+    # clock()` immediately before submission -- a REAL `datetime.now()`
+    # would make this test's own pass/fail depend on the wall-clock time
+    # the suite happens to run at, which is exactly the class of flake this
+    # fixed literal avoids. `AlpacaPaperAdapter`, unlike `SimulatorBroker`
+    # elsewhere in this codebase's tests, has no injectable fake clock built
+    # in -- `adapter.clock` is overridden directly on the ONE adapter
+    # instance used for the actual submit call, below (same "override a
+    # bound instance method" pattern `tests/test_approval_execution.py`'s
+    # own `submit_spy` helper uses), returning a FIXED instant derived from
+    # this same NOW rather than real wall-clock time. This also resolves
+    # the ORIGINAL reason this test moved off a fixed literal in the first
+    # place: a token minted against a fixed past literal used to expire the
+    # instant `submit()` compared it to the REAL current time (tests/
+    # test_broker_alpaca.py's own `approved_token` fixture hit and
+    # documented that identical issue) -- now that `adapter.clock()` itself
+    # is fixed and consistent with NOW, that expiry mismatch cannot recur
+    # either. 2026-07-20 15:00 UTC is a confirmed real NYSE trading Monday
+    # (13:30-20:00 UTC session -- see tests/test_approval_execution.py's own
+    # identical constant), comfortably mid-session.
+    NOW = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
     # ---------------------------------------------------------- 1. Wiring
     # Real collaborators, constructed the same way run_agent.py/run_cycle
     # construct them -- no fakes standing in for any of this codebase's own
@@ -279,6 +285,14 @@ def test_full_paper_approval_and_trade_cycle(tmp_path):
                                        status="filled", filled_qty=str(qty),
                                        filled_avg_price="100.00"))
     adapter = _adapter(transport)
+    # Fixed, in-session clock for THIS adapter instance only (the one that
+    # actually reaches adapter.submit() -- see this test's own NOW comment
+    # above for the full reasoning). BrokerAdapter.submit()'s own
+    # verify_minimum_display_time (shown_at + 15s >= min_display 10s) and
+    # agent.approval_execution's new session gate both read adapter.clock()
+    # -- this single override keeps both consistent with NOW instead of
+    # real wall-clock time.
+    adapter.clock = lambda: NOW + timedelta(seconds=30)
     order = execute_approved_request(
         request_id, store=approval_store, adapter=adapter, gatekeeper=gatekeeper,
         token=token, reference_price=100.0,
@@ -362,7 +376,12 @@ def test_a_second_approve_after_execution_is_a_replay_not_a_re_execution(tmp_pat
     throughout: re-approving an already-approved request through the same
     real HTTP dispatch layer never mints a second token or re-decides
     anything -- it returns the original decision, replayed."""
-    NOW = datetime.now(timezone.utc) - timedelta(seconds=20)   # see the other test's own comment on why
+    # Real wall-clock time is still fine HERE (unlike the other test above,
+    # session-gate unit, 2026-08-13): this test never calls
+    # execute_approved_request/adapter.submit() at all -- it only exercises
+    # approval/replay through route_request -- so neither the token-expiry
+    # issue nor agent.approval_execution's session gate is ever reached.
+    NOW = datetime.now(timezone.utc) - timedelta(seconds=20)
     gatekeeper = Gatekeeper(account_id=ACCT, account_type=AccountType.TAXABLE,
                             capability_policy=initial_policy(), risk_policy=RISK,
                             day_trade_guard=DayTradeGuard(account_id=ACCT, max_per_5_sessions=3),

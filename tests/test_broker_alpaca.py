@@ -829,3 +829,367 @@ def test_terminal_order_statuses_is_exactly_three_of_status_maps_five_canonical_
     assert TERMINAL_ORDER_STATUSES == {"filled", "canceled", "rejected"}
     assert TERMINAL_ORDER_STATUSES < canonical
     assert canonical - TERMINAL_ORDER_STATUSES == {"new", "partially_filled"}
+
+
+# ===========================================================================
+# REAL-SHAPE CONTRACT TESTS (live-adapter-parsing-failure unit, 2026-08-13).
+#
+# ROOT CAUSE this section proves closed: account()/positions()/open_orders()/
+# fills() each discarded the HTTP status `_request` already returns and
+# parsed the response body directly as the endpoint's success shape. A
+# non-2xx response (Alpaca's own documented error shape: a small JSON
+# OBJECT) then produced, respectively: `KeyError: 'equity'` (account -- a
+# dict missing that key), `TypeError: string indices must be integers`
+# (positions/fills -- iterating a DICT yields its KEYS, which are strings,
+# then indexing a string with a non-integer key), `AttributeError: 'str'
+# object has no attribute 'get'` (open_orders -- same string-key iteration,
+# but _to_broker_order calls .get() first) -- this is EXACTLY the real Mac
+# failure_sentinel signature reported (x386, "string indices must be
+# integers") from a real diagnose_runtime.py run against PA3XZX944LRR.
+#
+# Every fixture below marked REAL CAPTURE is drawn verbatim from this
+# codebase's own committed evidence (scripts/fixtures/{account,positions,
+# orders,activities_since}.json -- probed against the same real paper
+# account on 2026-07-27/2026-07-30, `"status": 200` in every case) -- not
+# hand-invented shapes. These confirm Alpaca's SUCCESS wire shape is exactly
+# what this adapter's field-mapping already assumed; nothing about that
+# mapping needed to change. What changed is that a non-2xx / wrong-type /
+# malformed response is now caught BEFORE field access, as a named
+# `AlpacaResponseError`, instead of falling through to a bare stdlib
+# exception with no endpoint context.
+# ===========================================================================
+
+import json as _json
+from pathlib import Path as _Path
+
+from agent.broker.alpaca import AlpacaResponseError
+
+_FIXTURES_DIR = _Path(__file__).resolve().parent.parent / "scripts" / "fixtures"
+
+
+def _real_fixture_body(name: str):
+    return _json.loads((_FIXTURES_DIR / name).read_text())["body"]
+
+
+# ------------------------------------------------ 1. account() success shapes
+
+def test_account_against_the_real_committed_capture():
+    """REAL CAPTURE: scripts/fixtures/account.json, probed 2026-07-27
+    against PA3XZX944LRR, status 200. 36 top-level fields; this adapter
+    only reads five of them (plus the two absent-vs-present PDT fields
+    covered elsewhere) -- proves the real wire body, unmodified, parses
+    clean through account() end to end."""
+    body = _real_fixture_body("account.json")
+    t = ScriptedTransport()
+    t.enqueue(200, body)
+    snap = adapter(t).account()
+    assert snap.equity == Decimal("500.12")
+    assert snap.cash == Decimal("480")
+    assert snap.buying_power == Decimal("480")
+    assert snap.multiplier == Decimal("1")
+
+
+# ----------------------------------------------- 2. positions() success shapes
+
+def test_positions_against_the_real_committed_capture():
+    """REAL CAPTURE: scripts/fixtures/positions.json -- a real fractional
+    SPY position, status 200."""
+    body = _real_fixture_body("positions.json")
+    t = ScriptedTransport()
+    t.enqueue(200, body)
+    [pos] = adapter(t).positions()
+    assert pos.symbol == "SPY"
+    assert pos.qty == Decimal("0.027087234")
+    assert pos.avg_price == Decimal("737.986")
+    assert pos.market_value == Decimal("20.124691")
+
+
+def test_positions_no_position_response_is_an_empty_list_not_an_error():
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    assert adapter(t).positions() == []
+
+
+# ---------------------------------------------- 3. open_orders() success shapes
+
+def test_open_orders_against_the_real_committed_capture():
+    """REAL CAPTURE: scripts/fixtures/orders.json -- a real FILLED,
+    notional-originated order (qty=null, filled_qty populated: exactly the
+    `_to_broker_order` notional fallback path), status 200."""
+    body = _real_fixture_body("orders.json")
+    t = ScriptedTransport()
+    t.enqueue(200, body)
+    [order] = adapter(t).open_orders()
+    assert order.client_order_id == "732f0667-fb47-43f6-babd-7c0fe64ece18"
+    assert order.status == "filled"
+    assert order.qty == Decimal("0.027087234")
+    assert order.avg_fill_price == Decimal("737.986")
+
+
+def test_open_orders_no_open_orders_response_is_an_empty_list_not_an_error():
+    t = ScriptedTransport()
+    t.enqueue(200, [])
+    assert adapter(t).open_orders() == []
+
+
+# -------------------------------------------------- 4. fills() success shapes
+
+def test_fills_against_the_real_committed_activities_capture():
+    """REAL CAPTURE: scripts/fixtures/activities_since.json's own FILL row
+    -- the actual, already-quarantine-admitted execution
+    (20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346, order_id
+    91dcb2f4-315c-4c39-8211-1f71ed7d49a9) this unit's own item 6 is about.
+    Proves fills() parses that exact real row end to end once the order-id
+    lookup resolves."""
+    activities = _json.loads(
+        (_FIXTURES_DIR / "activities_since.json").read_text())["activities"]
+    fill_row = next(a for a in activities if a["activity_type"] == "FILL")
+    t = ScriptedTransport()
+    t.enqueue(200, [fill_row])
+    t.enqueue(200, order_json(client_order_id="c-real"))
+    [execution] = adapter(t).fills()
+    assert execution.execution_id == (
+        "20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346")
+    assert execution.qty == Decimal("0.027087234")
+    assert execution.price == Decimal("737.986")
+    assert execution.client_order_id == "c-real"
+
+
+# -------------------------------------------- 5. malformed / wrong-type shapes
+
+def test_account_on_wrong_top_level_type_raises_alpaca_response_error_not_a_crash():
+    """The real defect's actual trigger shape for account(): a non-2xx
+    error response IS a dict (Alpaca's documented error shape), so this
+    exercises the OTHER direction -- a genuinely wrong top-level type
+    (e.g. a list) on an otherwise-200 response -- as the belt-and-suspenders
+    check module docstring describes."""
+    t = ScriptedTransport()
+    t.enqueue(200, [{"unexpected": "list, not an object"}])
+    with pytest.raises(AlpacaResponseError):
+        adapter(t).account()
+
+
+def test_positions_on_wrong_top_level_type_raises_not_a_bare_typeerror():
+    """THIS IS THE ACTUAL REAL DEFECT, REPRODUCED: before this fix, a dict
+    body (e.g. Alpaca's own error-response shape) reaching positions()'s old
+    `for p in data: p["qty"]` would iterate the dict's KEYS (strings) and
+    then index a string with a non-integer key -- exactly `TypeError: string
+    indices must be integers`, the real failure_sentinel signature (x386)
+    from the real Mac run. Now caught by `_expect_list` before any
+    iteration, as a named, endpoint-labelled `AlpacaResponseError`."""
+    t = ScriptedTransport()
+    t.enqueue(200, {"code": 40110000, "message": "not really an error status, "
+                                                  "but still the wrong shape"})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/positions"):
+        adapter(t).positions()
+
+
+def test_open_orders_on_wrong_top_level_type_raises_not_a_bare_attributeerror():
+    """The real defect's other exact signature: `AttributeError: 'str'
+    object has no attribute 'get'` -- `_to_broker_order`'s old
+    `o.get("qty")` called on a STRING (one of the error dict's own keys,
+    yielded by iterating it as if it were a list of order objects)."""
+    t = ScriptedTransport()
+    t.enqueue(200, {"code": 50010000, "message": "wrong shape for open_orders"})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/orders"):
+        adapter(t).open_orders()
+
+
+def test_positions_element_that_is_not_an_object_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(200, ["not-a-position-object"])
+    with pytest.raises(AlpacaResponseError):
+        adapter(t).positions()
+
+
+def test_open_orders_element_that_is_not_an_object_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(200, ["not-an-order-object"])
+    with pytest.raises(AlpacaResponseError):
+        adapter(t).open_orders()
+
+
+# ------------------------------------------------- 6. API error object shapes
+
+def test_account_on_a_documented_alpaca_error_object_raises_named_error_not_keyerror():
+    """THE OTHER HALF OF THE REAL DEFECT: a non-2xx status whose body IS
+    Alpaca's own documented small error object (`{"code": ..., "message":
+    ...}`) -- account()'s old `data["equity"]` on this dict raised a bare
+    `KeyError: 'equity'`, the real failure_sentinel signature reported for
+    account(). Now caught by `_ensure_ok` on the status BEFORE any field
+    access, regardless of what the error body happens to contain."""
+    t = ScriptedTransport()
+    t.enqueue(401, {"code": 40110000, "message": "authentication failed"})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/account"):
+        adapter(t).account()
+
+
+def test_positions_on_a_documented_alpaca_error_object_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(401, {"code": 40110000, "message": "authentication failed"})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/positions"):
+        adapter(t).positions()
+
+
+def test_open_orders_on_a_documented_alpaca_error_object_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(401, {"code": 40110000, "message": "authentication failed"})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/orders"):
+        adapter(t).open_orders()
+
+
+def test_fills_on_a_documented_alpaca_error_object_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(401, {"code": 40110000, "message": "authentication failed"})
+    with pytest.raises(AlpacaResponseError, match="activities/FILL"):
+        adapter(t).fills()
+
+
+def test_get_by_client_id_404_is_still_none_not_an_error():
+    """UNCHANGED special case: 404 on THIS endpoint specifically means "no
+    such order", not a generic error -- must still short-circuit to `None`
+    before `_ensure_ok`, exactly as before this fix."""
+    t = ScriptedTransport()
+    t.enqueue(404, {"code": 40410000, "message": "order not found"})
+    assert adapter(t).get_by_client_id("nope") is None
+
+
+def test_get_by_client_id_non_404_error_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(500, {"code": 50010000, "message": "internal error"})
+    with pytest.raises(AlpacaResponseError, match="by_client_order_id"):
+        adapter(t).get_by_client_id("c1")
+
+
+# -------------------------------------------------------- 7. HTTP error shapes
+
+def test_account_on_http_error_with_a_non_dict_body_still_raises_named_error():
+    """A non-2xx status caught by `_ensure_ok` BEFORE `_expect_dict` even
+    runs -- proves the ordering (status check first) holds even when the
+    error body itself isn't the documented shape (e.g. a load balancer's
+    own HTML/plain-text error page, not Alpaca's JSON at all)."""
+    t = ScriptedTransport()
+    t.enqueue(503, "Service Unavailable")
+    with pytest.raises(AlpacaResponseError, match="GET /v2/account"):
+        adapter(t).account()
+
+
+def test_positions_on_http_error_with_empty_dict_body_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(500, {})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/positions"):
+        adapter(t).positions()
+
+
+# ------------------------------------------------------------ 8. empty body
+
+def test_account_on_a_200_with_an_empty_object_body_raises_named_error_not_keyerror():
+    """`UrllibTransport`/`ScriptedTransport` both decode an empty body as
+    `{}` (see agent/broker/transport.py) -- a genuinely empty 200 response
+    is therefore indistinguishable, at this layer, from "a dict missing
+    every field," which is exactly what `_expect_dict` + the per-field
+    try/except already handles: no crash, a named, endpoint-labelled
+    error."""
+    t = ScriptedTransport()
+    t.enqueue(200, {})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/account"):
+        adapter(t).account()
+
+
+def test_positions_on_a_200_with_an_empty_object_body_raises_named_error():
+    """An empty-body 200 for a LIST endpoint decodes to `{}`, not `[]` --
+    `_expect_list` catches the type mismatch rather than this silently
+    behaving like "no positions" (which would be indistinguishable from a
+    real empty portfolio -- exactly the kind of silent-empty Appendix E's
+    fail-safe bias forbids)."""
+    t = ScriptedTransport()
+    t.enqueue(200, {})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/positions"):
+        adapter(t).positions()
+
+
+# -------------------------------------------------------- 9. unexpected wrapper
+
+def test_account_wrapped_in_an_unexpected_envelope_raises_named_error():
+    """A hypothetical future envelope change (e.g. `{"account": {...}}`
+    instead of the bare object this adapter's own real capture confirms
+    Alpaca actually sends) -- the top-level IS a dict, so `_expect_dict`
+    passes, but `data["equity"]` is still missing at THIS level; the
+    per-field try/except catches the resulting KeyError and re-raises it as
+    a named, endpoint-labelled error rather than propagating a bare
+    KeyError."""
+    t = ScriptedTransport()
+    t.enqueue(200, {"account": account_json()})
+    with pytest.raises(AlpacaResponseError, match="GET /v2/account"):
+        adapter(t).account()
+
+
+# ------------------------------------------- 10. fills()/non_fill_activities()
+# pagination-loop and per-object validation (not just the first page)
+
+def test_fills_pagination_loop_validates_every_page_not_just_the_first():
+    """Page 1 is a FULL page (100 == page_size), so the loop keeps paging
+    -- proves page 2's own failure is caught too, not just a hypothetical
+    check on page 1 that a short/empty final page would never exercise."""
+    t = ScriptedTransport()
+    t.enqueue(200, [activity_json(id=f"a{i}", order_id="alpaca-order-1")
+                    for i in range(100)])
+    t.enqueue(401, {"code": 40110000, "message": "authentication failed"})  # page 2 fails
+    with pytest.raises(AlpacaResponseError, match="activities/FILL"):
+        adapter(t).fills()
+
+
+def test_non_fill_activities_pagination_loop_validates_every_page():
+    t = ScriptedTransport()
+    t.enqueue(200, [cat_fee_json(id=f"d{i}") for i in range(100)])
+    t.enqueue(401, {"code": 40110000, "message": "authentication failed"})
+    with pytest.raises(AlpacaResponseError, match="/v2/account/activities"):
+        adapter(t).non_fill_activities()
+
+
+def test_non_fill_activities_element_that_is_not_an_object_is_skipped_not_crashed():
+    """`non_fill_activities`'s own FILL-exclusion filter already guards with
+    `isinstance(a, dict)` before `.get(...)` -- a non-dict element is
+    excluded by the filter (same defensive posture as the FILL-type
+    exclusion itself), not force-fed into `_to_account_activity`, which
+    would raise. This is intentionally more permissive than positions/
+    open_orders (where a non-dict element is a hard, immediate error)
+    because the exclusion filter runs first, by construction, for every
+    element, not just malformed ones."""
+    t = ScriptedTransport()
+    t.enqueue(200, ["not-an-activity-object", cat_fee_json()])
+    activities = adapter(t).non_fill_activities()
+    assert [a.activity_type for a in activities] == ["FEE"]
+
+
+def test_client_order_id_for_on_error_status_raises_named_error():
+    t = ScriptedTransport()
+    t.enqueue(200, [activity_json(order_id="alpaca-order-9")])
+    t.enqueue(401, {"code": 40110000, "message": "authentication failed"})
+    with pytest.raises(AlpacaResponseError, match="/v2/orders/alpaca-order-9"):
+        adapter(t).fills()
+
+
+# ---------------------------------------------- 11. no silent empty, ever
+
+def test_none_of_the_new_validation_helpers_ever_return_a_silent_default():
+    """Appendix E's fail-safe-to-NO-TRADE invariant, applied directly:
+    every failure mode exercised above raises `AlpacaResponseError` -- none
+    of them return an empty list, a zeroed AccountSnapshot, or any other
+    stand-in value. This test is a single, explicit cross-check tying that
+    property back to the invariant by name, on top of the many individual
+    pytest.raises(...) assertions above."""
+    scenarios = [
+        lambda t: adapter(t).account(),
+        lambda t: adapter(t).positions(),
+        lambda t: adapter(t).open_orders(),
+        lambda t: adapter(t).fills(),
+    ]
+    for scenario in scenarios:
+        t = ScriptedTransport()
+        t.enqueue(401, {"code": 40110000, "message": "authentication failed"})
+        # If this ever silently returned {}/[]/None instead of raising,
+        # pytest.raises itself would fail here with "DID NOT RAISE" -- that
+        # failure mode IS the assertion this test makes.
+        with pytest.raises(AlpacaResponseError):
+            scenario(t)

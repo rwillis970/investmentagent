@@ -108,9 +108,55 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.run_agent import _parse_args  # noqa: E402 -- see sys.path insert above
+from scripts.run_dashboard import _parse_args as _parse_dashboard_args  # noqa: E402
 # Default parser for check_plist/_check_parses -- see module docstring's
 # "PLUGGABLE PARSER" section for why a caller can override this.
 _DEFAULT_PARSE_ARGS_FN: Callable[[list[str]], object] = _parse_args
+
+# CLI TYPE SELECTION (preflight-CLI-parser-bug follow-up, 2026-08-13). Maps
+# the `--type` CLI flag directly to the parser `check_plist`'s own
+# `parse_args_fn` should validate against -- see `main`'s own docstring for
+# why this exists (the CLI, unlike `check_plist` itself, used to hardcode
+# `scripts.run_agent._parse_args` unconditionally, so it silently
+# "validated" a dashboard plist's ProgramArguments against the WRONG
+# script's parser and could false-fail on --host/--port, or -- worse --
+# false-PASS a cross-wired plist that happened to parse under the wrong
+# parser by coincidence).
+_TYPE_TO_PARSER: dict[str, Callable[[list[str]], object]] = {
+    "reconcile-loop": _parse_args,
+    "dashboard": _parse_dashboard_args,
+}
+
+# Auto-detection: a plist's own `Label` key already names which job it is
+# (both checked-in templates set this -- deploy/com.investmentagent.
+# reconcile-loop.plist's `Label` is literally `com.investmentagent.
+# reconcile-loop`, the dashboard template's is `com.investmentagent.
+# dashboard`). Used only when the operator does not pass `--type`
+# explicitly; an unrecognized or missing Label is treated as AMBIGUOUS --
+# see `_detect_type`'s own docstring -- never guessed.
+_LABEL_TO_TYPE = {
+    "com.investmentagent.reconcile-loop": "reconcile-loop",
+    "com.investmentagent.dashboard": "dashboard",
+}
+
+
+def _detect_type(plist_path: Path) -> str | None:
+    """Best-effort auto-detection from the plist's own `Label` key. Returns
+    `None` -- never a guess, never a default -- if the file cannot be read/
+    parsed at all, or if `Label` is missing or does not match either known
+    job. `main` treats a `None` result as ambiguous and requires the
+    operator to pass `--type` explicitly rather than silently falling back
+    to either parser (the exact bug this follow-up closes: a fallback to
+    `scripts.run_agent._parse_args` was previously unconditional)."""
+    try:
+        with Path(plist_path).open("rb") as fh:
+            plist = plistlib.load(fh)
+    except Exception:   # noqa: BLE001 -- any read/parse failure is just "undetectable"
+        return None
+    label = plist.get("Label")
+    if not isinstance(label, str):
+        return None
+    return _LABEL_TO_TYPE.get(label)
 
 # The one flag among _parse_args's own set that takes no following value --
 # see _flag_values's own docstring for why this matters to the pairing.
@@ -338,6 +384,26 @@ def check_plist(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI ENTRY POINT -- NOW TYPE-AWARE (preflight-CLI-parser-bug
+    follow-up, 2026-08-13). Before this fix, this CLI called `check_plist`
+    with no `parse_args_fn` at all, which meant it ALWAYS validated check 2
+    against `scripts.run_agent._parse_args` -- correct for the reconcile-
+    loop plist, silently WRONG for the dashboard plist (whose own `--host`/
+    `--port` flags `scripts.run_agent._parse_args` does not recognize, and
+    whose own missing `--account-id`-is-required-elsewhere assumptions
+    could, in principle, let a genuinely broken dashboard plist "validate"
+    by coincidence). `check_plist` itself already grew a `parse_args_fn`
+    parameter for exactly this reason; this CLI was the one remaining
+    caller still implicitly hardcoded.
+
+    `--type reconcile-loop|dashboard` lets an operator (or a script) state
+    unambiguously which job a given installed plist is, and is ALWAYS
+    trusted over auto-detection when given. Without it, this CLI attempts
+    to auto-detect from the plist's own `Label` key (`_detect_type`) --
+    if that is ambiguous (missing/unreadable/unrecognized `Label`), this
+    CLI refuses to guess: it exits 1 with a clear message asking for
+    `--type` explicitly, rather than silently defaulting to either
+    parser."""
     parser = argparse.ArgumentParser(
         description="Preflight check for an INSTALLED launchd plist -- run "
                     "this before `launchctl bootstrap`. See this file's own "
@@ -351,17 +417,41 @@ def main(argv: list[str] | None = None) -> int:
              "template in deploy/, which tests/test_run_agent_plist_parses.py "
              "already validates."
     )
+    parser.add_argument(
+        "--type", choices=sorted(_TYPE_TO_PARSER), default=None,
+        help="which job this plist is, so check 2 (ProgramArguments parses) "
+             "validates against the CORRECT script's own parser -- "
+             "'reconcile-loop' for scripts/run_agent.py, 'dashboard' for "
+             "scripts/run_dashboard.py. If omitted, this is auto-detected "
+             "from the plist's own Label key; auto-detection failing "
+             "(an unreadable file, or a Label that is missing or matches "
+             "neither known job) is a hard error asking for this flag "
+             "explicitly -- never a silent default to either parser."
+    )
     args = parser.parse_args(argv)
 
-    failures = check_plist(args.plist_path)
+    resolved_type = args.type or _detect_type(args.plist_path)
+    if resolved_type is None:
+        print(
+            f"preflight FAILED for {args.plist_path} -- could not determine "
+            "which job this plist is (its Label is missing, unreadable, or "
+            "matches neither 'com.investmentagent.reconcile-loop' nor "
+            "'com.investmentagent.dashboard'). Pass --type reconcile-loop or "
+            "--type dashboard explicitly -- this CLI will not guess which "
+            "parser to validate ProgramArguments against.",
+            file=sys.stderr,
+        )
+        return 1
+
+    failures = check_plist(args.plist_path, _TYPE_TO_PARSER[resolved_type])
     if failures:
-        print(f"preflight FAILED for {args.plist_path} -- {len(failures)} "
-             f"problem(s) found:", file=sys.stderr)
+        print(f"preflight FAILED for {args.plist_path} (type={resolved_type}) "
+             f"-- {len(failures)} problem(s) found:", file=sys.stderr)
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         return 1
 
-    print(f"preflight OK: {args.plist_path}")
+    print(f"preflight OK: {args.plist_path} (type={resolved_type})")
     return 0
 
 
