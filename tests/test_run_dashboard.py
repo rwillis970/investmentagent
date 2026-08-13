@@ -461,3 +461,61 @@ def test_build_dashboard_runtime_wires_a_real_ledger_when_account_id_is_given(tm
     )
     assert runtime.ledger is not None
     assert runtime.ledger.account_id == "acct-1"
+
+
+# --------------------------------------- broker_state_refresh_fn wiring
+# (overnight-hardening unit, 2026-08-13): the "captured once at startup,
+# stale forever" fix -- see agent/dashboard_server.py's own
+# DashboardRuntime.broker_state_refresh_fn docstring, and this module's own
+# `_refresh` closure comment for why it is the SAME `_build_broker_state`,
+# just re-invoked instead of called once.
+
+def test_build_dashboard_runtime_attaches_a_refresh_fn_with_no_account_id(tmp_path):
+    """Even with no account_id (nothing meaningful to refresh),
+    broker_state_refresh_fn must still be a callable, never None -- route_
+    request's own null-check is only about whether a refresh mechanism
+    exists at all, not about whether it will find anything."""
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id=None, **_all_store_paths(tmp_path),
+    )
+    assert callable(runtime.broker_state_refresh_fn)
+    account, positions, guard, ledger = runtime.broker_state_refresh_fn()
+    assert account is None
+    assert positions == ()
+
+
+def test_broker_state_refresh_fn_returns_a_fresh_read_each_call(tmp_path):
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id="acct-1", now=now,
+        **_all_store_paths(tmp_path),
+    )
+    assert callable(runtime.broker_state_refresh_fn)
+    account_1, _, _, _ = runtime.broker_state_refresh_fn()
+    account_2, _, _, _ = runtime.broker_state_refresh_fn()
+    assert account_1 is not None
+    assert account_2 is not None
+    assert account_1.account_id == account_2.account_id == "acct-1"
+
+
+def test_broker_state_refresh_fn_uses_now_fn_not_a_frozen_initial_now(tmp_path):
+    """The refresh closure must call `now_fn()` fresh on every invocation --
+    proven by injecting a `now_fn` whose return value changes between calls
+    and observing `fetched_at` track it."""
+    # First value is consumed by build_dashboard_runtime's own initial,
+    # one-shot _build_broker_state call (since no explicit `now=` is given
+    # here); the next two are what the two refresh_fn() calls below should
+    # each independently observe.
+    clock = iter([
+        datetime(2026, 7, 20, 14, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 20, 16, 30, tzinfo=timezone.utc),
+    ])
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id="acct-1",
+        now_fn=lambda: next(clock), **_all_store_paths(tmp_path),
+    )
+    account_1, _, _, _ = runtime.broker_state_refresh_fn()
+    account_2, _, _, _ = runtime.broker_state_refresh_fn()
+    assert account_1.fetched_at == datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    assert account_2.fetched_at == datetime(2026, 7, 20, 16, 30, tzinfo=timezone.utc)

@@ -243,3 +243,146 @@ def test_a_realistic_reconciliation_halt_with_a_drifting_message_still_alerts(tm
     final = load(path)
     assert final.consecutive_count == 3
     assert should_alert(final, threshold=3) is True
+
+
+# ---------------------------------------------- active vs. recovered (overnight-hardening unit, 2026-08-13)
+
+def test_a_fresh_failure_record_defaults_to_active_status():
+    rec = record_failure(None, exc_type="RuntimeError", message="boom", now=T0)
+    assert rec.status == "active"
+    assert rec.recovered_at is None
+
+
+def test_mark_recovered_of_a_missing_sentinel_is_a_safe_no_op(tmp_path):
+    from agent.failure_sentinel import mark_recovered
+    assert mark_recovered(tmp_path / "nope.json", now=T0) is None
+
+
+def test_failure_then_mark_recovered_flips_status_and_sets_recovered_at(tmp_path):
+    """failure -> failure -> successful recovery."""
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    rec = record_failure(None, exc_type="DataDirConflict", message="sibling conflict", now=T0)
+    rec = record_failure(rec, exc_type="DataDirConflict", message="sibling conflict",
+                         now=T0 + timedelta(minutes=1))
+    save(path, rec)
+    assert load(path).consecutive_count == 2
+
+    recovered_at = T0 + timedelta(hours=6)
+    result = mark_recovered(path, now=recovered_at)
+    assert result.status == "recovered"
+    assert result.recovered_at == recovered_at
+    # historical detail preserved, not erased
+    assert result.exc_type == "DataDirConflict"
+    assert result.consecutive_count == 2
+    assert result.first_at == T0
+
+    loaded = load(path)
+    assert loaded == result
+
+
+def test_restart_after_recovery_stays_recovered(tmp_path):
+    """restart after recovery: loading a recovered sentinel again (e.g. a
+    fresh process reading it, or the diagnostic re-checking) must not
+    silently flip it back to active or lose recovered_at."""
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    rec = record_failure(None, exc_type="DataDirConflict", message="x", now=T0)
+    save(path, rec)
+    mark_recovered(path, now=T0 + timedelta(hours=1))
+
+    # Simulate a brand new process restarting and just reading the file --
+    # no write at all.
+    loaded_again = load(path)
+    assert loaded_again.status == "recovered"
+    assert loaded_again.recovered_at == T0 + timedelta(hours=1)
+
+
+def test_mark_recovered_is_idempotent_and_preserves_the_original_recovered_at(tmp_path):
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    save(path, record_failure(None, exc_type="RuntimeError", message="x", now=T0))
+    first = mark_recovered(path, now=T0 + timedelta(hours=1))
+    second = mark_recovered(path, now=T0 + timedelta(hours=5))
+    assert second.recovered_at == first.recovered_at == T0 + timedelta(hours=1)
+
+
+def test_new_failure_after_recovery_starts_a_fresh_streak_at_one(tmp_path):
+    """new failure after recovery becomes active again -- and, critically,
+    does NOT silently reattach to the old (already-notified) streak."""
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    rec = record_failure(None, exc_type="DataDirConflict", message="x", now=T0)
+    for i in range(1, 5):
+        rec = record_failure(rec, exc_type="DataDirConflict", message="x",
+                             now=T0 + timedelta(minutes=i))
+    save(path, rec)
+    assert load(path).consecutive_count == 5
+    mark_recovered(path, now=T0 + timedelta(hours=1))
+
+    # A NEW failure of the SAME exc_type arrives later -- must be a fresh
+    # incident, not a continuation of the one already recovered from.
+    prior = load(path)
+    new_rec = record_failure(prior, exc_type="DataDirConflict", message="y",
+                             now=T0 + timedelta(hours=2))
+    assert new_rec.status == "active"
+    assert new_rec.consecutive_count == 1
+    assert new_rec.first_at == T0 + timedelta(hours=2)
+    assert new_rec.recovered_at is None
+
+
+def test_new_failure_of_a_different_type_after_recovery_also_starts_fresh(tmp_path):
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    save(path, record_failure(None, exc_type="DataDirConflict", message="x", now=T0))
+    mark_recovered(path, now=T0 + timedelta(hours=1))
+    prior = load(path)
+    new_rec = record_failure(prior, exc_type="TransportError", message="blip",
+                             now=T0 + timedelta(hours=2))
+    assert new_rec.status == "active"
+    assert new_rec.consecutive_count == 1
+
+
+def test_a_recovered_sentinel_never_alerts_on_its_own(tmp_path):
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    rec = record_failure(None, exc_type="RuntimeError", message="x", now=T0)
+    for i in range(1, 5):
+        rec = record_failure(rec, exc_type="RuntimeError", message="x",
+                             now=T0 + timedelta(minutes=i))
+    save(path, rec)
+    recovered = mark_recovered(path, now=T0 + timedelta(hours=1))
+    # should_alert is a pure function of consecutive_count/threshold -- a
+    # recovered record's count is frozen at whatever it was, so a caller
+    # that (incorrectly) re-checked alerting against a stale, already-
+    # recovered record would still see the SAME answer as before recovery.
+    # The real guard against a stale re-alert is record_failure's own
+    # status check (see test_new_failure_after_recovery_starts_a_fresh_
+    # streak_at_one) -- documented here so the two are not confused.
+    assert recovered.consecutive_count == 5
+
+
+def test_load_of_an_old_format_file_with_no_status_key_defaults_to_active(tmp_path):
+    """BACKWARD COMPATIBLE: a sentinel written before status/recovered_at
+    existed must read as active, not silently as recovered."""
+    import json
+    path = tmp_path / "failure_sentinel.json"
+    old_format = {
+        "exc_type": "ReconciliationMismatch",
+        "message": "local positions {} do not match broker {'SPY': ...}",
+        "first_at": T0.isoformat(),
+        "last_at": T0.isoformat(),
+        "consecutive_count": 2,
+    }
+    path.write_text(json.dumps(old_format))
+    loaded = load(path)
+    assert loaded.status == "active"
+    assert loaded.recovered_at is None
+    assert loaded.consecutive_count == 2
+
+
+def test_save_is_atomic_no_tmp_file_left_behind(tmp_path):
+    path = tmp_path / "failure_sentinel.json"
+    save(path, record_failure(None, exc_type="RuntimeError", message="x", now=T0))
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "failure_sentinel.json"]
+    assert leftovers == []

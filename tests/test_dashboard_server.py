@@ -674,3 +674,60 @@ def test_an_options_preflight_on_an_unknown_path_still_returns_204(tmp_path):
         assert resp.status == 204
     finally:
         _stop(server, thread)
+
+
+# ------------------------------------------------ broker_state_refresh_fn
+# (overnight-hardening unit, 2026-08-13): the "captured once at startup,
+# stale forever" fix -- see DashboardRuntime.broker_state_refresh_fn's own
+# docstring.
+
+def _account(**over):
+    kw = dict(account_id=ACCT, equity=Decimal("500"), cash=Decimal("500"),
+             settled_cash=Decimal("500"), unsettled_cash=Decimal("0"),
+             buying_power=Decimal("500"), multiplier=Decimal("1"),
+             pattern_day_trader=False, day_trade_count=0, fetched_at=T0)
+    kw.update(over)
+    return AccountSnapshot(**kw)
+
+
+def test_get_api_state_calls_broker_state_refresh_fn_when_set(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        return _account(settled_cash=Decimal("123.45")), (), None, None
+
+    runtime.broker_state_refresh_fn = refresh
+    result = route_request(runtime, method="GET", path="/api/state")
+    payload = json.loads(result.body)
+    assert len(calls) == 1
+    assert payload["risk_gates"]["settled_cash_usd"] == 123.45
+
+
+def test_get_api_state_calls_refresh_fn_again_on_a_second_request(tmp_path):
+    """Proves the refresh is per-request, not a one-shot cache -- a value
+    that changes between two polls must be visible on the second one."""
+    runtime, _ = make_runtime(tmp_path)
+    readings = iter([Decimal("100.00"), Decimal("200.00")])
+
+    def refresh():
+        return _account(settled_cash=next(readings)), (), None, None
+
+    runtime.broker_state_refresh_fn = refresh
+    first = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    second = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert first["risk_gates"]["settled_cash_usd"] == 100.0
+    assert second["risk_gates"]["settled_cash_usd"] == 200.0
+
+
+def test_get_api_state_with_no_refresh_fn_keeps_old_one_shot_behavior(tmp_path):
+    """`broker_state_refresh_fn=None` (the field's own default) must behave
+    EXACTLY like before this unit -- whatever was set on `runtime.
+    broker_account` at construction is what /api/state reports, unchanged
+    by any request."""
+    runtime, _ = make_runtime(tmp_path)
+    runtime.broker_account = _account(settled_cash=Decimal("77.00"))
+    assert runtime.broker_state_refresh_fn is None
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["risk_gates"]["settled_cash_usd"] == 77.0

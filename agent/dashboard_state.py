@@ -25,7 +25,7 @@ rather than reaching for a broker connection itself.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -55,6 +55,27 @@ _NO_RECONCILE_HISTORY = (
     "only (reconcile_settled_cash/positions/open_orders) -- there is no "
     "persisted 'last reconciliation result' store to read from"
 )
+
+# BROKER-STATE PROVENANCE (overnight-hardening unit, 2026-08-13). See
+# agent/diagnostics.py's own module docstring for why this codebase now
+# distinguishes "checked, and it's fine" from "I don't know" everywhere a
+# figure could otherwise be presented as more current than it actually is.
+# `broker_account.fetched_at` (agent/broker/base.py's own field, set by
+# whichever adapter -- SimulatorBroker or AlpacaPaperAdapter -- actually
+# performed the read) is the ONE piece of provenance this codebase already
+# carries for a broker snapshot; every broker-derived risk_gates field below
+# now surfaces it as `<field>_observed_at` and `<field>_is_stale`, computed
+# against this threshold, rather than silently presenting a number with no
+# indication of how current it is. 15 minutes, not runtime_status.py's own
+# 25-hour DEFAULT_STALE_AFTER: that threshold answers "has ANYTHING checked
+# this account since yesterday," a much coarser question than "is this
+# specific dollar figure on my screen right now still trustworthy." Since
+# `scripts/run_dashboard.py`'s `broker_state_refresh_fn` (broker-state-
+# provenance unit, 2026-08-13) now re-reads on every GET /api/state rather
+# than once at process startup, `_is_stale` should read False on essentially
+# every real request; it exists as an honest signal for the case a refresh
+# itself just failed and the caller is looking at the last successful read.
+_BROKER_SNAPSHOT_STALE_AFTER = timedelta(minutes=15)
 
 
 def _null(reason: str) -> dict:
@@ -131,6 +152,9 @@ def build_dashboard_state(
         "minimum_settled_cash_pct_of_nlv": config.minimum_settled_cash_pct_of_nlv,
         "minimum_absolute_settled_cash": config.minimum_absolute_settled_cash,
     }
+    _BROKER_DERIVED_FIELDS = ("current_reserve_pct", "required_reserve_usd",
+                             "investable_cash_usd", "settled_cash_usd",
+                             "unsettled_cash_usd", "nlv_usd")
     if broker_account is not None:
         portfolio = PortfolioState(
             account_id=account_id or broker_account.account_id,
@@ -160,12 +184,25 @@ def build_dashboard_state(
             # risk_gates field this could reuse without misrepresenting it).
             **_prefixed("nlv_usd", _present(float(broker_account.equity))),
         })
+        # BROKER-STATE PROVENANCE (overnight-hardening unit, 2026-08-13):
+        # see this module's own _BROKER_SNAPSHOT_STALE_AFTER docstring.
+        # `broker_account.fetched_at` is naive-safe here -- agent.broker.base
+        # already requires every adapter to set it from a real, tz-aware
+        # `now`, matching `now` (this function's own required param) closely
+        # enough that this is never a cross-timezone comparison bug.
+        is_stale = (now - broker_account.fetched_at) > _BROKER_SNAPSHOT_STALE_AFTER
+        for name in _BROKER_DERIVED_FIELDS:
+            risk_gates[f"{name}_observed_at"] = broker_account.fetched_at.isoformat()
+            risk_gates[f"{name}_is_stale"] = is_stale
+        risk_gates["broker_snapshot_source"] = "live_broker_read"
     else:
-        for name in ("current_reserve_pct", "required_reserve_usd", "investable_cash_usd",
-                     "settled_cash_usd", "unsettled_cash_usd", "nlv_usd"):
+        for name in _BROKER_DERIVED_FIELDS:
             risk_gates.update(_prefixed(name, _null(
                 "no broker_account was supplied to build_dashboard_state for this cycle"
             )))
+            risk_gates[f"{name}_observed_at"] = None
+            risk_gates[f"{name}_is_stale"] = None
+        risk_gates["broker_snapshot_source"] = None
 
     # DASHBOARD FIX (2026-08-12): `broker_positions` is a separate parameter
     # from `broker_account` (its own default of `()`, never None) -- so

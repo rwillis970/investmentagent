@@ -255,6 +255,7 @@ the full reasoning on each):
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import logging
 import subprocess
@@ -297,7 +298,9 @@ from agent.money import to_decimal
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.pipeline import Gatekeeper
 from agent.pipeline_stage import PipelineRuntime
-from agent.run_loop import AccountRuntime, run_loop as real_run_loop
+from agent.run_loop import (AccountRuntime, in_session_now,
+                            seconds_until_next_session_open, run_loop as real_run_loop)
+from agent import runtime_status as runtime_status_module
 from agent.secrets_provider import KeychainSecretsProvider, SecretsProvider
 from agent.startup import _reconcile_mode_persistence
 from agent.store import FactStore
@@ -324,6 +327,18 @@ def _default_notify(message: str) -> None:
         )
     except Exception:
         pass
+
+
+def _session_state_for_runtime_status(now: datetime) -> tuple[str, datetime | None]:
+    """`"OPEN"`/`"CLOSED"` + next-open, for `RuntimeStatus.market_session_
+    state`/`.next_session_open` -- reuses `agent.run_loop.in_session_now`/
+    `seconds_until_next_session_open` directly (this script already imports
+    `agent.run_loop` for the real loop itself, so unlike `agent.
+    diagnostics`'s own deliberately-narrow `_in_session` reimplementation,
+    there is no import-graph reason to avoid it here)."""
+    if in_session_now(now):
+        return "OPEN", None
+    return "CLOSED", now + timedelta(seconds=seconds_until_next_session_open(now))
 
 
 def _resolve_gatekeeper_signing_key(secrets_provider: SecretsProvider,
@@ -1037,6 +1052,12 @@ _DEFAULT_STORE_FILENAMES = {
     "cash_quarantine_store_path": "cash_quarantine.jsonl",
     "mode_store_path": "mode_state.jsonl",
     "audit_log_path": "audit.jsonl",
+    # overnight-hardening unit, 2026-08-13: see `_on_cycle_success`'s own
+    # runtime_status write, below -- this is the SAME file `scripts/
+    # diagnose_runtime.py` writes with `source="diagnostic"`; a real cycle
+    # writes it with `source="cycle"` instead, the stronger of the two
+    # producers (see agent/runtime_status.py's own TWO PRODUCERS section).
+    "runtime_status_path": "runtime_status.json",
 }
 
 
@@ -1107,12 +1128,31 @@ def _check_data_dir_sanity(data_dir: Path, *, account_id: str) -> None:
     A sibling that is not a directory, has none of {ledger.jsonl,
     mode_state.jsonl, audit.jsonl}, or agrees with `account_id` (or has no
     account_id of its own recorded yet) is not a conflict. Only a sibling
-    that positively records a DIFFERENT account_id trips this."""
+    that positively records a DIFFERENT account_id trips this.
+
+    ARCHIVED SIBLINGS ARE EXEMPT (overnight-hardening unit, found on the
+    real Mac the night this guard first shipped: `state/` was archived to
+    `state-archive-2026-07-31/` per deploy/README.md's own CANONICAL
+    DIRECTORY section specifically so nothing would silently default into
+    it again -- but archiving only renames a directory; the old account's
+    history is still sitting inside it, so this guard, as first written,
+    flagged the ARCHIVE ITSELF as a conflicting sibling forever, on every
+    single startup, defeating the archive's whole purpose and leaving
+    `failure_sentinel.json` permanently populated with a `DataDirConflict`
+    no restart could ever clear. A directory name matching the
+    `state-archive-*`/`*-archive-*` convention this codebase itself uses
+    (see `.gitignore`) is deliberately, by construction, set-aside history,
+    not an ambiguous "also in use" candidate -- excluded here by name, not
+    by content, so an operator does not have to also scrub account_ids out
+    of a directory whose entire point is preserving them unchanged."""
     parent = data_dir.parent
     if not parent.is_dir():
         return
     for sibling in sorted(parent.iterdir()):
         if sibling.resolve() == data_dir.resolve() or not sibling.is_dir():
+            continue
+        if fnmatch.fnmatch(sibling.name, "*-archive-*") or fnmatch.fnmatch(
+                sibling.name, "*-archive"):
             continue
         sibling_ids = _account_ids_in(sibling)
         conflicting = sibling_ids - {account_id}
@@ -1229,6 +1269,13 @@ def _parse_args(argv: list[str] | None):
                         help="durable AuditLog file -- survives a restart, fsynced on every "
                              "append (see agent/audit.py's own docstring for why); defaults "
                              "to <data-dir>/audit.jsonl")
+    parser.add_argument("--runtime-status-path",
+                        help="durable agent.runtime_status.RuntimeStatus snapshot -- written "
+                             "with source=\"cycle\" after every successful cycle (overnight-"
+                             "hardening unit, 2026-08-13; see _on_cycle_success's own comment) "
+                             "and consumed by the dashboard's broker-state provenance fields. "
+                             "Defaults to <data-dir>/runtime_status.json -- the SAME file "
+                             "scripts/diagnose_runtime.py writes with source=\"diagnostic\".")
     parser.add_argument("--advance-mode-to", choices=list(mode_fsm.MODES), default=None,
                         help="advance the PERSISTED mode one legal §9.2 step, with no "
                              "broker adapter and no account reconciliation, then exit -- "
@@ -1542,12 +1589,71 @@ def main(argv: list[str] | None = None, *,
                     # notification must never mask the recovery itself or
                     # change this function's own exit code.
                     log.warning("recovery notification itself failed: %s", notify_exc)
-            failure_sentinel.clear(sentinel_path)
+            # overnight-hardening unit, 2026-08-13: mark_recovered (status
+            # flip + recovered_at), not clear() (delete) -- so the dashboard
+            # and data/runtime_status.json still have the last incident's
+            # exc_type/consecutive_count/recovered_at to show, rather than a
+            # file that simply stopped existing with no trace of what it
+            # used to say. See agent/failure_sentinel.py's own module
+            # docstring, ACTIVE VS. RECOVERED.
+            failure_sentinel.mark_recovered(sentinel_path, now=report.now)
         except Exception as sentinel_exc:   # noqa: BLE001 -- best-effort
             # operational convenience, same posture as the failure-side
             # sentinel bookkeeping in the except-block below.
             log.warning("failure sentinel recovery bookkeeping itself failed: %s",
                        sentinel_exc)
+
+        # RUNTIME_STATUS, source="cycle" (overnight-hardening unit,
+        # 2026-08-13). This is the ONLY producer of that source value in
+        # this codebase (scripts/diagnose_runtime.py writes the same file
+        # with source="diagnostic" -- see agent/runtime_status.py's own TWO
+        # PRODUCERS section for why the two must never be conflated). Every
+        # field below is read straight off `report` -- the CycleReport a
+        # REAL run_cycle just produced -- never recomputed independently:
+        # `report.reconciliations` already reflects a cycle that completed
+        # without raising a ReconciliationMismatch/PostureMismatch/
+        # CrossAccountError, so positions/settled-cash/open-orders/day-
+        # trades all genuinely reconciled (or, for positions/cash, were
+        # quarantined for operator review rather than silently accepted --
+        # this script's own sync_fills/sync_cash_events wiring, unaffected
+        # by this write). Best-effort, same posture as the sentinel
+        # bookkeeping just above: a failure here must never mask, or change
+        # the exit code of, a cycle that otherwise genuinely succeeded.
+        try:
+            recon = report.reconciliations[0] if report.reconciliations else None
+            if recon is not None:
+                session_state, next_open = _session_state_for_runtime_status(report.now)
+                status = runtime_status_module.RuntimeStatus(
+                    generated_at=report.now, account_id=recon.account_id,
+                    mode=report.result.mode, process_status="running",
+                    source="cycle",
+                    market_session_state=session_state, next_session_open=next_open,
+                    broker_snapshot_status="PASS", broker_snapshot_at=report.now,
+                    reconciliation_status="PASS", reconciliation_at=report.now,
+                    positions_reconciled=True, cash_reconciled=True,
+                    open_orders_reconciled=True,
+                    last_successful_cycle_at=report.now,
+                    last_failure_at=None, last_failure_type=None, recovered_at=None,
+                    collection_last_success_at=(
+                        report.pipeline_result.last_collected_at
+                        if report.pipeline_result is not None else None
+                    ),
+                    screen_last_success_at=(
+                        report.pipeline_result.last_screened_at
+                        if report.pipeline_result is not None else None
+                    ),
+                    unavailable_reasons={} if report.pipeline_result is not None else {
+                        "collection_last_success_at": "no pipeline was attached to this cycle",
+                        "screen_last_success_at": "no pipeline was attached to this cycle",
+                    },
+                )
+                runtime_status_module.write_atomic(args.runtime_status_path, status)
+        except Exception as status_exc:   # noqa: BLE001 -- best-effort,
+            # same posture as every other bookkeeping block in this
+            # function; runtime_status.json is explicitly NOT an audit
+            # replacement (see its own module docstring) and losing one
+            # write here must never be treated as the cycle itself failing.
+            log.warning("runtime_status write itself failed: %s", status_exc)
 
     try:
         # Runtime-recovery unit (2026-08-13): the data-dir sanity guard

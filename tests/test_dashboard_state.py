@@ -354,3 +354,66 @@ def test_deferred_approvals_is_always_an_empty_list_no_mechanism_exists_yet(tmp_
         approval_request_store=store, audit_log=audit, account_id=ACCT,
     )
     assert state["approvals"]["deferred"] == []
+
+
+# ----------------------------------------------- broker-state provenance
+# (overnight-hardening unit, 2026-08-13): every broker-derived risk_gates
+# field must carry a value, a source, an observed_at, and a staleness flag
+# -- see agent/dashboard_state.py's own _BROKER_SNAPSHOT_STALE_AFTER
+# docstring for the full reasoning.
+
+def test_broker_derived_fields_carry_observed_at_and_source_when_supplied(tmp_path):
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    account = _account_snapshot(fetched_at=T0)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, broker_account=account,
+    )
+    rg = state["risk_gates"]
+    assert rg["settled_cash_usd_observed_at"] == T0.isoformat()
+    assert rg["settled_cash_usd_is_stale"] is False
+    assert rg["nlv_usd_observed_at"] == T0.isoformat()
+    assert rg["current_reserve_pct_observed_at"] == T0.isoformat()
+    assert rg["broker_snapshot_source"] == "live_broker_read"
+
+
+def test_broker_derived_fields_report_stale_past_the_threshold(tmp_path):
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    stale_fetch = T0 - timedelta(minutes=20)
+    account = _account_snapshot(fetched_at=stale_fetch)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, broker_account=account,
+    )
+    rg = state["risk_gates"]
+    assert rg["settled_cash_usd_observed_at"] == stale_fetch.isoformat()
+    assert rg["settled_cash_usd_is_stale"] is True
+    assert rg["nlv_usd_is_stale"] is True
+
+
+def test_broker_derived_fields_not_stale_just_under_the_threshold(tmp_path):
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    fresh_fetch = T0 - timedelta(minutes=14)
+    account = _account_snapshot(fetched_at=fresh_fetch)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit, broker_account=account,
+    )
+    assert state["risk_gates"]["settled_cash_usd_is_stale"] is False
+
+
+def test_broker_derived_provenance_is_null_with_no_broker_account_supplied(tmp_path):
+    cfg = _cfg()
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+    )
+    rg = state["risk_gates"]
+    assert rg["settled_cash_usd_observed_at"] is None
+    assert rg["settled_cash_usd_is_stale"] is None
+    assert rg["nlv_usd_observed_at"] is None
+    assert rg["broker_snapshot_source"] is None

@@ -108,6 +108,23 @@ class DashboardRuntime:
     ledger: Ledger | None = None
     credential_preflight: dict = field(default_factory=dict)
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+    # BROKER-STATE PROVENANCE (overnight-hardening unit, 2026-08-13). Before
+    # this unit, `broker_account`/`broker_positions`/`day_trade_guard`/
+    # `ledger` above were populated ONCE, at process startup (scripts.
+    # run_dashboard.build_dashboard_runtime's own one-time
+    # `_build_broker_state` call), then served unchanged for the entire
+    # life of a long-running dashboard process -- a real, found staleness
+    # gap (fact #4 in the overnight-unit request that opened this unit: the
+    # dashboard was not even receiving a snapshot in some real deployments,
+    # and even when it was, it never got fresher). `broker_state_refresh_fn`,
+    # when set, is called by `route_request`'s own `GET /api/state` handler
+    # BEFORE every read -- see that call site's own comment for exactly
+    # what it does and does not do. `None` (this field's own default)
+    # preserves the OLD one-shot behavior exactly, for any caller/test that
+    # never sets it -- this is purely additive, not a required rewiring.
+    broker_state_refresh_fn: Callable[
+        [], tuple["AccountSnapshot | None", "tuple[Position, ...]",
+                 "DayTradeGuard | None", "Ledger | None"]] | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +148,21 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
     now = runtime.now_fn()
 
     if method == "GET" and path == "/api/state":
+        # BROKER-STATE PROVENANCE (overnight-hardening unit, 2026-08-13):
+        # re-read broker state on THIS request, if a refresh function was
+        # wired -- see DashboardRuntime.broker_state_refresh_fn's own
+        # docstring for why (closes the "captured once at process startup,
+        # stale forever after" gap). Deliberately NOT wrapped in a try/
+        # except here: `scripts.run_dashboard._build_broker_state`, the one
+        # real function ever passed as this callback, already documents
+        # "never raises: any failure ... returns the same (None, (), None,
+        # None) quadruple" -- so a broker-side failure already surfaces as
+        # an honest null read, not an exception this route needs to guard
+        # against separately. A refresh_fn that DOES raise is a bug in that
+        # callback, not something this route should paper over.
+        if runtime.broker_state_refresh_fn is not None:
+            (runtime.broker_account, runtime.broker_positions,
+            runtime.day_trade_guard, runtime.ledger) = runtime.broker_state_refresh_fn()
         state = build_dashboard_state(
             now=now, config=runtime.config, cost_ledger=runtime.cost_ledger,
             opportunity_tracker=runtime.opportunity_tracker,

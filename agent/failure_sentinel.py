@@ -17,7 +17,38 @@ DELIBERATELY NOT append-only, unlike every other durable store in this
 codebase (`ModeStore`/`LedgerStore`/`AuditLog`). This is disposable
 operational state -- what failed last time, and how many times in a row --
 not evidence anything downstream needs a permanent history of; overwriting
-it on every save is the right choice, not an oversight.
+it on every save is the right choice, not an oversight. The permanent
+record of what actually happened, when, lives in `AuditLog` (durable,
+hash-chained, append-only) -- this file is never that, and nothing here
+ever removes or edits an audit row.
+
+ACTIVE VS. RECOVERED (overnight-hardening unit, 2026-08-13). Real defect
+found running this on the real Mac: a `DataDirConflict` (since fixed -- see
+`scripts/run_agent.py::_check_data_dir_sanity`'s own archived-sibling
+exemption) wrote a sentinel record, and then the process outside a trading
+session for hours afterward -- `agent.run_loop.run_loop` correctly never
+calls `run_cycle` outside a session, so `on_cycle_success` (the ONLY thing
+that used to clear this file, via `clear()`) never fired. The process was
+genuinely healthy; the sentinel had no way to say so. `FailureRecord` now
+carries `status` (`"active"` or `"recovered"`) and `recovered_at`
+(`None` while active). `mark_recovered` flips `status` without discarding
+`exc_type`/`message`/`first_at`/`last_at`/`consecutive_count` -- an operator
+(or the dashboard) can still see exactly what the LAST failure was and when
+it cleared, not just that nothing is wrong right now. `record_failure` only
+extends a streak when the prior record is still ACTIVE and matches
+`exc_type`; a new failure arriving after a recovery -- even the identical
+exception type -- starts a fresh streak at 1, never silently reattaching to
+an incident that was already closed out. `clear()` (delete the file
+outright) still exists for a caller that genuinely wants "nothing on
+record" rather than "the last thing on record was resolved" -- but the two
+call sites that used to call it (`scripts/run_agent.py`'s cycle-success
+hook, and the new read-only diagnostic's own recovery marking -- see
+`agent/diagnostics.py`) now call `mark_recovered` instead, specifically so
+the dashboard and `data/runtime_status.json` have something to show besides
+a missing file. BACKWARD COMPATIBLE: `load()` on an old-format file with no
+`status`/`recovered_at` keys defaults them to `"active"`/`None` -- an
+untouched sentinel from before this change reads exactly as it always did,
+an active failure, not a silently-recovered one.
 
 `save` CREATES ITS OWN PARENT DIRECTORY (real gap found running the loop
 for the first time): unlike `ModeStore`/`LedgerStore`/`AuditLog`, which
@@ -45,9 +76,14 @@ longer part of what determines recurrence."""
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
+
+
+ACTIVE = "active"
+RECOVERED = "recovered"
 
 
 @dataclass(frozen=True)
@@ -57,20 +93,38 @@ class FailureRecord:
     first_at: datetime
     last_at: datetime
     consecutive_count: int
+    # overnight-hardening unit, 2026-08-13 -- see module docstring's ACTIVE
+    # VS. RECOVERED section. Defaults preserve every existing call site
+    # (tests, scripts/run_agent.py's own construction sites) that built a
+    # FailureRecord before these fields existed.
+    status: str = ACTIVE
+    recovered_at: datetime | None = None
 
 
 def record_failure(prior: FailureRecord | None, *, exc_type: str, message: str,
                    now: datetime) -> FailureRecord:
-    """The same `exc_type` as `prior` extends the streak (increments
-    `consecutive_count`, keeps `first_at`, updates `message` to this
-    occurrence's) -- regardless of whether `message` itself matches;
-    anything else -- a different `exc_type`, or no prior record at all --
-    starts a fresh one at count 1. See module docstring for why exception
-    type, not message text, is the recurrence key: `type(exc).__name__` is
-    exactly what scripts/run_agent.py already has in hand alongside
-    `str(exc)`, and it is stable across restarts in a way an interpolated
-    message (a timestamp, a request id, a dollar figure) is not."""
-    if prior is not None and prior.exc_type == exc_type:
+    """The same `exc_type` as an ACTIVE `prior` extends the streak
+    (increments `consecutive_count`, keeps `first_at`, updates `message` to
+    this occurrence's) -- regardless of whether `message` itself matches;
+    anything else -- a different `exc_type`, no prior record at all, OR a
+    prior record that is already RECOVERED -- starts a fresh one at count 1.
+    See module docstring for why exception type, not message text, is the
+    recurrence key: `type(exc).__name__` is exactly what scripts/
+    run_agent.py already has in hand alongside `str(exc)`, and it is stable
+    across restarts in a way an interpolated message (a timestamp, a
+    request id, a dollar figure) is not.
+
+    THE RECOVERED CHECK (overnight-hardening unit, 2026-08-13) is what makes
+    "new failure after recovery becomes active again, fresh streak" true: a
+    prior record whose `status` is already RECOVERED represents a CLOSED
+    incident -- a new failure of the identical exc_type arriving later is a
+    new incident that happens to look the same, not a continuation of one
+    an operator already got a recovery notification for. Without this
+    check, `should_alert`'s own `== threshold` logic (fires exactly once
+    per crossing) would never fire again for a repeat-offender exc_type,
+    because the reattached streak would already be past `threshold` from
+    the first incident."""
+    if prior is not None and prior.status == ACTIVE and prior.exc_type == exc_type:
         return replace(prior, message=message, last_at=now,
                       consecutive_count=prior.consecutive_count + 1)
     return FailureRecord(exc_type=exc_type, message=message, first_at=now,
@@ -103,17 +157,46 @@ def should_alert(record: FailureRecord, *, threshold: int = 3,
 
 
 def load(path: str | Path) -> FailureRecord | None:
+    """BACKWARD COMPATIBLE (overnight-hardening unit, 2026-08-13): a file
+    written before `status`/`recovered_at` existed has neither key --
+    `.get(..., ACTIVE)`/`.get(..., None)` read those as "active, never
+    recovered," exactly what an old-format file always meant before this
+    change, not a silently-invented recovery."""
     p = Path(path)
     if not p.exists():
         return None
     d = json.loads(p.read_text())
+    recovered_at = d.get("recovered_at")
     return FailureRecord(
         exc_type=d["exc_type"],
         message=d["message"],
         first_at=datetime.fromisoformat(d["first_at"]),
         last_at=datetime.fromisoformat(d["last_at"]),
         consecutive_count=d["consecutive_count"],
+        status=d.get("status", ACTIVE),
+        recovered_at=datetime.fromisoformat(recovered_at) if recovered_at else None,
     )
+
+
+def mark_recovered(path: str | Path, *, now: datetime) -> FailureRecord | None:
+    """The RECOVERY half (overnight-hardening unit, 2026-08-13; see module
+    docstring's ACTIVE VS. RECOVERED section) -- replaces `clear()` at both
+    of this codebase's real call sites (`scripts/run_agent.py`'s cycle-
+    success hook, `agent/diagnostics.py`'s own all-PASS path). Returns
+    `None`, and writes nothing, if there is no sentinel to recover FROM (a
+    process that has never failed) -- a safe no-op, matching `clear()`'s own
+    no-op-if-missing behaviour. If the loaded record is already RECOVERED,
+    this is idempotent: `recovered_at` is NOT bumped to `now` a second time,
+    preserving the actual moment recovery happened rather than the moment
+    it was last re-observed."""
+    prior = load(path)
+    if prior is None:
+        return None
+    if prior.status == RECOVERED:
+        return prior
+    record = replace(prior, status=RECOVERED, recovered_at=now)
+    save(path, record)
+    return record
 
 
 def save(path: str | Path, record: FailureRecord) -> None:
@@ -129,13 +212,25 @@ def save(path: str | Path, record: FailureRecord) -> None:
     directory that a fresh install hasn't created yet doesn't exist is
     self-defeating -- it silently disables the one mechanism meant to
     surface exactly this kind of problem, at exactly the moment (a fresh
-    install) it's most likely to be needed."""
+    install) it's most likely to be needed.
+
+    ATOMIC WRITE (overnight-hardening unit, 2026-08-13): write-to-temp-then-
+    `os.replace` -- same technique as `agent/runtime_status.py`'s own
+    atomic write, applied here too, since this file is read by an operator
+    (and, from tonight, the read-only diagnostic) precisely at the moments
+    a process might be crashing -- exactly when a plain truncating write is
+    most likely to be interrupted mid-write and leave behind unparseable
+    JSON, defeating the one file whose entire job is being readable during
+    a failure."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     d = asdict(record)
     d["first_at"] = record.first_at.isoformat()
     d["last_at"] = record.last_at.isoformat()
-    p.write_text(json.dumps(d))
+    d["recovered_at"] = record.recovered_at.isoformat() if record.recovered_at else None
+    tmp = p.with_suffix(p.suffix + f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(d))
+    os.replace(tmp, p)
 
 
 def clear(path: str | Path) -> None:

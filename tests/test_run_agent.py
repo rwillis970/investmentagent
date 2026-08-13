@@ -15,7 +15,9 @@ import types
 from datetime import datetime, timedelta, timezone
 
 from agent import config as config_module
+from agent import failure_sentinel
 from agent import mode as mode_fsm
+from agent import runtime_status as runtime_status_module
 from agent.accounts import BrokerCredentials
 from agent.audit import AuditLog
 from agent.cash_event_quarantine import ADMITTED as CASH_ADMITTED
@@ -442,6 +444,7 @@ def _argv(tmp_path, config_path):
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
+        "--runtime-status-path", str(tmp_path / "runtime_status.json"),
     ]
 
 
@@ -617,8 +620,19 @@ def test_recovering_after_a_notified_failure_streak_sends_a_recovery_notificatio
     assert "RuntimeError" in recovery_message   # exc_type, not the message text
     assert "3" in recovery_message
 
+    # overnight-hardening unit, 2026-08-13: the sentinel is no longer
+    # deleted on recovery (failure_sentinel.clear) -- it is marked
+    # RECOVERED in place (failure_sentinel.mark_recovered), so the
+    # dashboard/runtime_status still have the last incident's exc_type,
+    # consecutive_count and recovered_at to show, not a file that simply
+    # stopped existing.
     sentinel_path = tmp_path / "failure_sentinel.json"
-    assert not sentinel_path.exists()
+    assert sentinel_path.exists()
+    recovered = failure_sentinel.load(sentinel_path)
+    assert recovered.status == "recovered"
+    assert recovered.recovered_at == recovered_at
+    assert recovered.exc_type == "RuntimeError"
+    assert recovered.consecutive_count == 3
 
 
 def test_recovering_after_a_single_non_alerting_failure_sends_no_recovery_notification(tmp_path):
@@ -651,8 +665,130 @@ def test_recovering_after_a_single_non_alerting_failure_sends_no_recovery_notifi
     assert code == 0
     assert notified == []   # still no notification -- never alerted, nothing to recover from
 
+    # overnight-hardening unit, 2026-08-13: still marked RECOVERED in place
+    # (not deleted) even though it never alerted -- the next failure of any
+    # type still starts a fresh streak, which is the property this test's
+    # docstring actually cares about; see agent.failure_sentinel.
+    # record_failure's own RECOVERED check.
     sentinel_path = tmp_path / "failure_sentinel.json"
-    assert not sentinel_path.exists()
+    assert sentinel_path.exists()
+    recovered = failure_sentinel.load(sentinel_path)
+    assert recovered.status == "recovered"
+    assert recovered.recovered_at == recovered_at
+
+
+def _succeeding_run_loop_with_full_report(now, *, account_id="acct-a", mode="PAPER",
+                                          pipeline_result=None):
+    """A fuller fake than `_succeeding_run_loop_calling_on_cycle_success`
+    above -- that one's bare `SimpleNamespace(now=now)` is exactly why the
+    existing recovery-notification tests never exercised the runtime_status
+    write below (it degrades to a caught, logged no-op against a report
+    with no `.reconciliations`/`.result`/`.pipeline_result` at all).
+    `.reconciliations` here carries just enough of a real `agent.startup.
+    AccountReconciliation`'s shape (`.account_id`) for `_on_cycle_success`'s
+    own runtime_status block to read from -- overnight-hardening unit,
+    2026-08-13."""
+    def run_loop_fn(**kwargs):
+        on_cycle_success = kwargs["on_cycle_success"]
+        recon = types.SimpleNamespace(account_id=account_id)
+        result = types.SimpleNamespace(mode=mode)
+        fake_report = types.SimpleNamespace(
+            now=now, reconciliations=(recon,), result=result,
+            pipeline_result=pipeline_result,
+        )
+        on_cycle_success(fake_report)
+    return run_loop_fn
+
+
+def test_a_successful_cycle_writes_runtime_status_with_source_cycle(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    now = datetime(2026, 8, 13, 15, 0, tzinfo=timezone.utc)
+
+    code = main(
+        _argv(tmp_path, config_path),
+        run_loop_fn=_succeeding_run_loop_with_full_report(now),
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=lambda msg: None,
+    )
+    assert code == 0
+
+    status = runtime_status_module.read(tmp_path / "runtime_status.json")
+    assert status is not None
+    assert status.source == "cycle"
+    assert status.account_id == "acct-a"
+    assert status.mode == "PAPER"
+    assert status.generated_at == now
+    assert status.broker_snapshot_status == "PASS"
+    assert status.reconciliation_status == "PASS"
+    assert status.positions_reconciled is True
+    assert status.cash_reconciled is True
+    assert status.open_orders_reconciled is True
+    assert status.last_successful_cycle_at == now
+
+
+def test_a_successful_cycle_with_no_pipeline_marks_collection_screen_unavailable(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    now = datetime(2026, 8, 13, 15, 0, tzinfo=timezone.utc)
+
+    main(
+        _argv(tmp_path, config_path),
+        run_loop_fn=_succeeding_run_loop_with_full_report(now, pipeline_result=None),
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=lambda msg: None,
+    )
+    status = runtime_status_module.read(tmp_path / "runtime_status.json")
+    assert status.collection_last_success_at is None
+    assert status.screen_last_success_at is None
+    assert "collection_last_success_at" in status.unavailable_reasons
+    assert "screen_last_success_at" in status.unavailable_reasons
+
+
+def test_a_successful_cycle_with_a_pipeline_result_reads_real_collection_screen_timestamps(
+        tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    now = datetime(2026, 8, 13, 15, 0, tzinfo=timezone.utc)
+    collected_at = now - timedelta(minutes=5)
+    screened_at = now - timedelta(minutes=2)
+    pipeline_result = types.SimpleNamespace(
+        last_collected_at=collected_at, last_screened_at=screened_at,
+    )
+
+    main(
+        _argv(tmp_path, config_path),
+        run_loop_fn=_succeeding_run_loop_with_full_report(now, pipeline_result=pipeline_result),
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=lambda msg: None,
+    )
+    status = runtime_status_module.read(tmp_path / "runtime_status.json")
+    assert status.collection_last_success_at == collected_at
+    assert status.screen_last_success_at == screened_at
+    assert status.unavailable_reasons == {}
+
+
+def test_runtime_status_write_failure_never_changes_the_cycle_exit_code(tmp_path, monkeypatch):
+    """Best-effort, same posture as the sentinel bookkeeping right above it
+    in _on_cycle_success -- a broken runtime_status write must never mask a
+    cycle that otherwise genuinely succeeded."""
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    now = datetime(2026, 8, 13, 15, 0, tzinfo=timezone.utc)
+
+    def _boom(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(run_agent_module.runtime_status_module, "write_atomic", _boom)
+    code = main(
+        _argv(tmp_path, config_path),
+        run_loop_fn=_succeeding_run_loop_with_full_report(now),
+        secrets_provider_factory=_secrets_provider_factory,
+        notify_fn=lambda msg: None,
+    )
+    assert code == 0
 
 
 def test_a_successful_cycle_with_no_prior_failure_history_is_a_silent_no_op(tmp_path):
@@ -1399,6 +1535,7 @@ def test_data_dir_is_never_created_when_every_store_path_is_given_explicitly(tmp
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.jsonl"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
+        "--runtime-status-path", str(tmp_path / "runtime_status.json"),
     ])
     assert not (tmp_path / "data").exists()
 
@@ -1764,6 +1901,34 @@ def test_data_dir_sanity_refuses_when_a_sibling_records_a_different_account(tmp_
     import pytest
     with pytest.raises(DataDirConflict, match="acct-OTHER"):
         _check_data_dir_sanity(data_dir, account_id="acct-a")
+
+
+def test_data_dir_sanity_exempts_an_archived_sibling_by_name(tmp_path):
+    """The real defect found overnight, 2026-08-13: `state/` was archived to
+    `state-archive-2026-07-31/` specifically so nothing would silently
+    default into it again -- but the archive still contains the OLD
+    account's real history, so without this exemption the guard flagged the
+    archive itself as a conflicting sibling on every single startup,
+    permanently, defeating the archive's purpose and leaving
+    failure_sentinel.json stuck on a DataDirConflict no restart could ever
+    clear. A directory matching the state-archive-*/ *-archive naming
+    convention must never trip this guard, regardless of what account_id(s)
+    its own history records."""
+    parent = tmp_path / "parent"
+    data_dir = parent / "data"
+    archive = parent / "state-archive-2026-07-31"
+    data_dir.mkdir(parents=True)
+    archive.mkdir()
+    _write_jsonl(archive / "ledger.jsonl", [{"kind": "fill", "account_id": "acct-OTHER"}])
+    _check_data_dir_sanity(data_dir, account_id="acct-a")   # no raise
+
+    # A non-archive-named sibling with the SAME conflicting content still
+    # trips it -- this is a narrow, name-based exemption, not a general
+    # loosening of the guard.
+    also_archive = parent / "old-account-archive"
+    also_archive.mkdir()
+    _write_jsonl(also_archive / "ledger.jsonl", [{"kind": "fill", "account_id": "acct-OTHER"}])
+    _check_data_dir_sanity(data_dir, account_id="acct-a")   # still no raise
 
 
 def test_data_dir_sanity_ignores_a_sibling_with_no_account_id_recorded_yet(tmp_path):

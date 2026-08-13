@@ -46,6 +46,20 @@ THREE CHECKS, ALL MUST PASS:
      itself catches an operator who filled in every flag but forgot to
      replace one value.
 
+PLUGGABLE PARSER (overnight hardening unit, 2026-08-13; LaunchAgent
+installer follow-up). `check_plist` and `_check_parses` both take an
+optional `parse_args_fn`, defaulting to `scripts.run_agent._parse_args`
+for full backward compatibility with every existing caller of this
+module (this file's own CLI below and every test in
+`tests/test_preflight_plist.py` still get the original behavior with no
+changes). This exists because `scripts/install_launchagents.py` renders
+and validates TWO different plists (the reconciliation loop's and the
+dashboard's), each wired to a DIFFERENT script with a DIFFERENT flag
+set (`scripts.run_dashboard._parse_args` accepts `--host`/`--port`,
+which `scripts.run_agent._parse_args` correctly rejects as unrecognized,
+and vice versa for the reconciliation loop's own flags) -- one hardcoded
+parser could only ever validate one of the two plists correctly.
+
 DELIBERATELY DOES NOT TOUCH THE KEYCHAIN (item 2 of this unit's own
 instructions: "It must not require the keychain entry to exist or resolve
 any secret. This runs before load, and a locked keychain is not a plist
@@ -87,12 +101,16 @@ import io
 import plistlib
 import sys
 from pathlib import Path
+from typing import Callable
 from xml.sax.saxutils import escape
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.run_agent import _parse_args  # noqa: E402 -- see sys.path insert above
+# Default parser for check_plist/_check_parses -- see module docstring's
+# "PLUGGABLE PARSER" section for why a caller can override this.
+_DEFAULT_PARSE_ARGS_FN: Callable[[list[str]], object] = _parse_args
 
 # The one flag among _parse_args's own set that takes no following value --
 # see _flag_values's own docstring for why this matters to the pairing.
@@ -234,18 +252,24 @@ def _check_paths(raw_text: str, program_args: list, plist: dict) -> list[str]:
     return failures
 
 
-def _check_parses(program_args: list) -> list[str]:
-    """Check 2: `ProgramArguments[2:]` parse against the real
-    `scripts.run_agent._parse_args` -- see module docstring for why this
-    is safe to call with no keychain access (it never resolves a secret)
-    and why it deliberately runs LAST (its own `--data-dir` defaulting has
-    a real, if idempotent, `mkdir -p` side effect that must not run before
-    `_check_paths` above has already recorded its own, pre-load answer)."""
+def _check_parses(
+    program_args: list,
+    parse_args_fn: Callable[[list[str]], object] = _DEFAULT_PARSE_ARGS_FN,
+) -> list[str]:
+    """Check 2: `ProgramArguments[2:]` parse against `parse_args_fn`
+    (default: the real `scripts.run_agent._parse_args`) -- see module
+    docstring for why this is safe to call with no keychain access (it
+    never resolves a secret) and why it deliberately runs LAST (its own
+    `--data-dir` defaulting has a real, if idempotent, `mkdir -p` side
+    effect that must not run before `_check_paths` above has already
+    recorded its own, pre-load answer). See module docstring's "PLUGGABLE
+    PARSER" section for why a caller can override which script's parser
+    this validates against."""
     argv = program_args[2:]
     stderr_buffer = io.StringIO()
     try:
         with contextlib.redirect_stderr(stderr_buffer):
-            _parse_args(argv)
+            parse_args_fn(argv)
     except SystemExit:
         # argparse's own parser.error() prints a full usage banner ahead of
         # the actual message ("<prog>: error: ..."); an operator wants the
@@ -266,12 +290,20 @@ def _check_parses(program_args: list) -> list[str]:
     return []
 
 
-def check_plist(plist_path: Path) -> list[str]:
+def check_plist(
+    plist_path: Path,
+    parse_args_fn: Callable[[list[str]], object] = _DEFAULT_PARSE_ARGS_FN,
+) -> list[str]:
     """Returns every failure `plist_path` has against the three checks in
     this module's own docstring (empty list == every check passed). Never
     raises for an ordinary bad or unreadable plist -- that is itself
     reported as one failure message, not a traceback -- so a caller (this
     module's own CLI below, or a test) always gets a clean list back.
+
+    `parse_args_fn` defaults to `scripts.run_agent._parse_args` (every
+    existing caller's behavior is unchanged); pass
+    `scripts.run_dashboard._parse_args` to validate a dashboard plist
+    instead -- see module docstring's "PLUGGABLE PARSER" section.
 
     ORDER: placeholders and paths are checked from the plist's own RAW
     text/values FIRST; `_parse_args` (check 2) runs LAST, deliberately --
@@ -301,7 +333,7 @@ def check_plist(plist_path: Path) -> list[str]:
     failures: list[str] = []
     failures += _check_placeholders(raw_text, program_args, plist)
     failures += _check_paths(raw_text, program_args, plist)
-    failures += _check_parses(program_args)
+    failures += _check_parses(program_args, parse_args_fn)
     return failures
 
 

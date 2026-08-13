@@ -44,6 +44,26 @@
   reconcile-loop.plist's own comment for why this template's example
   changed (runtime-recovery unit, 2026-08-13). Point this at the SAME
   absolute path you give that job's own data-dir flag.
+
+  THE KEY ID, SECRET REF, AND SIGNING KEY SECRET REF FLAGS, ADDED
+  (overnight hardening unit, 2026-08-13; DASHBOARD BROKER-STATE
+  PROVENANCE finding). This template previously omitted these three flags
+  entirely, even though scripts/run_dashboard.py has accepted them since
+  Unit 16/17 (2026-08-12). For a deployment where config.json sets broker
+  to "alpaca_paper" (not the "simulator" default), that omission is the
+  most likely real cause of "settled cash, NLV, reserve, and investable
+  cash all report unavailable": with neither flag supplied,
+  agent.broker.selection.select_broker_adapter raises BrokerSelectionError
+  inside scripts.run_dashboard._build_broker_state, which degrades (by
+  design, never crashes) to broker_account=None. An installed copy of the
+  OLD version of this template, silently missing these three flags, would
+  reproduce exactly that symptom on every restart. Filling them in here
+  (the SAME values as the reconcile-loop job's own key id, secret ref, and
+  signing key secret ref flags; see scripts/install_launchagents.py, which
+  renders both plists from the SAME parameters for exactly this reason)
+  closes that gap. Harmless for the broker "simulator" default
+  (scripts/run_dashboard.py's own docstring: unused and optional for that
+  default).
 -->
 <plist version="1.0">
 <dict>
@@ -58,6 +78,12 @@
         <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/config.json</string>
         <string>--account-id</string>
         <string>REPLACE_WITH_ACCOUNT_ID</string>
+        <string>--key-id</string>
+        <string>REPLACE_WITH_ALPACA_PAPER_KEY_ID</string>
+        <string>--secret-ref</string>
+        <string>REPLACE_WITH_KEYCHAIN_SECRET_REF</string>
+        <string>--signing-key-secret-ref</string>
+        <string>REPLACE_WITH_SIGNING_KEY_SECRET_REF</string>
         <string>--data-dir</string>
         <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/data</string>
         <string>--host</string>

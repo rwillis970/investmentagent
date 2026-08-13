@@ -198,7 +198,9 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
                            secrets_provider_factory: Callable[[str], SecretsProvider]
                                = KeychainSecretsProvider,
                            credential_preflight: dict | None = None,
-                           now: datetime | None = None) -> DashboardRuntime:
+                           now: datetime | None = None,
+                           now_fn: Callable[[], datetime] | None = None,
+                           ) -> DashboardRuntime:
     """CREDENTIALS (Unit 16, 2026-08-12): `key_id`/`secret_ref` are both
     optional, matching `_parse_args`'s own `--key-id`/`--secret-ref`
     defaults -- `credentials`/`secrets_provider` below stay `None` unless
@@ -222,12 +224,43 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         credentials = BrokerCredentials(account_id=account_id, key_id=key_id,
                                         secret_ref=secret_ref)
         secrets_provider = secrets_provider_factory(cfg.mode)
+    # `now_fn`, when given, is the injectable clock BOTH the one-shot build
+    # below AND every later refresh use -- production leaves it `None` and
+    # gets the real wall clock every time (see `_refresh`'s own `now_fn()`
+    # call). Tests that pass a fixed `now=` but no `now_fn` get a clock
+    # pinned to that SAME fixed instant for every refresh too, so asserting
+    # against a deterministic `broker_account.fetched_at` doesn't require
+    # every such test to also invent its own `now_fn`.
+    if now_fn is None:
+        fixed_now = now
+        now_fn = ((lambda: fixed_now) if fixed_now is not None
+                 else (lambda: datetime.now(timezone.utc)))
     broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
         cfg, account_id=account_id, ledger_store_path=ledger_store_path,
         quarantine_store_path=quarantine_store_path,
         credentials=credentials, secrets_provider=secrets_provider,
-        now=now or datetime.now(timezone.utc),
+        now=now or now_fn(),
     )
+    # BROKER-STATE PROVENANCE (overnight-hardening unit, 2026-08-13): a
+    # closure over the exact same arguments the call just above used,
+    # re-evaluating `now` fresh on every invocation -- this is what
+    # `DashboardRuntime.broker_state_refresh_fn` calls on every real GET
+    # /api/state (see that field's own docstring), so a long-running
+    # dashboard process's broker-derived figures stop going stale for the
+    # life of the process, closing the exact gap the overnight-hardening
+    # unit's own fact #4 named ("build_dashboard_state is not receiving a
+    # broker_account snapshot"). Still the SAME `_build_broker_state` --
+    # never-raises, read-only, no capability_policy/staging_key attached --
+    # this is a refresh CADENCE change, not a new read path or a new
+    # broker-access posture.
+    def _refresh():
+        return _build_broker_state(
+            cfg, account_id=account_id, ledger_store_path=ledger_store_path,
+            quarantine_store_path=quarantine_store_path,
+            credentials=credentials, secrets_provider=secrets_provider,
+            now=now_fn(),
+        )
+
     return DashboardRuntime(
         config=cfg, config_path=config_path,
         cost_ledger=CostLedger(monthly_budget=cfg.monthly_budget_usd,
@@ -244,6 +277,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         day_trade_guard=day_trade_guard,
         ledger=ledger,
         credential_preflight=credential_preflight or {},
+        broker_state_refresh_fn=_refresh,
     )
 
 
