@@ -207,6 +207,43 @@ def test_respects_the_look_ahead_guard_via_the_supplied_view():
 
 # ------------------------------------------------------------- run_materiality_cycle
 
+def test_identical_inputs_replayed_twice_produce_byte_identical_events():
+    """Unit D reconstruction (duplicate/replay check): run_materiality_cycle
+    has no internal randomness, no wall-clock read, and no mutable module
+    state (confirmed separately by grep across agent/materiality.py and
+    agent/materiality_cycle.py for `random.`, `datetime.now`, `uuid.` --
+    zero matches). That means calling it twice with an identical FactStore
+    view and an identical `now` must be a true no-op replay: same
+    event_ids, same scores, same skip_reasons, in the same order -- not
+    merely 'equivalent', but reproducible field-for-field. This is what
+    makes it safe for a caller (e.g. an OpportunityEventTracker keyed on
+    event_id) to dedupe a re-run after a crash/restart without special
+    casing: the second run's event_id for the same underlying fact is
+    guaranteed identical to the first, so a straightforward
+    "have I seen this event_id before" check is sufficient replay
+    protection at the consumer layer."""
+    store = FactStore()
+    store.append(snapshot_fact("AAPL", ret_since_open=5.0, atr_20=0.1))
+    store.append(snapshot_fact("MSFT", ret_since_open=0.0, atr_20=1.0))
+    store.append(filing_fact("AAPL", form="8-K", item_codes=("2.02",),
+                             observed_at=T0, effective_at=T0))
+    result_a = run_cycle(store)
+    result_b = run_cycle(store)
+    assert len(result_a.events) == len(result_b.events) > 0
+    ids_a = [e.event_id for e in result_a.events]
+    ids_b = [e.event_id for e in result_b.events]
+    assert ids_a == ids_b
+    assert len(ids_a) == len(set(ids_a)), "event_ids must be unique within a single cycle too"
+    for ea, eb in zip(result_a.events, result_b.events):
+        assert ea.event_id == eb.event_id
+        assert ea.symbols == eb.symbols
+        assert ea.source_id == eb.source_id
+        assert ea.observed_at == eb.observed_at
+        assert ea.score_components == eb.score_components
+    assert result_a.skipped == result_b.skipped
+    assert result_a.degraded_reason == result_b.degraded_reason
+
+
 def test_a_symbol_with_a_new_filing_produces_a_filing_typed_event():
     store = FactStore()
     store.append(snapshot_fact("AAPL", ret_since_open=5.0, atr_20=0.1))

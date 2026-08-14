@@ -180,6 +180,28 @@ def compute_score(candidate: MaterialityCandidate, policy: MaterialityPolicy, *,
     threshold it was compared against. `screen()` adds a `gates` key on top
     of this for the trigger conjunction's own four conditions.
     """
+    # NON-FINITE INPUT GUARD (Unit D, reconstructed 2026-08-13). NaN/
+    # Infinity are NOT caught by the plain comparisons below: every
+    # comparison against NaN is False in Python/IEEE754, so `float("nan")
+    # <= 0` is False and a NaN atr_20 would otherwise slip straight past
+    # the very next check, divide ret_since_open by NaN, and produce a NaN
+    # `score` -- which then compares False against `score >= threshold`
+    # for ANY threshold, silently reporting "not material" for what is
+    # actually corrupted/invalid market data, with no error raised and
+    # nothing logged anywhere. These four fields have no "unknown is
+    # legitimate" case (unlike earnings_proximity/sector_ret below) --
+    # they are always required, so they are always validated, unlike the
+    # weight-gated checks further down.
+    for _field_name, _value in (
+        ("ret_since_open", candidate.ret_since_open),
+        ("atr_20", candidate.atr_20),
+        ("volume_so_far", candidate.volume_so_far),
+        ("median_volume_same_time", candidate.median_volume_same_time),
+    ):
+        if not math.isfinite(_value):
+            raise MaterialityInputError(
+                f"{candidate.symbol}: {_field_name} must be finite, got {_value!r}"
+            )
     if candidate.atr_20 <= 0:
         raise MaterialityInputError(
             f"{candidate.symbol}: atr_20 must be positive, got {candidate.atr_20!r}"
@@ -237,6 +259,25 @@ def compute_score(candidate: MaterialityCandidate, policy: MaterialityPolicy, *,
             f"materiality_w5={policy.w5!r} is nonzero; refusing to score "
             "rather than treat an unknown input as zero under a live weight (§3.2)"
         )
+    # Same non-finite guard as the four unconditional fields above, but
+    # weight-gated: a non-finite value under a LIVE weight is the same
+    # "malformed input, refuse to score" case; under a ZERO weight it is
+    # never even inspected (see term4_for_score/sector_ret_for_score below,
+    # which substitute 0.0 whenever the weight is zero, unconditionally --
+    # NOT merely when the raw value happens to be None -- 0.0 * nan is
+    # itself NaN in IEEE754, so relying on the weight multiplication alone
+    # to zero out a non-finite raw term would not actually work).
+    if (policy.w4 != 0 and candidate.earnings_proximity is not None
+            and not math.isfinite(candidate.earnings_proximity)):
+        raise MaterialityInputError(
+            f"{candidate.symbol}: earnings_proximity must be finite, got "
+            f"{candidate.earnings_proximity!r}"
+        )
+    if (policy.w5 != 0 and candidate.sector_ret is not None
+            and not math.isfinite(candidate.sector_ret)):
+        raise MaterialityInputError(
+            f"{candidate.symbol}: sector_ret must be finite, got {candidate.sector_ret!r}"
+        )
 
     term1_momentum = abs(candidate.ret_since_open) / candidate.atr_20
     volume_ratio = candidate.volume_so_far / candidate.median_volume_same_time
@@ -252,8 +293,15 @@ def compute_score(candidate: MaterialityCandidate, policy: MaterialityPolicy, *,
     # `raw_terms` below, unmodified, so a human auditing `score_components`
     # later can tell "unknown" apart from "known, and exactly zero".
     term4_earnings = candidate.earnings_proximity
-    term4_for_score = term4_earnings if term4_earnings is not None else 0.0
-    sector_ret_for_score = candidate.sector_ret if candidate.sector_ret is not None else 0.0
+    # 0.0 whenever the weight is zero, unconditionally -- not merely when
+    # the raw value is None -- see the non-finite guard comment above for
+    # why (0.0 * nan is itself nan; substitution must happen before the
+    # multiply, not be assumed to happen because of it).
+    term4_for_score = (0.0 if policy.w4 == 0
+                       else (term4_earnings if term4_earnings is not None else 0.0))
+    sector_ret_for_score = (0.0 if policy.w5 == 0
+                            else (candidate.sector_ret if candidate.sector_ret is not None
+                                  else 0.0))
     term5_idiosyncratic = abs(candidate.ret_since_open - sector_ret_for_score) / candidate.atr_20
     term6_budget_brake = analyses_today / max_model_analyses_per_day
 

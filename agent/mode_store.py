@@ -28,12 +28,15 @@ and `assert_legal_startup`'s contract for it is unchanged.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 from .entities import ModeChange
+
+_LOGGER_NAME = "investmentagent.mode_store"
 
 
 class ModeStoreError(Exception):
@@ -48,6 +51,11 @@ class ModeStore:
     def __init__(self, path: str | Path | None = None):
         self._history: list[ModeChange] = []
         self._path = Path(path) if path else None
+        # Set on every _load(): the raw text of a crash-truncated trailing
+        # row, if the most recent load found one, else None. Same
+        # attribute name/shape as agent.store.FactStore's own -- see
+        # _load's own docstring below for the full recovery semantics.
+        self.truncated_tail_on_load: str | None = None
         if self._path and self._path.exists():
             self._load()
 
@@ -118,13 +126,88 @@ class ModeStore:
         raise ModeStoreError("mode history is append-only; changes are never deleted")
 
     def _load(self) -> None:
+        """CRASH-TRUNCATED-TAIL RECOVERY (writer-lock-gap unit, round 2,
+        2026-08-14 -- Unit 3, mirrors `agent.store.FactStore._load`'s own
+        already-reviewed distinction, applied here for the safety-critical
+        store that decides PAUSED/RUNNING, not merely research evidence):
+
+        THE DEFECT THIS CLOSES. Before this fix, `_load` called
+        `json.loads(line)` for every line with NO exception handling
+        anywhere -- a single crash-truncated final row (this class's own
+        `write()` fsyncs deliberately, but a `SIGKILL` landing between
+        `open(..., "a")` and the completed `fh.write()`/`fh.flush()`/
+        `os.fsync()` sequence can still leave a partial final line on disk;
+        fsync makes a COMPLETED write durable, it cannot make an
+        INCOMPLETE one atomic) made the ENTIRE `ModeStore()` construction
+        raise -- not just lose the one crash-interrupted row. Every real
+        caller (scripts/run_agent.py's scheduled loop, `--advance-mode-to`,
+        scripts/run_dashboard.py's `_refresh_operational_state`, agent/
+        diagnostics.py) already treats that raise safely (the scheduled
+        loop refuses to start a cycle at all; the dashboard and
+        diagnostics degrade to an honest "unknown"/`UNAVAILABLE` -- see
+        this unit's own report for the full call-site audit) -- so the OLD
+        behavior was never a path to a fabricated PERMISSIVE mode. But it
+        was needlessly total: refusing to start the scheduled loop over a
+        single interrupted final row throws away the value of `write()`'s
+        own fsync discipline, whose entire point is that EVERY ROW BEFORE
+        the interrupted one is already durably, positively known-good.
+
+        THE FIX, EXACTLY MIRRORING FactStore._load's OWN REASONING:
+        - The LAST line fails to parse, every line before it parses fine:
+          tolerated. The row is discarded (recorded verbatim on
+          `truncated_tail_on_load`, logged as a warning, never silently
+          dropped with no trace) and loading continues with every prior
+          row. `current()` then reports the mode from the last WELL-FORMED
+          row -- the last state this store ever positively, durably
+          confirmed -- never a guess, never a default, and specifically
+          NOT forced to PAUSED if the last good row was already something
+          else: recovering to "the last state we can actually prove" IS
+          the fail-safe behavior here, not a weakening of it.
+        - Any OTHER line fails to parse (not the last): raised, exactly as
+          before this fix -- there is no fsync-ordering argument that could
+          explain corruption in the MIDDLE of this file as "just a crash,"
+          and mode history is exactly the kind of record this codebase
+          refuses to silently repair by skipping a row (§7.2's own
+          "separate write path," §9.2's PAUSED/RUNNING boundary). Every
+          call site above already converts this raise into a safe,
+          fail-closed outcome -- see this method's own docstring intro.
+        - An empty file (zero non-blank lines) is not corruption at all:
+          `self._history` stays empty, `current()` returns `None`, exactly
+          the documented fresh-install baseline (see module docstring).
+        """
         # Read the whole file before appending anything, matching
         # FactStore._load's own reasoning: the reader must never observe a
         # row written during its own replay.
         with self._path.open(encoding="utf-8") as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
-        for line in lines:
-            self._history.append(_decode(json.loads(line)))
+        self.truncated_tail_on_load = None
+        for i, line in enumerate(lines):
+            is_last = i == len(lines) - 1
+            try:
+                decoded = json.loads(line)
+                change = _decode(decoded)
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                if not is_last:
+                    raise ModeStoreError(
+                        f"ModeStore {self._path}: malformed row at line "
+                        f"{i + 1} of {len(lines)}, which is NOT the final "
+                        f"line -- a crash mid-write can only ever produce "
+                        f"an incomplete FINAL row, so this cannot be "
+                        f"explained as an unclean shutdown. Refusing to "
+                        f"load rather than silently skip a row from the "
+                        f"middle of mode history: {exc}"
+                    ) from exc
+                self.truncated_tail_on_load = line
+                logging.getLogger(_LOGGER_NAME).warning(
+                    "ModeStore %s: discarding an unparseable final line "
+                    "(%d chars) on load -- every earlier row parses "
+                    "cleanly, so this looks like a crash mid-write, not "
+                    "corruption. current() will report the last "
+                    "WELL-FORMED row, never a guess. Raw content: %r",
+                    self._path, len(line), line,
+                )
+                break
+            self._history.append(change)
 
 
 def _encode(c: ModeChange) -> dict:

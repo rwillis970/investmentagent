@@ -68,6 +68,7 @@ from .dashboard_state import build_dashboard_state
 from .daytrade import DayTradeGuard
 from .ledger import Ledger
 from .opportunity_event_tracker import OpportunityEventTracker
+from .process_lock import ProcessLockError, acquire_process_lock
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "static"
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -125,6 +126,38 @@ class DashboardRuntime:
     broker_state_refresh_fn: Callable[
         [], tuple["AccountSnapshot | None", "tuple[Position, ...]",
                  "DayTradeGuard | None", "Ledger | None"]] | None = None
+    # UNIT E (reconstructed 2026-08-13): PAPER-vs-PAUSED truth. Mirrors
+    # broker_state_refresh_fn's own reasoning exactly -- ModeStore is
+    # file-backed and this dashboard process and the real scheduled
+    # run_agent.py process are separate OS processes (separate LaunchAgents),
+    # so a ModeStore instance built once at dashboard startup would go
+    # stale the moment an operator's --advance-mode-to (or the scheduled
+    # loop's own startup sequence) wrote a new mode from the OTHER process.
+    # `None` (this field's own default) means "no ModeStore wired" --
+    # route_request leaves operational_state/operational_state_paused_from
+    # at None, which agent.dashboard_state.build_dashboard_state renders as
+    # an honest "not supplied," never as a fabricated state.
+    operational_state_refresh_fn: Callable[[], tuple[str | None, str | None]] | None = None
+    # WRITER-LOCK GAP CLOSED (writer-lock-gap unit, 2026-08-14). This
+    # dashboard process and the scheduled `scripts/run_agent.py` process are
+    # separate OS processes that can both write `approval_request_store`/
+    # `audit_log` (POST .../approve|reject) or `config.json`/`audit_log`
+    # (PATCH /api/config) with no coordination of their own -- the exact
+    # same durable-store-corruption risk `agent.process_lock` already
+    # closes for the scheduled loop and the one-shot CLI writers in
+    # `scripts/run_agent.py`. `process_lock_data_dir`, when set by the
+    # caller (see `scripts/run_dashboard.py`'s own `main`, which already
+    # unconditionally resolves `--data-dir` for every invocation -- so "same
+    # canonicalized data dir = same lock identity" needs no new flag here
+    # either), is used by `route_request`'s POST-approval and PATCH-config
+    # branches to acquire `agent.process_lock.acquire_process_lock` for the
+    # SAME canonicalized directory before either handler touches a store.
+    # `None` (this field's own default) preserves the OLD, unlocked
+    # behavior exactly for any caller/test that never sets it -- e.g. a test
+    # exercising `_handle_approval_action` in isolation with no interest in
+    # lock contention. `GET /api/state` and every other read-only route
+    # never consults this field at all -- see route_request's own comment.
+    process_lock_data_dir: str | Path | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +196,14 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         if runtime.broker_state_refresh_fn is not None:
             (runtime.broker_account, runtime.broker_positions,
             runtime.day_trade_guard, runtime.ledger) = runtime.broker_state_refresh_fn()
+        # UNIT E: same per-request-refresh posture as broker_state_refresh_fn
+        # immediately above, for the identical cross-process-staleness
+        # reason -- see operational_state_refresh_fn's own field docstring.
+        operational_state = None
+        operational_state_paused_from = None
+        if runtime.operational_state_refresh_fn is not None:
+            operational_state, operational_state_paused_from = \
+                runtime.operational_state_refresh_fn()
         state = build_dashboard_state(
             now=now, config=runtime.config, cost_ledger=runtime.cost_ledger,
             opportunity_tracker=runtime.opportunity_tracker,
@@ -173,16 +214,26 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
             broker_positions=runtime.broker_positions,
             day_trade_guard=runtime.day_trade_guard,
             ledger=runtime.ledger,
+            operational_state=operational_state,
+            operational_state_paused_from=operational_state_paused_from,
         )
         return _json_result(200, state)
 
+    # WRITER-LOCK GAP CLOSED (writer-lock-gap unit, 2026-08-14): these are
+    # this module's only two writable routes -- see DashboardRuntime.
+    # process_lock_data_dir's own docstring and `_with_writer_lock` below.
+    # Every route above this point (GET /api/state, GET /api/credentials,
+    # and every static GET below) is read-only and deliberately never
+    # touches `_with_writer_lock` -- no lock is ever held for a GET.
     m = _APPROVAL_ACTION_RE.match(path)
     if method == "POST" and m:
-        return _handle_approval_action(runtime, request_id=m.group(1),
-                                       action=m.group(2), body=body, now=now)
+        return _with_writer_lock(runtime, lambda: _handle_approval_action(
+            runtime, request_id=m.group(1), action=m.group(2), body=body, now=now,
+        ))
 
     if method == "PATCH" and path == "/api/config":
-        return _handle_config_patch(runtime, body=body, now=now)
+        return _with_writer_lock(
+            runtime, lambda: _handle_config_patch(runtime, body=body, now=now))
 
     if method == "GET" and path == "/api/credentials":
         # Static read of a dict scripts/run_dashboard.py already computed at
@@ -203,6 +254,45 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         return _serve_static("credential_preflight_bind.js")
 
     return _json_result(404, {"error": f"no route for {method} {path}"})
+
+
+def _with_writer_lock(runtime: DashboardRuntime,
+                      fn: Callable[[], RouteResult]) -> RouteResult:
+    """Single acquisition site for both writable dashboard routes (POST
+    .../approve|reject, PATCH /api/config) -- see DashboardRuntime.
+    process_lock_data_dir's own docstring. `None` (unset -- the default,
+    and every existing test that builds a `DashboardRuntime` with no
+    opinion on locking) runs `fn` directly, unlocked, preserving the exact
+    prior behavior. When set, acquires the SAME canonicalized-data-dir
+    lock the scheduled loop (`scripts/run_agent.py`'s own bottom `with
+    acquire_process_lock(...)` block) and the CLI one-shot writers
+    (`_run_one_shot_locked` there) use, for `fn`'s entire body -- before
+    either handler here touches `approval_request_store`, `audit_log`, or
+    `config.json`. Lock contention raises `ProcessLockError`; caught here
+    and turned into a 503 with a clear, non-secret, generic message --
+    never a stack trace, never a filesystem path (this surface has
+    wildcard CORS and no auth of its own, see module docstring, so this
+    handler is deliberately more conservative about what it discloses over
+    HTTP than `ProcessLockError`'s own `str()` is).
+
+    NO NESTED-LOCK RISK: this is the only call to `acquire_process_lock`
+    anywhere in this module. Neither `_handle_approval_action` nor
+    `_handle_config_patch` acquires it independently, and `route_request`
+    calls this wrapper at most once per request (its two writable
+    branches are mutually exclusive), so there is exactly one acquisition
+    per call stack, by construction -- see agent/process_lock.py's own
+    module docstring for why a second acquisition from the SAME process
+    would itself fail, not just a genuinely different process's."""
+    if runtime.process_lock_data_dir is None:
+        return fn()
+    try:
+        with acquire_process_lock(runtime.process_lock_data_dir):
+            return fn()
+    except ProcessLockError:
+        return _json_result(503, {
+            "error": "another process is currently writing the same data "
+                     "directory; refusing to write -- try again shortly",
+        })
 
 
 def _handle_approval_action(runtime: DashboardRuntime, *, request_id: str,

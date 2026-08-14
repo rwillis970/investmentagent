@@ -301,7 +301,9 @@ from agent.pipeline_stage import PipelineRuntime
 from agent.run_loop import (AccountRuntime, in_session_now,
                             seconds_until_next_session_open, run_loop as real_run_loop)
 from agent import runtime_status as runtime_status_module
-from agent.secrets_provider import KeychainSecretsProvider, SecretsProvider
+from agent.process_lock import ProcessLockError, acquire_process_lock
+from agent.secrets_provider import (SecretsProvider,
+                                    default_keychain_secrets_provider_factory)
 from agent.startup import _reconcile_mode_persistence
 from agent.store import FactStore
 
@@ -1011,6 +1013,64 @@ def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
         return 1
 
 
+#  ONE-SHOT WRITER-LOCK GAP CLOSED (writer-lock-gap unit, 2026-08-14).
+#
+#  THE DEFECT (disclosed by agent/process_lock.py's own module docstring,
+#  independently confirmed during the phase1-integration pass): the
+#  scheduled loop below acquires `acquire_process_lock(args.data_dir)`
+#  before touching any durable store, but each of the four one-shot
+#  writable CLI dispatches --  --advance-mode-to, --admit-execution /
+#  --reject-execution, --admit-cash-event / --reject-cash-event, and
+#  --submit-approved (which can reach a REAL `adapter.submit`) -- returned
+#  from `main()` before that `with` block, so a manually-run one-shot
+#  command could race the scheduled loop against the SAME `ModeStore` /
+#  `ExecutionQuarantineStore` / `CashEventQuarantineStore` /
+#  `ApprovalRequestStore` / `AuditLog` files with no serialization at all.
+#
+#  THE FIX: `_run_one_shot_locked` below is the single acquisition site for
+#  all four dispatches. It acquires the identical `acquire_process_lock`
+#  used by the scheduled loop, scoped to the identical canonicalized
+#  `args.data_dir` (both this script and scripts/run_dashboard.py already
+#  unconditionally resolve `--data-dir` for every invocation -- see
+#  `_parse_args` -- so "same canonicalized data dir = same lock identity"
+#  requires no new flag), for the caller's *entire* body, before any of the
+#  four `_run_*` handlers above touch a store. Lock contention raises
+#  `ProcessLockError` (non-secret: only a local path and a generic
+#  contention explanation, see agent/process_lock.py), which is caught
+#  here, logged, and turned into a plain `return 1` -- this script's own
+#  "never raises, always 0 or 1" contract, identical to every other
+#  refusal branch in the four wrapped functions. Read-only paths (`--dry-
+#  run`, `--help`, diagnostics, and every dashboard GET in
+#  scripts/run_dashboard.py) are untouched -- this wrapper is only called
+#  from the four writable dispatch branches.
+#
+#  NO NESTED SELF-DEADLOCK: `fcntl.flock` locks are per open-file-
+#  description, not per-process -- a second `open()+flock()` on the same
+#  lock file from the SAME process would also refuse. `_run_one_shot_locked`
+#  is therefore the ONLY place in this script's one-shot paths that calls
+#  `acquire_process_lock`; none of the four `_run_*` handlers it wraps call
+#  `acquire_process_lock` themselves or call each other, and `main()`'s
+#  four dispatch branches are mutually exclusive early returns that never
+#  reach the scheduled loop's own `with acquire_process_lock(...)` block in
+#  the same call stack. One acquisition per process invocation, by
+#  construction.
+def _run_one_shot_locked(
+    *, data_dir: str, log: logging.Logger, action_desc: str,
+    fn: Callable[[], int],
+) -> int:
+    """Acquire the canonical data-dir process lock, then run `fn` (one of
+    the four one-shot writer dispatches in `main()`) inside it. Returns
+    `fn()`'s own result on success; returns 1 (never raises) if the lock
+    is already held -- e.g. by a running scheduled loop -- logging a
+    clear, non-secret refusal instead of racing a concurrent writer."""
+    try:
+        with acquire_process_lock(data_dir):
+            return fn()
+    except ProcessLockError as exc:
+        log.error("refusing %s: %s", action_desc, exc)
+        return 1
+
+
 #  --data-dir DEFAULTING (launchd-deploy-broken follow-up, 2026-08-03).
 #
 #  THE DEFECT: the unattended-wiring unit added `--fact-store-path`/
@@ -1461,7 +1521,8 @@ def _parse_args(argv: list[str] | None):
 
 def main(argv: list[str] | None = None, *,
         run_loop_fn: Callable = real_run_loop,
-        secrets_provider_factory: Callable[[str], SecretsProvider] = KeychainSecretsProvider,
+        secrets_provider_factory: Callable[[str], SecretsProvider]
+            = default_keychain_secrets_provider_factory,
         notify_fn: Callable[[str], None] = _default_notify,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         ) -> int:
@@ -1491,49 +1552,73 @@ def main(argv: list[str] | None = None, *,
     broker/failure-sentinel machinery below is touched on any of these
     paths (`--submit-approved` builds its OWN adapter, inside `_run_submit_
     approved` -- not the `run_loop_fn`/`_real_adapter_factory` path below,
-    which this flag never reaches)."""
+    which this flag never reaches).
+
+    All four of these one-shot dispatches are wrapped in `_run_one_shot_
+    locked`, which acquires the SAME `acquire_process_lock(args.data_dir)`
+    the scheduled loop below acquires, before any of the four handlers
+    touches a durable store or (for --submit-approved) can ever reach
+    `adapter.submit` -- see `_run_one_shot_locked`'s own docstring/comment
+    block (writer-lock-gap unit, 2026-08-14) for why this closes the gap
+    with a single acquisition site and no nested-lock risk."""
     args = _parse_args(argv)
     logging.basicConfig(level=args.log_level)
     log = logging.getLogger(LOGGER_NAME)
 
     if args.advance_mode_to is not None:
-        return _run_advance_mode(
-            target_mode=args.advance_mode_to, mode_store_path=args.mode_store_path,
-            audit_log_path=args.audit_log_path, confirmed=args.confirmed,
-            now_fn=now_fn, log=log,
+        return _run_one_shot_locked(
+            data_dir=args.data_dir, log=log,
+            action_desc=f"--advance-mode-to {args.advance_mode_to}",
+            fn=lambda: _run_advance_mode(
+                target_mode=args.advance_mode_to, mode_store_path=args.mode_store_path,
+                audit_log_path=args.audit_log_path, confirmed=args.confirmed,
+                now_fn=now_fn, log=log,
+            ),
         )
 
     if args.admit_execution is not None or args.reject_execution is not None:
         decision = "admit" if args.admit_execution is not None else "reject"
         execution_id = args.admit_execution or args.reject_execution
-        return _run_admit_or_reject(
-            decision=decision, execution_id=execution_id, account_id=args.account_id,
-            quarantine_store_path=args.quarantine_store_path,
-            audit_log_path=args.audit_log_path,
-            holding_policy_version=args.admit_holding_policy_version,
-            lot_id=args.admit_lot_id, now_fn=now_fn, log=log,
+        return _run_one_shot_locked(
+            data_dir=args.data_dir, log=log,
+            action_desc=f"--{decision}-execution {execution_id}",
+            fn=lambda: _run_admit_or_reject(
+                decision=decision, execution_id=execution_id, account_id=args.account_id,
+                quarantine_store_path=args.quarantine_store_path,
+                audit_log_path=args.audit_log_path,
+                holding_policy_version=args.admit_holding_policy_version,
+                lot_id=args.admit_lot_id, now_fn=now_fn, log=log,
+            ),
         )
 
     if args.admit_cash_event is not None or args.reject_cash_event is not None:
         decision = "admit" if args.admit_cash_event is not None else "reject"
         activity_id = args.admit_cash_event or args.reject_cash_event
-        return _run_admit_or_reject_cash_event(
-            decision=decision, activity_id=activity_id, account_id=args.account_id,
-            cash_quarantine_store_path=args.cash_quarantine_store_path,
-            ledger_store_path=args.ledger_store_path,
-            audit_log_path=args.audit_log_path, now_fn=now_fn, log=log,
+        return _run_one_shot_locked(
+            data_dir=args.data_dir, log=log,
+            action_desc=f"--{decision}-cash-event {activity_id}",
+            fn=lambda: _run_admit_or_reject_cash_event(
+                decision=decision, activity_id=activity_id, account_id=args.account_id,
+                cash_quarantine_store_path=args.cash_quarantine_store_path,
+                ledger_store_path=args.ledger_store_path,
+                audit_log_path=args.audit_log_path, now_fn=now_fn, log=log,
+            ),
         )
 
     if args.submit_approved is not None:
-        return _run_submit_approved(
-            request_id=args.submit_approved, account_id=args.account_id,
-            config_path=args.config, key_id=args.key_id, secret_ref=args.secret_ref,
-            signing_key_secret_ref=args.signing_key_secret_ref,
-            account_type=args.account_type,
-            approval_request_store_path=args.approval_request_store_path,
-            audit_log_path=args.audit_log_path,
-            reference_price=args.submit_approved_reference_price,
-            secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
+        return _run_one_shot_locked(
+            data_dir=args.data_dir, log=log,
+            action_desc=f"--submit-approved {args.submit_approved}",
+            fn=lambda: _run_submit_approved(
+                request_id=args.submit_approved, account_id=args.account_id,
+                config_path=args.config, key_id=args.key_id, secret_ref=args.secret_ref,
+                signing_key_secret_ref=args.signing_key_secret_ref,
+                account_type=args.account_type,
+                approval_request_store_path=args.approval_request_store_path,
+                audit_log_path=args.audit_log_path,
+                reference_price=args.submit_approved_reference_price,
+                secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
+            ),
         )
 
     # Computed once, before the try block, so both the success-side
@@ -1656,81 +1741,82 @@ def main(argv: list[str] | None = None, *,
             log.warning("runtime_status write itself failed: %s", status_exc)
 
     try:
-        # Runtime-recovery unit (2026-08-13): the data-dir sanity guard
-        # runs BEFORE anything else in this block -- before config is even
-        # read -- so a conflicting sibling directory is refused as early as
-        # possible, never after a store has already been opened against it.
-        # Gated on data_dir_relevant (see _parse_args's own comment): a
-        # caller who supplied every individual store path explicitly never
-        # actually used --data-dir, so there is nothing meaningful to check.
-        if getattr(args, "data_dir_relevant", False):
-            _check_data_dir_sanity(Path(args.data_dir), account_id=args.account_id)
+        with acquire_process_lock(args.data_dir):
+            # Runtime-recovery unit (2026-08-13): the data-dir sanity guard
+            # runs BEFORE anything else in this block -- before config is even
+            # read -- so a conflicting sibling directory is refused as early as
+            # possible, never after a store has already been opened against it.
+            # Gated on data_dir_relevant (see _parse_args's own comment): a
+            # caller who supplied every individual store path explicitly never
+            # actually used --data-dir, so there is nothing meaningful to check.
+            if getattr(args, "data_dir_relevant", False):
+                _check_data_dir_sanity(Path(args.data_dir), account_id=args.account_id)
 
-        cfg = config_module.load(json.loads(Path(args.config).read_text()))
-        secrets_provider = secrets_provider_factory(cfg.mode)
-        signing_key = _resolve_gatekeeper_signing_key(secrets_provider,
-                                                       args.signing_key_secret_ref)
-        credentials = BrokerCredentials(account_id=args.account_id, key_id=args.key_id,
-                                       secret_ref=args.secret_ref)
-        account = build_account_runtime(
-            cfg, account_id=args.account_id, credentials=credentials,
-            ledger_store_path=args.ledger_store_path,
-            quarantine_store_path=args.quarantine_store_path,
-            cash_quarantine_store_path=args.cash_quarantine_store_path,
-        )
+            cfg = config_module.load(json.loads(Path(args.config).read_text()))
+            secrets_provider = secrets_provider_factory(cfg.mode)
+            signing_key = _resolve_gatekeeper_signing_key(secrets_provider,
+                                                           args.signing_key_secret_ref)
+            credentials = BrokerCredentials(account_id=args.account_id, key_id=args.key_id,
+                                           secret_ref=args.secret_ref)
+            account = build_account_runtime(
+                cfg, account_id=args.account_id, credentials=credentials,
+                ledger_store_path=args.ledger_store_path,
+                quarantine_store_path=args.quarantine_store_path,
+                cash_quarantine_store_path=args.cash_quarantine_store_path,
+            )
 
-        mode_store = ModeStore(args.mode_store_path)
-        audit_log = AuditLog(path=args.audit_log_path)
-        # Runtime-recovery unit (2026-08-13): one row per process start,
-        # recording exactly which absolute directory this run resolved
-        # --data-dir to -- an operator reading audit.jsonl after the fact
-        # (or comparing two directories' own audit logs, the way this
-        # unit's own investigation had to) no longer has to infer it from
-        # file mtimes.
-        audit_log.append(
-            actor="system", action="data_dir_resolved", object_type="startup",
-            object_id="system",
-            after={"data_dir": str(Path(args.data_dir).resolve()),
-                  "account_id": args.account_id},
-            timestamp=now_fn(),
-        )
-        approval_service = ApprovalService(
-            expiration=timedelta(minutes=cfg.approval_expiration_minutes),
-            min_display=timedelta(seconds=cfg.approval_min_display_seconds),
-            max_per_day=cfg.max_approval_requests_per_day,
-            # Operator decision surface unit, 2026-08-03: `cfg.price_band_pct`
-            # is new this commit -- this construction used to omit it
-            # entirely, silently relying on `ApprovalService`'s own
-            # `price_band_pct: float = 1.0` default rather than a real,
-            # configured value (see that field's own comment in
-            # agent/config.py).
-            price_band_pct=cfg.price_band_pct,
-        )
-        pipeline = build_pipeline_runtime(
-            cfg, account_id=args.account_id, credentials=credentials,
-            secrets_provider=secrets_provider,
-            account_type=AccountType(args.account_type),
-            audit_log=audit_log, approval_service=approval_service,
-            signing_key=signing_key,
-            fact_store_path=args.fact_store_path,
-            cost_ledger_path=args.cost_ledger_path,
-            extraction_cache_path=args.extraction_cache_path,
-            analysis_result_store_path=args.analysis_result_store_path,
-            approval_request_store_path=args.approval_request_store_path,
-            opportunity_tracker_path=args.opportunity_tracker_path,
-        )
+            mode_store = ModeStore(args.mode_store_path)
+            audit_log = AuditLog(path=args.audit_log_path)
+            # Runtime-recovery unit (2026-08-13): one row per process start,
+            # recording exactly which absolute directory this run resolved
+            # --data-dir to -- an operator reading audit.jsonl after the fact
+            # (or comparing two directories' own audit logs, the way this
+            # unit's own investigation had to) no longer has to infer it from
+            # file mtimes.
+            audit_log.append(
+                actor="system", action="data_dir_resolved", object_type="startup",
+                object_id="system",
+                after={"data_dir": str(Path(args.data_dir).resolve()),
+                      "account_id": args.account_id},
+                timestamp=now_fn(),
+            )
+            approval_service = ApprovalService(
+                expiration=timedelta(minutes=cfg.approval_expiration_minutes),
+                min_display=timedelta(seconds=cfg.approval_min_display_seconds),
+                max_per_day=cfg.max_approval_requests_per_day,
+                # Operator decision surface unit, 2026-08-03: `cfg.price_band_pct`
+                # is new this commit -- this construction used to omit it
+                # entirely, silently relying on `ApprovalService`'s own
+                # `price_band_pct: float = 1.0` default rather than a real,
+                # configured value (see that field's own comment in
+                # agent/config.py).
+                price_band_pct=cfg.price_band_pct,
+            )
+            pipeline = build_pipeline_runtime(
+                cfg, account_id=args.account_id, credentials=credentials,
+                secrets_provider=secrets_provider,
+                account_type=AccountType(args.account_type),
+                audit_log=audit_log, approval_service=approval_service,
+                signing_key=signing_key,
+                fact_store_path=args.fact_store_path,
+                cost_ledger_path=args.cost_ledger_path,
+                extraction_cache_path=args.extraction_cache_path,
+                analysis_result_store_path=args.analysis_result_store_path,
+                approval_request_store_path=args.approval_request_store_path,
+                opportunity_tracker_path=args.opportunity_tracker_path,
+            )
 
-        run_loop_fn(
-            accounts=[account],
-            adapter_factory=_real_adapter_factory(secrets_provider),
-            mode_store=mode_store, audit_log=audit_log,
-            approval_service=approval_service, target_mode=cfg.mode,
-            confirmed=args.confirmed,
-            cadence_seconds=cfg.reconciliation_cycle_interval_seconds,
-            logger=log, pipeline=pipeline,
-            on_cycle_success=_on_cycle_success,
-        )
-        return 0
+            run_loop_fn(
+                accounts=[account],
+                adapter_factory=_real_adapter_factory(secrets_provider),
+                mode_store=mode_store, audit_log=audit_log,
+                approval_service=approval_service, target_mode=cfg.mode,
+                confirmed=args.confirmed,
+                cadence_seconds=cfg.reconciliation_cycle_interval_seconds,
+                logger=log, pipeline=pipeline,
+                on_cycle_success=_on_cycle_success,
+            )
+            return 0
     except Exception as exc:   # noqa: BLE001 -- see agent.run_loop.run_loop's
         # own docstring: this loop deliberately does not distinguish a
         # StartupHalted from any other error; every one of them means state

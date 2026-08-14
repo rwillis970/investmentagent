@@ -459,3 +459,137 @@ def test_close_terminal_orders_only_checks_ids_this_store_believes_are_open(tmp_
     b.get_by_client_id = lambda cid: (checked.append(cid), original(cid))[1]
     close_terminal_orders(b, s, now=T0 + timedelta(minutes=1))
     assert checked == []
+
+
+# ------------------------------------------------------------------------
+# UNIT D -- quarantine-store-integrity-and-spy-forensics unit, 2026-08-14.
+#
+# Reproduces, on a disposable tmp_path fixture ONLY (never data/), the exact
+# durable shape this investigation found on the real account after a
+# `git checkout -- data/ledger.jsonl` operation (performed in an earlier
+# session, under rules since revised specifically because of this incident)
+# discarded an uncommitted, legitimately fill-sync-written ledger row: an
+# opening balance, a CAT fee cash adjustment, an execution quarantined and
+# then ADMITTED by a real operator decision -- but with NO corresponding
+# `Fill` on the ledger.
+#
+# Deliberately calls the real, unmodified `sync_fills` -- no special-cased
+# SPY recovery path is added anywhere in this codebase for this incident.
+# The question this answers: does the NORMAL, GENERAL fill-sync/quarantine
+# mechanism recover on its own once the broker still reports the execution?
+REAL_EXECUTION_ID = "20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346"
+REAL_CLIENT_ORDER_ID = "732f0667-fb47-43f6-babd-7c0fe64ece18"
+REAL_FILLED_AT = datetime(2026, 7, 28, 14, 42, 51, 412408, tzinfo=timezone.utc)
+REAL_QUARANTINED_AT = datetime(2026, 8, 12, 16, 6, 48, 185029, tzinfo=timezone.utc)
+REAL_ADMITTED_AT = datetime(2026, 8, 12, 23, 35, 29, 473928, tzinfo=timezone.utc)
+
+
+def _real_shape_registry():
+    """The real account's own holding policy is literally named "config"
+    (see agent/execution_quarantine.py's own module docstring) -- the
+    operator's real ADMITTED resolution recorded `holding_policy_version:
+    "config"`, not a test placeholder like "hp-v1"."""
+    return HoldingPolicyRegistry([HoldingPolicy("config", timedelta(0), timedelta(0))])
+
+
+def _real_shape_ledger_store(tmp_path):
+    """Reproduces data/ledger.jsonl's own real, currently-committed shape:
+    an opening balance of $480, seeded 2026-08-12T16:06:48.185029Z (the
+    same instant the execution was quarantined -- both derive from the
+    same broker read), plus the real CAT fee cash adjustment -- and
+    NOTHING else. No fill. This is the exact durable state Unit C's
+    forensic timeline found on the real account."""
+    s = LedgerStore(tmp_path / "ledger.jsonl", account_id=ACCT, policy_registry=_real_shape_registry())
+    s.write_opening_balance(to_decimal("480"), at=REAL_QUARANTINED_AT)
+    from agent.ledger import CashAdjustment
+    s.write_cash_adjustment(CashAdjustment(
+        adjustment_id="20260728000000000::de3745eb-7d16-4bf3-9514-234693d9f84e",
+        account_id=ACCT, amount=to_decimal("-0.01"), activity_type="FEE",
+        description="CAT fee for proceed of 1 trades on 2026-07-28 by PA3XZX944LRR",
+        effective_date=date(2026, 7, 28), symbol=None,
+    ))
+    return s
+
+
+def _real_shape_quarantine_store(tmp_path):
+    """Reproduces data/quarantine.jsonl's real, currently-observed logical
+    state (post Unit A fix -- the file's real duplicate rows collapse to
+    this exact one quarantine + one ADMITTED resolution; see
+    tests/test_execution_quarantine.py's own duplicate-collapse test): the
+    SPY execution IS still quarantined, and an operator DID admit it,
+    supplying holding_policy_version="config" (a BUY admission -- no
+    lot_id)."""
+    q = ExecutionQuarantineStore(tmp_path / "quarantine.jsonl", account_id=ACCT)
+    q.quarantine(
+        execution(execution_id=REAL_EXECUTION_ID, client_order_id=REAL_CLIENT_ORDER_ID,
+                  symbol="SPY", side="BUY", qty=0.027087234, price=737.986,
+                  cum_qty=0.027087234, filled_at=REAL_FILLED_AT),
+        reason=("BUY with no holding_policy_version recorded at staging time "
+               f"(client_order_id={REAL_CLIENT_ORDER_ID!r}); refusing to guess "
+               "which policy the new lot should open under"),
+        at=REAL_QUARANTINED_AT,
+    )
+    q.admit(REAL_EXECUTION_ID, decided_by="operator", decided_at=REAL_ADMITTED_AT,
+           holding_policy_version="config")
+    return q
+
+
+def test_normal_fill_sync_recovers_the_admitted_execution_with_no_special_case(tmp_path):
+    """THE central Unit D question: given the real durable evidence (opening
+    balance, CAT fee, an ADMITTED-but-never-filled execution) and a broker
+    that still reports the execution, does the ORDINARY sync_fills call
+    recover it -- with no ledger row ever touched by hand?"""
+    ledger_store = _real_shape_ledger_store(tmp_path)
+    quarantine = _real_shape_quarantine_store(tmp_path)
+    b = FakeBroker()
+    b.add_execution(execution(execution_id=REAL_EXECUTION_ID,
+                              client_order_id=REAL_CLIENT_ORDER_ID, symbol="SPY",
+                              side="BUY", qty=0.027087234, price=737.986,
+                              cum_qty=0.027087234, filled_at=REAL_FILLED_AT))
+    audit_log = AuditLog()
+    now = REAL_ADMITTED_AT + timedelta(minutes=5)
+
+    # Preconditions matching the real, currently-observed state exactly:
+    assert ledger_store.load()[1] == ()           # zero fills before recovery
+    assert quarantine.status(REAL_EXECUTION_ID) == ADMITTED
+
+    new_fills = sync_fills(b, ledger_store, now=now, quarantine=quarantine, audit_log=audit_log)
+
+    # (1) exactly one Fill written this call
+    assert len(new_fills) == 1
+    fill = new_fills[0]
+    assert fill.fill_id == REAL_EXECUTION_ID
+    assert fill.symbol == "SPY"
+    assert fill.side == "BUY"
+    assert fill.qty == to_decimal("0.027087234")
+    assert fill.price == to_decimal("737.986")
+    assert fill.holding_policy_version == "config"
+    assert fill.lot_id == REAL_EXECUTION_ID   # BUY: lot_id is the fill_id itself
+
+    # (2) repeated sync writes no duplicate Fill (idempotent on execution_id)
+    again = sync_fills(b, ledger_store, now=now + timedelta(minutes=5),
+                       quarantine=quarantine, audit_log=audit_log)
+    assert again == ()
+    assert len(ledger_store.load()[1]) == 1
+
+    # (3) local position becomes exactly SPY=0.027087234
+    ledger = ledger_store.to_ledger()
+    positions = ledger.positions()
+    assert positions == {"SPY": to_decimal("0.027087234")}
+
+    # (4) settled cash returns to the mathematically expected state:
+    # opening(480) + CAT fee(-0.01) - cost(0.027087234 * 737.986), where
+    # the cost is posted at USD-cent precision -- `Ledger._cash_notional`
+    # quantizes each fill's own cash effect to the cent via banker's
+    # rounding BEFORE folding it into settled_cash (agent/ledger.py's own
+    # docstring: "Alpaca ... posts the resulting account cash movement at
+    # USD cent precision"). 0.027087234 * 737.986 = 19.989999470724, which
+    # quantizes to 19.99 -- so settled cash is exactly $460.00, not merely
+    # close to it.
+    settled = ledger.settled_cash(now=now)
+    assert settled == to_decimal("460.00")
+
+    # (5) no manual ledger mutation was required anywhere in this test --
+    # the only calls that touched the ledger store were write_opening_balance
+    # (fixture setup, mirroring the real, already-committed opening balance)
+    # and sync_fills itself.

@@ -11,6 +11,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,7 @@ from agent.cost import CostLedger
 from agent.dashboard_server import (STATIC_DIR, DashboardRuntime,
                                     make_server, route_request)
 from agent.opportunity_event_tracker import OpportunityEventTracker
+from agent.process_lock import acquire_process_lock
 from tests.test_config_fixture import valid_raw_config
 
 ACCT = "acct-1"
@@ -274,6 +276,124 @@ def test_patch_config_response_never_includes_the_full_config_object(tmp_path):
                         "value": 10}).encode(),
     )
     assert "config" not in json.loads(result.body)
+
+
+# ----------------------------------------------------- writer-lock (2026-08-14)
+# `DashboardRuntime.process_lock_data_dir` closes the gap this dashboard
+# process previously left open: it and the scheduled `scripts/run_agent.py`
+# process both write `approval_request_store`/`audit_log`/`config.json` with
+# no coordination. These tests hold the SAME `agent.process_lock.
+# acquire_process_lock` the scheduled loop would hold mid-cycle (a real
+# `fcntl.flock`, not a mock -- see tests/test_process_lock.py for the
+# primitive's own coverage) and assert the two writable routes refuse
+# instead of racing it, while every read-only route is untouched by the
+# same contention.
+
+def test_post_approve_refuses_with_503_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    runtime, store = make_runtime(tmp_path, now=T0)
+    runtime.process_lock_data_dir = tmp_path
+    req = add_pending(store, now=T0)
+    runtime.now_fn = lambda: T0 + timedelta(seconds=46)
+    with acquire_process_lock(tmp_path):   # simulates the scheduled loop mid-cycle
+        result = route_request(
+            runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+            body=b"{}",
+        )
+    assert result.status == 503
+    payload = json.loads(result.body)
+    assert "error" in payload
+    # Non-secret: no filesystem path, no stack trace, nothing about the
+    # competing process -- see _with_writer_lock's own docstring for why
+    # this is deliberately more conservative than ProcessLockError.str().
+    assert str(tmp_path) not in payload["error"]
+    # And the write genuinely never happened -- refused before mutation,
+    # not rolled back after.
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_reject_refuses_with_503_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    runtime, store = make_runtime(tmp_path, now=T0)
+    runtime.process_lock_data_dir = tmp_path
+    req = add_pending(store, now=T0)
+    with acquire_process_lock(tmp_path):
+        result = route_request(
+            runtime, method="POST", path=f"/api/approval/{req.request_id}/reject",
+            body=b"{}",
+        )
+    assert result.status == 503
+    assert store.get(req.request_id).decision is None
+
+
+def test_patch_config_refuses_with_503_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    runtime.process_lock_data_dir = tmp_path
+    before = runtime.config.opportunity_screen_interval_minutes
+    with acquire_process_lock(tmp_path):
+        result = route_request(
+            runtime, method="PATCH", path="/api/config",
+            body=json.dumps({"key": "opportunity_screen_interval_minutes",
+                            "value": 10}).encode(),
+        )
+    assert result.status == 503
+    # config.json itself was never touched, and the in-memory runtime.config
+    # -- what every subsequent GET /api/state reads -- was never swapped in.
+    assert runtime.config.opportunity_screen_interval_minutes == before
+    assert not json.loads(Path(runtime.config_path).read_text()).get(
+        "opportunity_screen_interval_minutes") == 10
+
+
+def test_writable_routes_succeed_normally_once_the_lock_is_released(tmp_path):
+    """The other half of the proof above: identical runtime, identical
+    request, no competing lock held -- must succeed, proving the 503s above
+    were genuinely about contention and not some other defect."""
+    runtime, store = make_runtime(tmp_path, now=T0)
+    runtime.process_lock_data_dir = tmp_path
+    req = add_pending(store, now=T0)
+    runtime.now_fn = lambda: T0 + timedelta(seconds=46)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=b"{}",
+    )
+    assert result.status == 200
+
+
+def test_process_lock_data_dir_unset_preserves_the_old_unlocked_behavior(tmp_path):
+    """`process_lock_data_dir` defaults to `None` -- every existing test
+    above this section (and any real deployment that has not opted in)
+    must be completely unaffected: a POST/PATCH succeeds even while some
+    OTHER, unrelated directory's lock is held, because this runtime was
+    never told which directory to serialize against."""
+    runtime, store = make_runtime(tmp_path, now=T0)
+    assert runtime.process_lock_data_dir is None
+    req = add_pending(store, now=T0)
+    runtime.now_fn = lambda: T0 + timedelta(seconds=46)
+    with acquire_process_lock(tmp_path / "unrelated"):
+        result = route_request(
+            runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+            body=b"{}",
+        )
+    assert result.status == 200
+
+
+def test_get_api_state_is_never_locked_even_while_the_scheduled_loop_holds_it(tmp_path):
+    """Requirement: never hold a lock merely for a read-only GET. Proven
+    here the same way the writable routes are proven locked -- the
+    scheduled loop holds the SAME directory's lock throughout, and the read
+    must still succeed immediately, not queue or refuse."""
+    runtime, _ = make_runtime(tmp_path)
+    runtime.process_lock_data_dir = tmp_path
+    with acquire_process_lock(tmp_path):
+        result = route_request(runtime, method="GET", path="/api/state")
+    assert result.status == 200
+    assert json.loads(result.body)["mode"] == "PAPER"
+
+
+def test_get_api_credentials_is_never_locked_either(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    runtime.process_lock_data_dir = tmp_path
+    with acquire_process_lock(tmp_path):
+        result = route_request(runtime, method="GET", path="/api/credentials")
+    assert result.status == 200
 
 
 # ------------------------------------------------------------------- static serving
@@ -731,3 +851,67 @@ def test_get_api_state_with_no_refresh_fn_keeps_old_one_shot_behavior(tmp_path):
     assert runtime.broker_state_refresh_fn is None
     payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
     assert payload["risk_gates"]["settled_cash_usd"] == 77.0
+
+
+# ---------------------------------------- Unit E (reconstructed 2026-08-13):
+# operational_state_refresh_fn -- mirrors broker_state_refresh_fn's own
+# per-request-refresh tests exactly, same reasoning (see that field's own
+# docstring): a long-running dashboard process and the real scheduled
+# run_agent.py are separate OS processes, so operational_state must be
+# re-read per request, never captured once at construction.
+
+def test_get_api_state_calls_operational_state_refresh_fn_when_set(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        return "PAUSED", "PRODUCTION_ACTIVE"
+
+    runtime.operational_state_refresh_fn = refresh
+    result = route_request(runtime, method="GET", path="/api/state")
+    payload = json.loads(result.body)
+    assert len(calls) == 1
+    assert payload["operational_state"] == "PAUSED"
+    assert payload["operational_state_paused_from"] == "PRODUCTION_ACTIVE"
+
+
+def test_get_api_state_calls_operational_state_refresh_fn_again_on_a_second_request(tmp_path):
+    """A second, separate process (the real run_agent.py) writing a new
+    mode between two dashboard polls must be visible on the very next
+    poll -- proves this is a per-request re-read, not captured once."""
+    runtime, _ = make_runtime(tmp_path)
+    readings = iter([("PAUSED", "PRODUCTION_ACTIVE"), ("PRODUCTION_ACTIVE", None)])
+
+    def refresh():
+        return next(readings)
+
+    runtime.operational_state_refresh_fn = refresh
+    first = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    second = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert first["operational_state"] == "PAUSED"
+    assert second["operational_state"] == "PRODUCTION_ACTIVE"
+
+
+def test_get_api_state_with_no_operational_state_refresh_fn_reports_unavailable(tmp_path):
+    """`operational_state_refresh_fn=None` (the field's own default): the
+    dashboard must never fabricate a state -- rendered as an honest null,
+    never inferred from broker_environment/mode."""
+    runtime, _ = make_runtime(tmp_path)
+    assert runtime.operational_state_refresh_fn is None
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["operational_state"] is None
+    assert payload["operational_state_unavailable_reason"] is not None
+
+
+def test_get_api_state_operational_state_paper_broker_environment_does_not_imply_active(tmp_path):
+    """THE bug this unit exists to close, proven at the route_request
+    layer (not just build_dashboard_state's own unit tests): PAPER broker
+    environment + PAUSED persisted operational state must both be visible,
+    simultaneously, disagreeing -- never one masking the other."""
+    runtime, _ = make_runtime(tmp_path)
+    runtime.operational_state_refresh_fn = lambda: ("PAUSED", "PRODUCTION_ACTIVE")
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["mode"] == runtime.config.mode
+    assert payload["broker_environment"] == runtime.config.mode
+    assert payload["operational_state"] == "PAUSED"

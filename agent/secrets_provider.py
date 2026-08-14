@@ -61,7 +61,9 @@ bug to special-case or route around.
 from __future__ import annotations
 
 import subprocess
+import time
 from abc import ABC, abstractmethod
+from typing import Callable
 
 _SERVICE_PREFIX = "investmentagent"
 
@@ -156,3 +158,82 @@ class InMemorySecretsProvider(SecretsProvider):
             return self._entries[secret_ref]
         except KeyError:
             raise SecretNotFoundError(mode=self.mode, secret_ref=secret_ref) from None
+
+
+class CachingSecretsProvider(SecretsProvider):
+    """UNIT A FIX (reconstructed 2026-08-13, Keychain prompt storm).
+
+    THE DEFECT THIS CLOSES. `agent.broker.alpaca.AlpacaPaperAdapter.
+    _headers()` calls `self._secrets.resolve(...)` fresh on every real
+    HTTP call, by design (see that module's own CREDENTIALS section) --
+    and `agent.broker.selection.select_broker_adapter` calls `.resolve()`
+    once more, as a fail-fast presence check, before constructing anything.
+    Neither `KeychainSecretsProvider` nor `InMemorySecretsProvider` caches
+    anything (this module's own long-standing docstring: "RESOLVED FRESH,
+    NEVER CACHED HERE") -- that design note was written to describe a
+    generic `SecretsProvider` contract, but for the concrete
+    `KeychainSecretsProvider` implementation, "resolve fresh" means a real
+    `/usr/bin/security find-generic-password` subprocess invocation, which
+    macOS can gate behind a per-invocation Keychain-access confirmation
+    prompt depending on that item's ACL. Measured (tests/test_run_
+    dashboard.py::test_measured_resolve_count_per_steady_state_refresh_is_
+    four_uncached): FOUR resolve() calls per single, steady-state GET
+    /api/state -- one presence check plus one per account()/positions()/
+    open_orders() HTTP call -- and dashboard/static/dashboard_bind.js
+    polls every 5 seconds (`POLL_INTERVAL_MS = 5000`), for the life of an
+    open browser tab.
+
+    THE FIX: a bounded-TTL cache wrapping any `SecretsProvider`, keyed by
+    `secret_ref` (this provider is already bound to one mode, per the base
+    class's own isolation contract -- see module docstring -- so no mode
+    key is needed). A successful resolve is cached for `ttl_seconds`
+    (default 300s = 5 minutes); a `SecretNotFoundError` is NEVER cached --
+    a transient failure (e.g. the login keychain briefly locked after
+    sleep, per this module's own KEYCHAIN MECHANISM section) must be
+    retried on the very next call, not remembered as permanently absent,
+    matching this codebase's fail-safe-to-NO-TRADE discipline: caching an
+    absence could paper over a credential becoming available again without
+    a restart, but never the reverse (a cached PRESENT value going briefly
+    stale for up to `ttl_seconds` is the only risk accepted here, and 5
+    minutes is short relative to any credential-rotation operator
+    workflow, which is out-of-band and manual regardless -- see this
+    module's own PROVISIONING section).
+
+    NOT a general-purpose cache: no eviction beyond TTL expiry, no size
+    bound (this codebase resolves at most a handful of distinct
+    secret_refs per process: alpaca_api_secret, and optionally a
+    gatekeeper signing key), and `now_fn` is injectable purely for tests
+    (production leaves it `None` and gets `time.monotonic`, immune to
+    real-wall-clock changes across a sleep/wake cycle)."""
+
+    def __init__(self, wrapped: SecretsProvider, *, ttl_seconds: float = 300.0,
+                now_fn: Callable[[], float] | None = None):
+        super().__init__(wrapped.mode)
+        self._wrapped = wrapped
+        self._ttl_seconds = ttl_seconds
+        self._now_fn = now_fn or time.monotonic
+        self._cache: dict[str, tuple[str, float]] = {}   # secret_ref -> (value, cached_at)
+
+    def resolve(self, secret_ref: str) -> str:
+        cached = self._cache.get(secret_ref)
+        if cached is not None:
+            value, cached_at = cached
+            if self._now_fn() - cached_at < self._ttl_seconds:
+                return value
+        value = self._wrapped.resolve(secret_ref)   # SecretNotFoundError propagates, never cached
+        self._cache[secret_ref] = (value, self._now_fn())
+        return value
+
+
+def default_keychain_secrets_provider_factory(mode: str) -> SecretsProvider:
+    """The ONE production `secrets_provider_factory` default -- used by
+    BOTH `scripts/run_agent.py` and `scripts/run_dashboard.py` (previously
+    each used bare `KeychainSecretsProvider` directly as their own default,
+    two independent call sites making the same "wrap it in a cache" change
+    would otherwise have needed applying twice). Returns a
+    `CachingSecretsProvider` wrapping a real `KeychainSecretsProvider` for
+    `mode` -- see `CachingSecretsProvider`'s own docstring for why (Unit A,
+    the Keychain prompt storm fix). Tests never use this: they inject
+    `InMemorySecretsProvider`-based factories directly, exactly as before
+    this function existed."""
+    return CachingSecretsProvider(KeychainSecretsProvider(mode))

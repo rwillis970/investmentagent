@@ -210,7 +210,26 @@ def test_sync_fills_runs_before_reconciliation_so_a_real_fill_is_not_a_false_mis
     some earlier process/session placed it), bypassing this loop entirely.
     Reconciling that broker state against a ledger that has never synced it
     would halt on a phantom positions mismatch -- run_cycle must not do
-    that, because it syncs first."""
+    that, because it syncs first.
+
+    UPDATED for the cash-seed-ordering fix (2026-08-14, agent/account_
+    wiring.py's own module docstring's REAL INCIDENT section): this is
+    this account's very first cycle, so `opening is None` when
+    build_account_reconciliation runs. The quarantined execution below now
+    blocks the CASH seed too, not just positions (the whole point of this
+    fix -- a pending execution's cash effect may already be baked into the
+    broker's current settled-cash figure, exactly as it was for positions
+    already). So the halt now happens EARLIER and MORE DIRECTLY than
+    before this fix: `LedgerStoreError` from `store.to_ledger()`'s own
+    "refuses to guess" check, raised before `run_startup`'s
+    `reconcile_positions` ever gets a chance to run at all -- not a
+    `ReconciliationMismatch` with both sides populated, the way it used
+    to. This is a STRICTER proof of the same underlying claim, not a
+    weaker one: sync_fills still ran first (the execution IS quarantined,
+    not silently missing), and reconciliation still correctly refuses to
+    proceed on an account with unreviewed broker activity -- it now
+    refuses at the earliest possible point (seeding) rather than the
+    latest (position comparison)."""
     b = SimulatorBroker(account_id=ACCT, cash=500.0, now=IN_SESSION)
     key = b"k" * 32
     b.attach_staging_key(key)
@@ -231,19 +250,13 @@ def test_sync_fills_runs_before_reconciliation_so_a_real_fill_is_not_a_false_mis
     # OrderRecord for c1 was never staged through this loop, so sync_fills
     # cannot recover a holding_policy_version for this BUY -- it no longer
     # raises (agent/execution_quarantine.py's own unit: unresolved intent is
-    # quarantined, not fatal), so `local_positions` stays legitimately empty
-    # rather than fabricating the real SPY position. Reconciliation therefore
-    # STILL correctly halts -- not on a phantom mismatch invented by ordering,
-    # but on the genuine, real fact that this position exists at the broker
-    # and is not yet tracked locally (an operator must --admit-execution it).
-    # This is what actually proves sync ran first: the halt comes from
-    # reconcile_positions with real, both-sides-populated numbers, not from
-    # sync_fills failing to run at all.
-    # `broker-reported positions` now carries a real Decimal qty (2026-07-28
-    # Decimal migration -- agent/broker/base.py's Position.qty), so the
-    # broker side's repr is `{'SPY': Decimal('1.0')}`, not `{'SPY': 1.0}`.
-    from agent.reconciliation import ReconciliationMismatch
-    with pytest.raises(ReconciliationMismatch, match=r"\{'SPY': Decimal\('1\.0'\)\}"):
+    # quarantined, not fatal). Proves sync_fills genuinely ran (the
+    # execution is quarantined, a real durable fact -- not silently
+    # absent), and that the pending quarantine correctly blocks BOTH
+    # seeds (cash-seed-ordering fix, 2026-08-14) before reconciliation
+    # ever compares broker vs. local positions at all.
+    from agent.ledger_store import LedgerStoreError
+    with pytest.raises(LedgerStoreError, match="no opening_settled_cash recorded"):
         run_cycle(
             accounts=[acct], adapter_factory=lambda a: b,
             mode_store=mode_store_at("PAPER", now=IN_SESSION),

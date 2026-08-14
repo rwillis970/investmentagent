@@ -28,6 +28,7 @@ from agent.execution_quarantine import ADMITTED, REJECTED, ExecutionQuarantineSt
 from agent.ledger_store import LedgerStore
 from agent.mode_store import ModeStore
 from agent.secrets_provider import InMemorySecretsProvider
+from agent.process_lock import acquire_process_lock
 from scripts.run_agent import (DataDirConflict, _account_ids_in,
                                _check_data_dir_sanity, build_account_runtime,
                                main)
@@ -1816,6 +1817,233 @@ def test_submit_approved_is_idempotent_across_two_separate_invocations(tmp_path,
     assert len(shared_adapter._orders) == 1
 
 
+# ------------------------------------------------- writer-lock gap (2026-08-14)
+# `_run_one_shot_locked` closes the gap left after Unit B (process_lock.py):
+# the scheduled loop already acquired `acquire_process_lock(args.data_dir)`
+# before touching any store, but --advance-mode-to/--admit-execution/
+# --reject-execution/--admit-cash-event/--reject-cash-event/--submit-approved
+# each returned from main() before ever reaching that lock. These tests hold
+# the SAME lock a real scheduled loop would hold mid-cycle (a genuine
+# `fcntl.flock`, exactly as tests/test_process_lock.py's own primitive-level
+# tests use it -- not mocked) and assert each one-shot dispatch now refuses
+# instead of racing it, writes nothing, and (for --submit-approved
+# specifically) never constructs a broker adapter at all.
+
+def test_advance_mode_refuses_and_writes_nothing_while_the_scheduled_loop_holds_the_lock(
+    tmp_path, caplog,
+):
+    data_dir = tmp_path / "data"
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    argv = _mode_argv(mode_path, audit_path, "RESEARCH") + ["--data-dir", str(data_dir)]
+    with acquire_process_lock(data_dir):   # simulates the scheduled loop mid-cycle
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(argv)
+    assert code == 1
+    assert not mode_path.exists()
+    assert not audit_path.exists()
+    assert any("advance-mode-to" in r.message for r in caplog.records)
+
+
+def test_advance_mode_succeeds_normally_once_the_competing_lock_is_released(tmp_path):
+    """Other half of the proof above: identical argv, no competing lock."""
+    data_dir = tmp_path / "data"
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    argv = _mode_argv(mode_path, audit_path, "RESEARCH") + ["--data-dir", str(data_dir)]
+    assert main(argv) == 0
+    assert ModeStore(mode_path).current() == "RESEARCH"
+
+
+def test_admit_execution_refuses_and_writes_nothing_while_the_scheduled_loop_holds_the_lock(
+    tmp_path, caplog,
+):
+    data_dir = tmp_path / "data"
+    quarantine_path = tmp_path / "q.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_buy(quarantine_path)
+    argv = _admit_argv(
+        account_id="acct-a", quarantine_path=quarantine_path, audit_path=audit_path,
+        execution_id="e1", holding_policy_version="hp-v1",
+    ) + ["--data-dir", str(data_dir)]
+    with acquire_process_lock(data_dir):
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(argv)
+    assert code == 1
+    assert not audit_path.exists()
+    store = ExecutionQuarantineStore(quarantine_path, account_id="acct-a")
+    assert store.status("e1") == "PENDING"   # still un-resolved -- never admitted
+    assert any("admit-execution" in r.message for r in caplog.records)
+
+
+def test_reject_execution_refuses_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    data_dir = tmp_path / "data"
+    quarantine_path = tmp_path / "q.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_buy(quarantine_path)
+    argv = _admit_argv(
+        account_id="acct-a", quarantine_path=quarantine_path, audit_path=audit_path,
+        execution_id="e1", reject=True,
+    ) + ["--data-dir", str(data_dir)]
+    with acquire_process_lock(data_dir):
+        code = main(argv)
+    assert code == 1
+    store = ExecutionQuarantineStore(quarantine_path, account_id="acct-a")
+    assert store.status("e1") == "PENDING"
+
+
+def test_admit_cash_event_refuses_and_writes_nothing_while_the_scheduled_loop_holds_the_lock(
+    tmp_path, caplog,
+):
+    data_dir = tmp_path / "data"
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    ledger_store_path = tmp_path / "ledger.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    event_created_at = datetime(2026, 7, 29, 0, 7, 16, tzinfo=timezone.utc)
+    baseline_established_at = datetime(2026, 7, 27, 18, 22, 41, tzinfo=timezone.utc)
+    _quarantine_a_cash_event(cash_quarantine_path, created_at=event_created_at)
+    LedgerStore(ledger_store_path, account_id="acct-a",
+               policy_registry=HoldingPolicyRegistry()).write_opening_balance(
+        __import__("decimal").Decimal("500"), at=baseline_established_at)
+    argv = _cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1", ledger_store_path=ledger_store_path,
+    ) + ["--data-dir", str(data_dir)]
+    with acquire_process_lock(data_dir):
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(argv)
+    assert code == 1
+    assert not audit_path.exists()
+    store = CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")
+    assert store.status("a1") == "PENDING"   # never admitted
+    assert any("admit-cash-event" in r.message for r in caplog.records)
+
+
+def test_reject_cash_event_refuses_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    data_dir = tmp_path / "data"
+    cash_quarantine_path = tmp_path / "cq.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    _quarantine_a_cash_event(cash_quarantine_path)
+    argv = _cash_event_argv(
+        account_id="acct-a", cash_quarantine_path=cash_quarantine_path,
+        audit_path=audit_path, activity_id="a1", reject=True,
+    ) + ["--data-dir", str(data_dir)]
+    with acquire_process_lock(data_dir):
+        code = main(argv)
+    assert code == 1
+    store = CashEventQuarantineStore(cash_quarantine_path, account_id="acct-a")
+    assert store.status("a1") == "PENDING"
+
+
+def test_submit_approved_refuses_and_never_touches_the_adapter_while_the_scheduled_loop_holds_the_lock(
+    tmp_path, monkeypatch, caplog,
+):
+    """The requirement this test exists for verbatim: `--submit-approved`
+    MUST acquire the lock before `adapter.submit` can ever be reached. The
+    fake `AlpacaPaperAdapter` here raises if constructed at all -- if the
+    lock wrapper here had a gap, this test would fail on that raise, not
+    just on the exit code."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    store_path, result = _submit_approved_request(tmp_path)
+
+    def _must_not_be_constructed(*a, **k):
+        raise AssertionError(
+            "adapter.submit must be unreachable when the process lock "
+            "could not be acquired -- construction alone is already a bug")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _must_not_be_constructed)
+
+    argv = _submit_approved_argv(
+        tmp_path=tmp_path, request_id=result.request.request_id,
+        config_path=config_path, approval_request_store_path=store_path,
+    ) + ["--data-dir", str(data_dir)]
+    with acquire_process_lock(data_dir):
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(
+                argv, secrets_provider_factory=_secrets_provider_factory,
+                now_fn=lambda: _SA_SUBMIT_AT,
+            )
+    assert code == 1
+    assert any("submit-approved" in r.message for r in caplog.records)
+    # And the request itself is still exactly as un-decided/un-submitted as
+    # it was before this call -- refusal happened before any store write.
+    audit = AuditLog(path=tmp_path / "audit.jsonl")
+    assert not any(e.action == "approval_execution_submitted" for e in audit.events)
+
+
+def test_submit_approved_succeeds_normally_once_the_competing_lock_is_released(
+    tmp_path, monkeypatch,
+):
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    store_path, result = _submit_approved_request(tmp_path)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _fake_alpaca_factory())
+
+    argv = _submit_approved_argv(
+        tmp_path=tmp_path, request_id=result.request.request_id,
+        config_path=config_path, approval_request_store_path=store_path,
+    ) + ["--data-dir", str(data_dir)]
+    code = main(
+        argv, secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _SA_SUBMIT_AT,
+    )
+    assert code == 0
+
+
+def _hold_one_shot_lock_forever(data_dir, acquired_event):
+    """Real, separate OS process (not a thread -- see tests/
+    test_process_lock.py's own docstring for why this must be a genuine
+    second process to prove anything about flock). Used by the crash-
+    release test below: this process is SIGKILLed, never exits cleanly."""
+    import time as time_module
+    with acquire_process_lock(data_dir):
+        acquired_event.set()
+        time_module.sleep(30)
+
+
+def test_advance_mode_can_proceed_immediately_after_the_lock_holder_is_sigkilled(tmp_path):
+    """Crash release, exercised through the NEW one-shot call site
+    (`_run_one_shot_locked`), not just the underlying primitive (already
+    covered exhaustively in tests/test_process_lock.py): a real process
+    holding the data_dir lock is SIGKILLed with no cleanup code of any kind
+    running, and --advance-mode-to must succeed immediately afterward --
+    proving the crash-release guarantee actually reaches this new caller,
+    not just agent.process_lock's own direct tests."""
+    import multiprocessing
+    import os
+    import signal
+
+    data_dir = tmp_path / "data"
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    acquired = multiprocessing.Event()
+    proc = multiprocessing.Process(target=_hold_one_shot_lock_forever,
+                                   args=(str(data_dir), acquired))
+    proc.start()
+    try:
+        assert acquired.wait(timeout=10), "child process never acquired the lock"
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.join(timeout=10)
+        assert proc.exitcode == -signal.SIGKILL
+
+        argv = _mode_argv(mode_path, audit_path, "RESEARCH") + ["--data-dir", str(data_dir)]
+        code = main(argv)
+        assert code == 0
+        assert ModeStore(mode_path).current() == "RESEARCH"
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+
 # --------------------------------------------- data-dir sanity guard (runtime-recovery unit, 2026-08-13)
 # The defect this closes: a real Alpaca fill was admitted into one data
 # directory's ledger while a SIBLING directory, also usable as --data-dir,
@@ -2004,3 +2232,57 @@ def test_data_dir_relevant_stays_false_when_every_store_path_is_explicit(tmp_pat
     argv = _argv(tmp_path, tmp_path / "config.json")
     args = _parse_args(argv)
     assert args.data_dir_relevant is False
+
+
+# ---------------------------------------- Unit B (reconstructed 2026-08-13):
+# process lock wiring in main()'s scheduled-loop path.
+
+def test_main_refuses_and_returns_nonzero_when_the_data_dir_is_already_locked(tmp_path, caplog):
+    """Wiring proof, not a re-test of agent.process_lock itself (see
+    tests/test_process_lock.py for the primitive's own subprocess/SIGKILL
+    tests): if another process already holds the lock for --data-dir, main()
+    must fail safe -- non-zero exit, a clear log line, never a raised
+    exception, never proceeding to construct any store or touch the loop."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    def run_loop_that_must_never_be_called(**kwargs):
+        raise AssertionError("run_loop_fn must never be called when the "
+                             "data_dir lock could not be acquired")
+
+    argv = [
+        "--config", str(config_path), "--data-dir", str(data_dir),
+        "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
+    ]
+    with acquire_process_lock(data_dir):   # simulates a second real process already running
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(
+                argv, run_loop_fn=run_loop_that_must_never_be_called,
+                secrets_provider_factory=_secrets_provider_factory,
+            )
+    assert code == 1
+    assert any("run_agent halted" in r.message for r in caplog.records)
+
+
+def test_main_succeeds_normally_once_the_competing_lock_is_released(tmp_path):
+    """The other half of the proof above: the SAME data_dir, SAME argv,
+    with no competing lock held -- must succeed normally, proving the
+    failure above was genuinely about lock contention, not some other
+    defect the first test's assertions happened not to catch."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    def succeeding_run_loop(**kwargs):
+        return None
+
+    argv = [
+        "--config", str(config_path), "--data-dir", str(data_dir),
+        "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
+    ]
+    code = main(argv, run_loop_fn=succeeding_run_loop,
+               secrets_provider_factory=_secrets_provider_factory)
+    assert code == 0

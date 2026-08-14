@@ -30,7 +30,8 @@ from agent.accounts import CrossAccountError
 from agent.broker.base import Position
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry, HoldingViolation
 from agent.ledger import (CashAdjustment, DuplicateCashAdjustmentError,
-                          DuplicateFillError, Fill, LotOverdrawnError,
+                          DuplicateFillError, DuplicateOpeningBalanceCorrectionError,
+                          Fill, LotOverdrawnError, OpeningBalanceCorrection,
                           OrderRecord, UnknownLotError)
 from agent.ledger_store import LedgerStore, LedgerStoreError
 from agent.lot_selection import (ALPACA_DEFAULT_POLICY, LotSelectionMethod,
@@ -71,6 +72,19 @@ def cash_adjustment(adjustment_id="a1", account_id=ACCT, amount="-0.01",
                           description=description,
                           effective_date=effective_date or _date(2026, 7, 28),
                           symbol=symbol)
+
+
+def opening_balance_correction(correction_id="c1", account_id=ACCT, amount="20.00",
+                               reason="repair for double-counted SPY fill",
+                               corrects_opening_balance_established_at=None,
+                               recorded_at=None):
+    return OpeningBalanceCorrection(
+        correction_id=correction_id, account_id=account_id,
+        amount=to_decimal(amount), reason=reason,
+        corrects_opening_balance_established_at=(
+            corrects_opening_balance_established_at or T0),
+        recorded_at=recorded_at or T0,
+    )
 
 
 # -------------------------------------------------------------- fresh store
@@ -729,3 +743,113 @@ def test_cash_adjustment_survives_a_reload(tmp_path):
     reloaded = store(path)
     assert reloaded.known_cash_adjustment_ids() == frozenset({"a1"})
     assert reloaded.to_ledger().settled_cash(now=T0) == Decimal("499.99")
+
+
+# ------------------------------------- opening-balance corrections (Task 2,
+# one-time historical repair unit, real double-counted SPY fill found
+# 2026-08-14 against the live paper account)
+
+def test_write_opening_balance_correction_is_visible_via_known_ids(tmp_path):
+    s = store(tmp_path / "ledger.jsonl")
+    assert s.known_opening_balance_correction_ids() == frozenset()
+    s.write_opening_balance_correction(opening_balance_correction(correction_id="c1"))
+    assert s.known_opening_balance_correction_ids() == frozenset({"c1"})
+
+
+def test_write_opening_balance_correction_needs_no_opening_balance_seeded_yet(tmp_path):
+    """Same reasoning as `write_cash_adjustment` (2026-07-30): this store
+    validates SHAPE, not the operator's semantic claim that a specific
+    prior opening_balance row exists to be corrected -- see
+    `LedgerStore.write_opening_balance_correction`'s own docstring."""
+    s = store(tmp_path / "ledger.jsonl")
+    s.write_opening_balance_correction(opening_balance_correction())   # must not raise
+    assert s.known_opening_balance_correction_ids() == frozenset({"c1"})
+
+
+def test_write_opening_balance_correction_for_the_wrong_account_halts(tmp_path):
+    s = store(tmp_path / "ledger.jsonl", account_id=ACCT)
+    with pytest.raises(CrossAccountError):
+        s.write_opening_balance_correction(
+            opening_balance_correction(account_id=ACCT_B))
+
+
+def test_a_different_opening_balance_correction_under_the_same_id_is_rejected_before_disk(tmp_path):
+    with tempfile.TemporaryDirectory() as d:
+        s = store(Path(d) / "ledger.jsonl")
+        s.write_opening_balance_correction(
+            opening_balance_correction(correction_id="c1", amount="20.00"))
+
+        def _boom(*a, **k):
+            raise AssertionError("_append_row must not be called for a rejected write")
+        s._append_row = _boom   # noqa: SLF001 -- deliberate white-box check
+        with pytest.raises(DuplicateOpeningBalanceCorrectionError):
+            s.write_opening_balance_correction(
+                opening_balance_correction(correction_id="c1", amount="21.00"))
+
+
+def test_opening_balance_correction_reflected_in_settled_cash_after_seeding(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    s = store(path)
+    s.write_opening_balance(Decimal("460.0"), at=T0)
+    s.write_opening_balance_correction(opening_balance_correction(amount="20.00"))
+    assert s.to_ledger().settled_cash(now=T0) == Decimal("480.00")
+
+
+def test_opening_balance_correction_survives_a_reload(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    s = store(path)
+    s.write_opening_balance(Decimal("460.0"), at=T0)
+    s.write_opening_balance_correction(
+        opening_balance_correction(correction_id="c1", amount="20.00"))
+
+    reloaded = store(path)
+    assert reloaded.known_opening_balance_correction_ids() == frozenset({"c1"})
+    assert reloaded.to_ledger().settled_cash(now=T0) == Decimal("480.00")
+
+
+def test_opening_balance_correction_is_the_exact_shape_of_the_real_task2_repair(tmp_path):
+    """End-to-end reproduction of the real incident's proposed repair,
+    against a store shaped exactly like the real canonical
+    data/ledger.jsonl (opening_balance=480 seeded 2026-08-12T16:06:48.185029+00:00
+    AFTER one SPY BUY fill already existed) -- proves the correction record
+    this store now persists actually closes the $460/$480 gap end to end,
+    not just in isolated Ledger-level arithmetic (see tests/test_ledger.py's
+    own coverage for that half)."""
+    # Real bug order (the whole point of Task 1's fix): the SPY BUY was
+    # QUARANTINED, not yet written as a Fill, in the same cycle the cash
+    # seed ran -- so `write_opening_balance` saw zero local fills and
+    # seeded the broker's raw (already-post-fill) 480 verbatim. The Fill
+    # itself was only written by the NEXT sync_fills call, after this
+    # store already believed 480 was the correct, not-yet-fill-adjusted
+    # baseline. Reproducing that exact order here, not the fixed order.
+    seeded_at = datetime(2026, 8, 12, 16, 6, 48, 185029, tzinfo=timezone.utc)
+    path = tmp_path / "ledger.jsonl"
+    s = store(path)
+    # The real canonical data/ledger.jsonl's third row: a real broker-
+    # sourced CAT fee CashAdjustment, already reflected in the 480 broker
+    # figure exactly like the fill is -- included here so this
+    # reproduction is the exact real three-row shape, not an
+    # approximation of it.
+    s.write_cash_adjustment(cash_adjustment(
+        adjustment_id="20260728000000000::de3745eb-7d16-4bf3-9514-234693d9f84e",
+        amount="-0.01", activity_type="FEE",
+        description="CAT fee for proceed of 1 trades on 2026-07-28 by PA3XZX944LRR"))
+    s.write_opening_balance(Decimal("480"), at=seeded_at)
+    s.write_fill(fill(fill_id="20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346",
+                      side="BUY", lot_id="l1", qty=0.027087234, price=737.986,
+                      at=datetime(2026, 7, 28, 14, 42, 51, 412408, tzinfo=timezone.utc)))
+    assert s.to_ledger().settled_cash(now=seeded_at) == Decimal("460.00")
+
+    s.write_opening_balance_correction(OpeningBalanceCorrection(
+        correction_id="repair-2026-08-14-001", account_id=ACCT,
+        amount=Decimal("20.00"),
+        reason="opening_balance seeded 2026-08-12T16:06:48.185029+00:00 "
+              "already reflected fill "
+              "20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346 "
+              "(SPY BUY 0.027087234 @ 737.986); that fill's own BUY-debit "
+              "in settled_cash() double-counts it",
+        corrects_opening_balance_established_at=seeded_at,
+        recorded_at=seeded_at,
+    ))
+    assert s.to_ledger().settled_cash(now=seeded_at) == Decimal("480.00")
+

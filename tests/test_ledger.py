@@ -23,8 +23,9 @@ from agent.accounts import CrossAccountError
 from agent.holding import (HoldingPolicy, HoldingPolicyRegistry, HoldingViolation,
                            open_lots, sellable_qty)
 from agent.ledger import (CashAdjustment, DuplicateCashAdjustmentError,
-                          DuplicateFillError, Fill, Ledger, LedgerError,
-                          LotOverdrawnError, OrderRecord, UnknownLotError)
+                          DuplicateFillError, DuplicateOpeningBalanceCorrectionError,
+                          Fill, Ledger, LedgerError, LotOverdrawnError,
+                          OpeningBalanceCorrection, OrderRecord, UnknownLotError)
 from agent.lot_selection import (ALPACA_DEFAULT_POLICY, LotSelectionMethod,
                                  LotSelectionPolicy)
 from agent.money import to_decimal
@@ -694,6 +695,106 @@ def test_ledger_reconstructible_from_its_record_includes_cash_adjustments():
         cash_adjustments=l1.cash_adjustments,
     )
     assert l2.settled_cash(now=FRI) == l1.settled_cash(now=FRI) == Decimal("399.99")
+
+
+def opening_balance_correction(correction_id="c1", account_id=ACCT, amount="20.00",
+                               reason="repair for double-counted SPY fill "
+                               "fill-l1-buy: opening_balance seeded 2026-08-12 "
+                               "already reflected this fill",
+                               corrects_opening_balance_established_at=None,
+                               recorded_at=None):
+    return OpeningBalanceCorrection(
+        correction_id=correction_id, account_id=account_id,
+        amount=to_decimal(amount), reason=reason,
+        corrects_opening_balance_established_at=(
+            corrects_opening_balance_established_at or FRI),
+        recorded_at=recorded_at or FRI,
+    )
+
+
+# ------------------------------------ opening-balance corrections (Task 2,
+# real double-counted SPY fill found 2026-08-14 against the live paper
+# account -- see agent.account_wiring's own module docstring for the full
+# incident this record type exists to correct)
+
+def test_an_opening_balance_correction_is_visible_to_settled_cash_immediately():
+    l = ledger(opening=460.0)
+    l.record_opening_balance_correction(opening_balance_correction(amount="20.00"))
+    assert l.settled_cash(now=FRI) == Decimal("480.00")
+
+
+def test_an_opening_balance_correction_does_not_disturb_lot_accounting():
+    l = ledger()
+    l.record_fill(buy(qty=2.0, price=100.0, at=FRI))
+    l.record_opening_balance_correction(opening_balance_correction(amount="20.00"))
+    assert l.positions() == {"SPY": 2.0}
+    assert l.disposal_records() == []
+
+
+def test_a_negative_opening_balance_correction_debits_settled_cash():
+    l = ledger(opening=460.0)
+    l.record_opening_balance_correction(
+        opening_balance_correction(amount="-5.00"))
+    assert l.settled_cash(now=FRI) == Decimal("455.00")
+
+
+def test_opening_balance_corrections_for_the_wrong_account_halt():
+    l = ledger(account_id=ACCT)
+    with pytest.raises(CrossAccountError):
+        l.record_opening_balance_correction(
+            opening_balance_correction(account_id=ACCT_B))
+
+
+def test_recording_the_identical_opening_balance_correction_twice_is_a_no_op():
+    l = ledger(opening=460.0)
+    c = opening_balance_correction(amount="20.00")
+    l.record_opening_balance_correction(c)
+    l.record_opening_balance_correction(c)
+    assert l.settled_cash(now=FRI) == Decimal("480.00")
+
+
+def test_recording_a_different_opening_balance_correction_under_the_same_id_is_an_error():
+    l = ledger()
+    l.record_opening_balance_correction(
+        opening_balance_correction(correction_id="c1", amount="20.00"))
+    with pytest.raises(DuplicateOpeningBalanceCorrectionError):
+        l.record_opening_balance_correction(
+            opening_balance_correction(correction_id="c1", amount="21.00"))
+
+
+def test_opening_balance_corrections_are_a_read_only_tuple():
+    l = ledger()
+    l.record_opening_balance_correction(opening_balance_correction())
+    assert isinstance(l.opening_balance_corrections, tuple)
+    assert l.opening_balance_corrections[0].correction_id == "c1"
+
+
+def test_ledger_reconstructible_from_its_record_includes_opening_balance_corrections():
+    l1 = ledger(opening=460.0)
+    l1.record_fill(buy(lot_id="l1", qty=1.0, price=100.0, at=FRI))
+    l1.record_opening_balance_correction(opening_balance_correction(amount="20.00"))
+
+    l2 = Ledger.from_records(
+        account_id=ACCT, opening_settled_cash=Decimal("460.0"), policy_registry=registry(),
+        fills=l1.fills, order_records=l1.order_records,
+        opening_balance_corrections=l1.opening_balance_corrections,
+    )
+    assert l2.settled_cash(now=FRI) == l1.settled_cash(now=FRI) == Decimal("380.00")
+
+
+def test_an_opening_balance_correction_is_not_a_cash_adjustment():
+    """Distinct types, distinct ids, distinct storage -- a correction never
+    shows up in `cash_adjustments` and a cash adjustment never shows up in
+    `opening_balance_corrections`, even though both feed `settled_cash`
+    unconditionally. See `OpeningBalanceCorrection`'s own docstring for why
+    these are deliberately not the same record type."""
+    l = ledger(opening=460.0)
+    l.record_cash_adjustment(cash_adjustment(adjustment_id="a1", amount="-0.01"))
+    l.record_opening_balance_correction(
+        opening_balance_correction(correction_id="c1", amount="20.00"))
+    assert [a.adjustment_id for a in l.cash_adjustments] == ["a1"]
+    assert [c.correction_id for c in l.opening_balance_corrections] == ["c1"]
+    assert l.settled_cash(now=FRI) == Decimal("479.99")
 
 
 def test_an_unsupported_lot_selection_policy_is_refused_not_approximated():

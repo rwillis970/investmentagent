@@ -43,6 +43,86 @@ def test_returns_the_configured_mode(tmp_path):
     assert state["mode"] == "PAPER"
 
 
+# ---------------------------------------- Unit E (reconstructed 2026-08-13):
+# PAPER-vs-PAUSED truth -- operational_state is a separate field from
+# broker-environment "mode"/"broker_environment", never conflated.
+
+def test_broker_environment_is_a_new_alias_for_the_same_unchanged_mode_value(tmp_path):
+    cfg = _cfg(mode="PAPER")
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+    )
+    assert state["mode"] == "PAPER"
+    assert state["broker_environment"] == "PAPER"
+
+
+def test_operational_state_defaults_to_null_when_not_supplied(tmp_path):
+    """No caller wired a ModeStore read at all -- must render as an honest
+    'not supplied,' never as a fabricated PRODUCTION_ACTIVE/PAUSED/DISABLED
+    value, and never silently inferred from mode/broker_environment."""
+    cfg = _cfg(mode="PAPER")
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+    )
+    assert state["operational_state"] is None
+    assert state["operational_state_unavailable_reason"] is not None
+    assert state["operational_state_paused_from"] is None
+
+
+def test_operational_state_paused_is_never_implied_by_a_paper_broker_environment(tmp_path):
+    """THE bug this unit exists to close: broker_environment == 'PAPER'
+    must never be read as 'this account is actively trading.' Constructs
+    the exact scenario described in the standing live-Mac checkpoint --
+    broker environment PAPER, persisted operational state PAUSED -- and
+    proves the two fields disagree correctly, rather than one masking the
+    other."""
+    cfg = _cfg(mode="PAPER")
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+        operational_state="PAUSED", operational_state_paused_from="PRODUCTION_ACTIVE",
+    )
+    assert state["mode"] == "PAPER"
+    assert state["broker_environment"] == "PAPER"
+    assert state["operational_state"] == "PAUSED"
+    assert state["operational_state_paused_from"] == "PRODUCTION_ACTIVE"
+    assert state["operational_state_unavailable_reason"] is None
+
+
+def test_operational_state_disabled_is_a_real_value_not_an_unavailable_reason(tmp_path):
+    """A fresh, never-written ModeStore's own documented baseline
+    ('DISABLED') is a genuine, legitimate value -- must render via the
+    PRESENT branch, not be confused with the 'nothing was supplied' null
+    branch above, even though both involve a kind of absence."""
+    cfg = _cfg(mode="PAPER")
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+        operational_state="DISABLED",
+    )
+    assert state["operational_state"] == "DISABLED"
+    assert state["operational_state_unavailable_reason"] is None
+
+
+def test_operational_state_paused_from_is_null_when_state_is_not_paused(tmp_path):
+    cfg = _cfg(mode="PAPER")
+    cost_ledger, tracker, store, audit = _stores(tmp_path)
+    state = build_dashboard_state(
+        now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
+        approval_request_store=store, audit_log=audit,
+        operational_state="PRODUCTION_ACTIVE",
+    )
+    assert state["operational_state"] == "PRODUCTION_ACTIVE"
+    assert state["operational_state_paused_from"] is None
+    assert state["operational_state_paused_from_unavailable_reason"] is not None
+
+
 def test_cost_section_reflects_the_real_cost_ledger(tmp_path):
     cfg = _cfg()
     cost_ledger, tracker, store, audit = _stores(tmp_path)

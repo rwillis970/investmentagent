@@ -10,6 +10,7 @@ store is the same "quarantine, not a halt, not a guess" answer
 unresolvable execution, applied to an unresolvable CASH movement instead."""
 from __future__ import annotations
 
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -246,3 +247,125 @@ def test_a_pre_created_at_row_from_the_real_account_decodes_with_created_at_none
     pending = s.pending()
     assert len(pending) == 1
     assert pending[0].created_at is None
+
+
+# --------------------------------------------------- Unit A: load is read-only
+# quarantine-store-integrity-and-spy-forensics unit, 2026-08-14 -- same real
+# defect as agent/execution_quarantine.py (see that test file's own section
+# for the full writeup): `_load_into` used to replay every row THROUGH
+# `quarantine`/`admit`/`reject`, duplicating the file on every load. Confirmed
+# on the real account: data/cash_quarantine.jsonl independently accumulated
+# 786 lines for 2 logical events from the exact same defect. All temp-file-
+# only.
+
+def _seed(tmp_path):
+    path = tmp_path / "cash_quarantine.jsonl"
+    s = CashEventQuarantineStore(path, account_id=ACCT)
+    s.quarantine(activity(activity_id="a1"), reason="unexplained cash movement: FEE/CAT", at=T0)
+    s.quarantine(activity(activity_id="a2", activity_type="DIV", activity_sub_type=None,
+                          net_amount="1.23", symbol="SPY", description="dividend"),
+                reason="unexplained cash movement: DIV", at=T0)
+    s.admit("a1", decided_by="ray", decided_at=T0)
+    s.reject("a2", decided_by="ray", decided_at=T0)
+    return path
+
+
+def _sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_a_single_reload_appends_zero_bytes(tmp_path):
+    path = _seed(tmp_path)
+    before_bytes = path.read_bytes()
+    before_lines = len(before_bytes.splitlines())
+    CashEventQuarantineStore(path, account_id=ACCT)
+    after_bytes = path.read_bytes()
+    assert after_bytes == before_bytes
+    assert len(after_bytes.splitlines()) == before_lines
+
+
+def test_a_hundred_reloads_append_zero_bytes_and_hash_never_changes(tmp_path):
+    path = _seed(tmp_path)
+    before_hash = _sha256(path)
+    before_lines = len(path.read_bytes().splitlines())
+    for _ in range(100):
+        CashEventQuarantineStore(path, account_id=ACCT)
+        assert _sha256(path) == before_hash
+        assert len(path.read_bytes().splitlines()) == before_lines
+
+
+def test_reload_does_not_disturb_logical_state_or_pending_counts(tmp_path):
+    path = _seed(tmp_path)
+    for _ in range(5):
+        reloaded = CashEventQuarantineStore(path, account_id=ACCT)
+    assert reloaded.status("a1") == ADMITTED
+    assert reloaded.status("a2") == REJECTED
+    assert reloaded.pending() == ()
+    quarantined, resolutions = reloaded.load()
+    assert len(quarantined) == 2
+    assert len(resolutions) == 2
+
+
+def test_quarantine_admit_reject_each_individually_survive_many_reloads(tmp_path):
+    path = tmp_path / "cash_quarantine.jsonl"
+    s = CashEventQuarantineStore(path, account_id=ACCT)
+    s.quarantine(activity(activity_id="a-pending"), reason="x", at=T0)
+    s.quarantine(activity(activity_id="a-admitted"), reason="x", at=T0)
+    s.admit("a-admitted", decided_by="ray", decided_at=T0)
+    s.quarantine(activity(activity_id="a-rejected"), reason="x", at=T0)
+    s.reject("a-rejected", decided_by="ray", decided_at=T0)
+
+    for _ in range(10):
+        r = CashEventQuarantineStore(path, account_id=ACCT)
+        assert r.status("a-pending") == PENDING
+        assert r.status("a-admitted") == ADMITTED
+        assert r.status("a-rejected") == REJECTED
+        assert [q.activity_id for q in r.pending()] == ["a-pending"]
+
+
+def test_a_real_bloated_pre_existing_duplicate_file_collapses_cleanly_and_does_not_grow(tmp_path):
+    """Reproduces the SHAPE of the real, already-corrupted
+    data/cash_quarantine.jsonl (hundreds of byte-identical duplicate
+    quarantine/resolution pairs from the pre-fix bug) using a synthetic temp
+    file -- never the real file."""
+    path = tmp_path / "cash_quarantine.jsonl"
+    quarantined_row = (
+        '{"kind": "quarantined", "activity_id": "a1", "account_id": "%s", '
+        '"activity_type": "FEE", "activity_sub_type": "CAT", '
+        '"net_amount": "-0.01", "date": "2026-07-28", "created_at": '
+        '"2026-07-29T00:07:16+00:00", "symbol": null, '
+        '"description": "CAT fee", "reason": "unexplained cash movement: FEE/CAT", '
+        '"quarantined_at": "2026-08-12T16:06:48.185029+00:00"}\n' % ACCT
+    )
+    resolution_row = (
+        '{"kind": "resolution", "activity_id": "a1", "account_id": "%s", '
+        '"decision": "ADMITTED", "decided_by": "operator", '
+        '"decided_at": "2026-08-12T23:35:29.473928+00:00", "notes": null}\n' % ACCT
+    )
+    path.write_text((quarantined_row + resolution_row) * 50)
+    before_lines = len(path.read_bytes().splitlines())
+    assert before_lines == 100
+
+    s = CashEventQuarantineStore(path, account_id=ACCT)   # must not raise
+    assert s.status("a1") == ADMITTED
+    quarantined, resolutions = s.load()
+    assert len(quarantined) == 1
+    assert len(resolutions) == 1
+
+    after_lines = len(path.read_bytes().splitlines())
+    assert after_lines == before_lines
+
+    CashEventQuarantineStore(path, account_id=ACCT)
+    assert len(path.read_bytes().splitlines()) == before_lines
+
+
+def test_repeated_diagnostic_style_construction_does_not_mutate_the_file(tmp_path):
+    """Mirrors agent/diagnostics.py's diagnose_account, which constructs a
+    FRESH CashEventQuarantineStore on every call. Simulates 20 rapid reads."""
+    path = _seed(tmp_path)
+    before_hash = _sha256(path)
+    for _ in range(20):
+        polled = CashEventQuarantineStore(path, account_id=ACCT)
+        _ = polled.pending()
+        _ = polled.load()
+    assert _sha256(path) == before_hash

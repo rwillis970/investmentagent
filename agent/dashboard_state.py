@@ -96,12 +96,39 @@ def build_dashboard_state(
     day_trade_guard: DayTradeGuard | None = None,
     ledger: Ledger | None = None,
     audit_recent_limit: int = 20,
+    operational_state: str | None = None,
+    operational_state_paused_from: str | None = None,
 ) -> dict:
     """Assemble the single JSON document the dashboard's GET /api/state
     returns. Every store this function reads is passed in by the caller
     (`agent.dashboard_server`, wired to the real, running process's own
     stores) -- this function itself opens nothing and constructs no
-    collaborator, so it is directly unit-testable against fakes/fixtures."""
+    collaborator, so it is directly unit-testable against fakes/fixtures.
+
+    PAPER-vs-PAUSED (Unit E, reconstructed 2026-08-13). `config.mode` (the
+    pre-existing `"mode"` key below, UNCHANGED) is the BROKER ENVIRONMENT --
+    which Alpaca endpoint/credential namespace this process is configured
+    to talk to (PAPER vs live) -- set once, at process construction, from
+    `--mode`/config, and never updated at runtime. It answers "which broker
+    account would an order go to," NOT "is this account currently allowed
+    to trade." That second, entirely different question is the PERSISTED
+    OPERATIONAL STATE -- `agent.mode_store.ModeStore`'s own durable,
+    append-only history of PRODUCTION_ACTIVE/PAUSED/DISABLED transitions
+    (see that module's own docstring) -- and conflating the two is exactly
+    the bug this unit exists to close: a dashboard showing `mode: "PAPER"`
+    must never be read as "this account is actively trading" when the
+    real, persisted operational state is PAUSED or DISABLED. `operational_
+    state`/`operational_state_paused_from` are NEW, SEPARATE fields (never
+    a rename or reinterpretation of `"mode"`, which keeps its old meaning
+    and old callers' expectations intact) -- `None` (both fields' own
+    default) means "not supplied by the caller," rendered via the same
+    `_prefixed`/`_null`/`_present` honesty convention as every other
+    "maybe not available" field in this module, so the frontend can tell
+    "the operational state genuinely could not be read" apart from any
+    real value, including the string "DISABLED" itself, which IS a real,
+    legitimate value (a fresh, never-written ModeStore's own documented
+    baseline -- agent.mode_store.ModeStore.current()'s own docstring),
+    never itself a stand-in for "unknown"."""
     today = now.date()
     session = market_calendar.session_for_instant(now)
 
@@ -321,6 +348,18 @@ def build_dashboard_state(
     return {
         "generated_at": now.isoformat(),
         "mode": config.mode,
+        "broker_environment": config.mode,
+        **_prefixed("operational_state", (
+            _present(operational_state) if operational_state is not None
+            else _null("no operational_state was supplied to build_dashboard_state "
+                      "(ModeStore read failed, was unavailable, or this caller has "
+                      "no ModeStore wired -- never implies PRODUCTION_ACTIVE or any "
+                      "other specific state)"))),
+        **_prefixed("operational_state_paused_from", (
+            _present(operational_state_paused_from)
+            if operational_state_paused_from is not None
+            else _null("either operational_state is not PAUSED, or paused_from "
+                      "could not be determined"))),
         "session": session.isoformat(),
         "cost": cost,
         "data_collection": data_collection,
