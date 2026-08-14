@@ -861,9 +861,55 @@ def test_operational_state_refresh_reads_paused_from_when_state_is_paused(tmp_pa
     assert paused_from == "PRODUCTION_ACTIVE"
 
 
-def test_operational_state_refresh_degrades_to_none_none_on_a_corrupt_store_file(tmp_path):
+def test_operational_state_refresh_reports_disabled_on_a_lone_truncated_first_row(tmp_path):
+    """UPDATED (writer-lock-gap unit, round 2, Unit 3, 2026-08-14): a mode-
+    state file containing exactly ONE malformed line is indistinguishable
+    from a crash mid-write of this store's very first-ever row -- agent.
+    mode_store.ModeStore._load() now tolerates a malformed FINAL line (see
+    its own docstring) and falls back to the last row it can positively
+    prove was durably written, which here is none at all, i.e. the
+    documented empty-history/fresh-install baseline. That baseline is not
+    "unknown" -- agent/mode_store.py's own module docstring and agent/
+    mode.py's normalize_persisted() already both define `current() is
+    None` as meaning DISABLED, and scripts/run_dashboard.py's
+    _refresh_operational_state renders that as the literal string
+    "DISABLED" (a real, safe, no-trade value -- see tests/
+    test_dashboard_state.py::test_operational_state_disabled_is_a_real_
+    value_not_an_unavailable_reason), not as an unavailable/None diagnostic.
+    Nothing about this changes the actual startup gate: agent/startup.py
+    and scripts/run_agent.py's scheduled loop each build their own
+    ModeStore and call mode.assert_legal_startup directly -- neither reads
+    this dashboard-only refresh function at all. See test immediately
+    below for the case that still degrades to (None, None): corruption
+    that is NOT explainable as a crash-truncated last row."""
     mode_store_path = tmp_path / "m.jsonl"
     mode_store_path.write_text("{not valid json\n")
+    runtime = build_dashboard_runtime(
+        _cfg(), config_path="c.json", account_id="acct-1",
+        now=datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),
+        **{**_all_store_paths(tmp_path), "mode_store_path": mode_store_path},
+    )
+    assert runtime.operational_state_refresh_fn() == ("DISABLED", None)
+
+
+def test_operational_state_refresh_still_degrades_to_none_none_on_unrecoverable_corruption(
+    tmp_path,
+):
+    """The case the ORIGINAL version of the test above meant to cover:
+    corruption that cannot be explained as a crash mid-write of a single
+    interrupted final row -- here, a well-formed first row followed by a
+    malformed row that is NOT the last line. ModeStore._load() still
+    raises ModeStoreError for this (see its own docstring: "there is no
+    fsync-ordering argument that could explain corruption in the MIDDLE of
+    this file as 'just a crash'"), so the dashboard's own broad
+    `except Exception` still degrades this to the honest, fully-unknown
+    (None, None) -- never a fabricated operational_state."""
+    mode_store_path = tmp_path / "m.jsonl"
+    mode_store_path.write_text(
+        '{"seq": 1, "mode": "PAPER", "changed_at": "2026-07-20T15:00:00+00:00"}\n'
+        '{not valid json -- and NOT the last line\n'
+        '{"seq": 3, "mode": "PAUSED", "changed_at": "2026-07-20T15:05:00+00:00"}\n'
+    )
     runtime = build_dashboard_runtime(
         _cfg(), config_path="c.json", account_id="acct-1",
         now=datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),

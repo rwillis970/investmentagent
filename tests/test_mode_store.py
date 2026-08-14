@@ -7,6 +7,7 @@ separate write path" from anything a candidate, playbook or model output
 could reach. See migrations/003_mode_state.sql for the corresponding
 policy.mode_state table.
 """
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -190,3 +191,165 @@ def test_seq_is_not_advanced_by_a_failed_write(tmp_path):
     store._path = tmp_path / "mode_state.jsonl"
     c = store.write("PAPER", changed_at=T0)
     assert c.seq == 1
+
+
+# ---------------------------------------------------------------------------
+# Unit 3 (writer-lock-gap unit, round 2, 2026-08-14): crash/corruption
+# adversarial coverage. REQUIRED SAFETY PROPERTY, proven throughout this
+# section: unknown or corrupt mode state must never enable trading -- every
+# case below either (a) recovers to the last row this store can positively
+# PROVE was durably written, never a guess, or (b) raises loudly, which
+# every real caller (scripts/run_agent.py's scheduled loop, --advance-mode-
+# to, scripts/run_dashboard.py's _refresh_operational_state, agent/
+# diagnostics.py -- see agent/mode_store.py's own ModeStore._load docstring
+# for the full call-site audit) already converts into a safe, fail-closed
+# outcome: refuse to start a cycle, or degrade to an honest "unknown" /
+# UNAVAILABLE, never a fabricated PAPER/RUNNING default.
+
+def test_a_crash_truncated_final_row_is_discarded_current_falls_back_to_the_prior_good_row(
+    tmp_path,
+):
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("RESEARCH", changed_at=T0)
+    store.write("PAPER", changed_at=T0 + timedelta(minutes=1))
+    # Simulate a crash mid-write of a THIRD transition: a well-formed file
+    # with one final, syntactically-broken trailing line appended by hand
+    # (exactly what a SIGKILL between fh.write() and os.fsync() can leave).
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"seq": 3, "mode": "PRODUCTION_ACTIVE", "changed_at": "2026-0')
+
+    reloaded = ModeStore(path)
+    assert reloaded.current() == "PAPER"   # the last row it can PROVE, not a guess
+    assert len(reloaded.history()) == 2
+    assert reloaded.truncated_tail_on_load is not None
+    assert "PRODUCTION_ACTIVE" in reloaded.truncated_tail_on_load
+
+
+def test_a_crash_truncated_final_row_logs_a_warning_naming_the_file(tmp_path, caplog):
+    import logging as logging_module
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("RESEARCH", changed_at=T0)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("{not valid json at all")
+
+    with caplog.at_level(logging_module.WARNING, logger="investmentagent.mode_store"):
+        ModeStore(path)
+    assert any("discarding an unparseable final line" in r.message for r in caplog.records)
+
+
+def test_a_malformed_middle_row_raises_and_never_silently_skips(tmp_path):
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("RESEARCH", changed_at=T0)
+    store.write("PAPER", changed_at=T0 + timedelta(minutes=1))
+    lines = path.read_text().splitlines()
+    # Corrupt the FIRST row (not the last) in place.
+    lines[0] = lines[0][:20]   # truncate mid-JSON, but this is NOT the final line
+    path.write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(ModeStoreError, match="NOT the final line"):
+        ModeStore(path)
+
+
+def test_an_empty_file_is_the_ordinary_fresh_install_baseline_not_corruption(tmp_path):
+    path = tmp_path / "mode_state.jsonl"
+    path.write_text("")
+    store = ModeStore(path)
+    assert store.current() is None
+    assert store.history() == ()
+    assert store.truncated_tail_on_load is None
+
+
+def test_a_missing_file_is_also_the_ordinary_fresh_install_baseline(tmp_path):
+    path = tmp_path / "does-not-exist.jsonl"
+    store = ModeStore(path)
+    assert store.current() is None
+    assert store.history() == ()
+
+
+def test_a_missing_required_key_on_the_final_row_is_tolerated_like_any_other_truncation(
+    tmp_path,
+):
+    """A crash can truncate a row anywhere, including mid-key -- {"seq": 3,
+    "mode": "PAPER" with no changed_at at all is a plausible interrupted
+    write, not distinguishable in kind from a syntactically-invalid JSON
+    truncation, and must be tolerated the same way (last line only)."""
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("RESEARCH", changed_at=T0)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"seq": 2, "mode": "PAPER"}) + "\n")   # valid JSON, missing key...
+        # ...but complete this to be genuinely a missing-key case, not a
+        # syntax truncation (proves the except clause's KeyError branch,
+        # not just JSONDecodeError).
+
+    reloaded = ModeStore(path)
+    assert reloaded.current() == "RESEARCH"
+    assert reloaded.truncated_tail_on_load is not None
+
+
+def test_a_corrupted_timestamp_on_the_final_row_is_tolerated_like_any_other_truncation(
+    tmp_path,
+):
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("RESEARCH", changed_at=T0)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"seq": 2, "mode": "PAPER",
+                             "changed_at": "not-a-real-timestamp"}) + "\n")
+
+    reloaded = ModeStore(path)
+    assert reloaded.current() == "RESEARCH"
+    assert reloaded.truncated_tail_on_load is not None
+
+
+def test_a_corrupted_timestamp_in_the_middle_still_raises(tmp_path):
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("RESEARCH", changed_at=T0)
+    store.write("PAPER", changed_at=T0 + timedelta(minutes=1))
+    lines = path.read_text().splitlines()
+    row = json.loads(lines[0])
+    row["changed_at"] = "not-a-real-timestamp"
+    lines[0] = json.dumps(row)
+    path.write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(ModeStoreError, match="NOT the final line"):
+        ModeStore(path)
+
+
+def test_duplicate_consecutive_transitions_to_the_same_mode_are_harmless(tmp_path):
+    """Not corruption at all -- two consecutive real writes of the same
+    mode (e.g. an operator re-running --advance-mode-to for a mode the
+    system is already in) must not confuse current()/history() or be
+    mistaken for conflicting/ambiguous state."""
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("RESEARCH", changed_at=T0)
+    store.write("RESEARCH", changed_at=T0 + timedelta(minutes=1))
+
+    reloaded = ModeStore(path)
+    assert reloaded.current() == "RESEARCH"
+    assert len(reloaded.history()) == 2
+
+
+def test_an_unknown_mode_value_is_a_semantic_concern_of_agent_mode_not_mode_store(tmp_path):
+    """ModeStore itself is pure persistence -- it does not validate mode
+    names (see its own module docstring: this is deliberate separation of
+    concerns). A garbage mode string decodes without error here; the
+    membership check that refuses it lives in agent.mode.assert_
+    legal_startup (agent/mode.py's own MODES/_KNOWN), which every real
+    startup path already consults before trusting a persisted mode -- see
+    this unit's own report for the full call-site trace. This test proves
+    ONLY that ModeStore does not crash or silently coerce the value; it is
+    not this test's job to re-prove agent.mode's own validation."""
+    path = tmp_path / "mode_state.jsonl"
+    store = ModeStore(path)
+    store.write("NOT_A_REAL_MODE", changed_at=T0)
+
+    reloaded = ModeStore(path)
+    assert reloaded.current() == "NOT_A_REAL_MODE"   # persisted verbatim, not validated here
+    from agent.mode import MODES
+    assert "NOT_A_REAL_MODE" not in MODES   # confirms agent.mode WOULD reject this downstream
