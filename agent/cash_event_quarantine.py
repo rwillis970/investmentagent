@@ -325,35 +325,108 @@ class CashEventQuarantineStore:
         """Read the whole file before replaying anything (same reasoning
         as `ExecutionQuarantineStore._load_into`/`LedgerStore._load_into`:
         the reader must never observe a row written during its own
-        replay). Rows are replayed THROUGH `quarantine`/`admit`/`reject` --
-        the same validated path a fresh write goes through."""
+        replay).
+
+        LOADING MUST BE PURELY READ-ONLY (Unit A fix, 2026-08-14 --
+        quarantine-store-integrity-and-spy-forensics unit). Rows used to be
+        replayed THROUGH `quarantine`/`admit`/`reject` themselves -- the
+        real write methods. Those methods decide "already known, no-op" by
+        checking `self._quarantined`/`self._resolutions`, which are EMPTY
+        at the start of every `_load_into` call, so the first occurrence of
+        every row in the file always looked new and was appended to disk
+        again -- a fresh load turned N physical lines into 2N, then 3N on
+        the NEXT load, forever, on every process start, every diagnostic
+        read, and every dashboard poll (`scripts/run_dashboard.py` and
+        `agent/diagnostics.py` both construct a fresh store on every call).
+        Confirmed on the real account: `data/quarantine.jsonl` grew from
+        830 to 838 lines from dashboard polling alone during this very
+        investigation.
+
+        The fix: replay now applies each row DIRECTLY to the in-memory
+        `_quarantined`/`_resolutions` dicts via `_replay_quarantine`/
+        `_replay_resolution`, which share the SAME validation
+        `quarantine()`/`_record_resolution()` apply (cross-account check,
+        unknown-kind/decision refusal, BUY/SELL field requirements via
+        `ExecutionQuarantineStore`'s own version, "never quarantined"/
+        "already resolved differently" corruption checks) but never call
+        `_append_row`. A process lock around the old replay was considered
+        and rejected: that would only serialize the corruption (one
+        duplicate copy per load instead of a torn one), not stop it -- the
+        defect is architectural (replay routed through the disk-appending
+        write path at all), not a concurrency race."""
         with self._path.open(encoding="utf-8") as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
         for line in lines:
             row = json.loads(line)
             kind = row.get("kind")
             if kind == "quarantined":
-                self.quarantine(_decode_activity(row), reason=row["reason"],
-                                at=datetime.fromisoformat(row["quarantined_at"]))
+                self._replay_quarantine(_decode_activity(row), reason=row["reason"],
+                                        at=datetime.fromisoformat(row["quarantined_at"]))
             elif kind == "resolution":
-                if row["decision"] == ADMITTED:
-                    self.admit(row["activity_id"], decided_by=row["decided_by"],
-                              decided_at=datetime.fromisoformat(row["decided_at"]),
-                              notes=row.get("notes"))
-                elif row["decision"] == REJECTED:
-                    self.reject(row["activity_id"], decided_by=row["decided_by"],
-                               decided_at=datetime.fromisoformat(row["decided_at"]),
-                               notes=row.get("notes"))
-                else:
+                if row["decision"] not in _DECISIONS:
                     raise CashEventQuarantineError(
                         f"unrecognised resolution decision {row['decision']!r}"
                     )
+                resolution = CashEventResolution(
+                    activity_id=row["activity_id"], account_id=row["account_id"],
+                    decision=row["decision"], decided_by=row["decided_by"],
+                    decided_at=datetime.fromisoformat(row["decided_at"]),
+                    notes=row.get("notes"),
+                )
+                self._replay_resolution(resolution)
             else:
                 raise CashEventQuarantineError(
                     f"unrecognised cash event quarantine row kind {kind!r} -- "
                     "refusing to silently skip a row this version does not "
                     "understand"
                 )
+
+    def _replay_quarantine(self, activity: AccountActivity, *, reason: str,
+                           at: datetime) -> None:
+        """Applies one persisted 'quarantined' row to in-memory state ONLY
+        -- never calls `_append_row`. Shares `quarantine()`'s cross-account
+        check and first-occurrence-wins idempotency (a restated duplicate
+        of an already-seen `activity_id` -- including the hundreds of real,
+        pre-existing duplicate rows this bug already wrote to
+        `data/cash_quarantine.jsonl` -- is silently ignored on replay, the
+        same as it would be if quarantined twice live). See `_load_into`'s
+        docstring for why this is a separate method from `quarantine()`
+        rather than that method reused directly."""
+        if activity.account_id != self.account_id:
+            raise CrossAccountError(self.account_id, activity.account_id,
+                                    "CashEventQuarantineStore._load_into")
+        if activity.activity_id in self._quarantined:
+            return
+        self._quarantined[activity.activity_id] = QuarantinedCashEvent(
+            activity_id=activity.activity_id, account_id=activity.account_id,
+            activity_type=activity.activity_type,
+            activity_sub_type=activity.activity_sub_type,
+            net_amount=to_decimal(activity.net_amount), date=activity.date,
+            created_at=activity.created_at, symbol=activity.symbol,
+            description=activity.description, reason=reason, quarantined_at=at,
+        )
+
+    def _replay_resolution(self, resolution: CashEventResolution) -> None:
+        """Applies one persisted 'resolution' row to in-memory state ONLY
+        -- never calls `_append_row`. Shares `_record_resolution`'s
+        validation: `activity_id` must already have been quarantined (a
+        resolution row with no matching quarantine row is corruption, not
+        silently skipped); an identical replay of an already-resolved
+        `activity_id` is a safe no-op (matches the hundreds of real
+        duplicate resolution rows this bug wrote); a SECOND, DIFFERENT
+        decision under the same `activity_id` is refused exactly as it
+        would be live -- append-only, replay-validated, same as before."""
+        self._require_quarantined(resolution.activity_id)
+        existing = self._resolutions.get(resolution.activity_id)
+        if existing is not None:
+            if existing == resolution:
+                return
+            raise CashEventQuarantineError(
+                f"cash event {resolution.activity_id!r} was already resolved "
+                f"({existing.decision}); a resolution is permanent and does not "
+                "get a second, different decision"
+            )
+        self._resolutions[resolution.activity_id] = resolution
 
 
 def _encode_quarantined(record: QuarantinedCashEvent) -> dict:
