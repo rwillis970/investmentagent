@@ -125,6 +125,18 @@ class DashboardRuntime:
     broker_state_refresh_fn: Callable[
         [], tuple["AccountSnapshot | None", "tuple[Position, ...]",
                  "DayTradeGuard | None", "Ledger | None"]] | None = None
+    # UNIT E (reconstructed 2026-08-13): PAPER-vs-PAUSED truth. Mirrors
+    # broker_state_refresh_fn's own reasoning exactly -- ModeStore is
+    # file-backed and this dashboard process and the real scheduled
+    # run_agent.py process are separate OS processes (separate LaunchAgents),
+    # so a ModeStore instance built once at dashboard startup would go
+    # stale the moment an operator's --advance-mode-to (or the scheduled
+    # loop's own startup sequence) wrote a new mode from the OTHER process.
+    # `None` (this field's own default) means "no ModeStore wired" --
+    # route_request leaves operational_state/operational_state_paused_from
+    # at None, which agent.dashboard_state.build_dashboard_state renders as
+    # an honest "not supplied," never as a fabricated state.
+    operational_state_refresh_fn: Callable[[], tuple[str | None, str | None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +175,14 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         if runtime.broker_state_refresh_fn is not None:
             (runtime.broker_account, runtime.broker_positions,
             runtime.day_trade_guard, runtime.ledger) = runtime.broker_state_refresh_fn()
+        # UNIT E: same per-request-refresh posture as broker_state_refresh_fn
+        # immediately above, for the identical cross-process-staleness
+        # reason -- see operational_state_refresh_fn's own field docstring.
+        operational_state = None
+        operational_state_paused_from = None
+        if runtime.operational_state_refresh_fn is not None:
+            operational_state, operational_state_paused_from = \
+                runtime.operational_state_refresh_fn()
         state = build_dashboard_state(
             now=now, config=runtime.config, cost_ledger=runtime.cost_ledger,
             opportunity_tracker=runtime.opportunity_tracker,
@@ -173,6 +193,8 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
             broker_positions=runtime.broker_positions,
             day_trade_guard=runtime.day_trade_guard,
             ledger=runtime.ledger,
+            operational_state=operational_state,
+            operational_state_paused_from=operational_state_paused_from,
         )
         return _json_result(200, state)
 

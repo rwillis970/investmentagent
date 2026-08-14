@@ -25,7 +25,8 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.secrets_provider import (InMemorySecretsProvider,
+from agent.secrets_provider import (CachingSecretsProvider,
+                                    InMemorySecretsProvider,
                                     KeychainSecretsProvider,
                                     SecretNotFoundError, SecretsProvider,
                                     _service_name)
@@ -181,3 +182,91 @@ def test_resolved_value_round_trips_exactly():
     provider = InMemorySecretsProvider(mode="PAPER")
     provider.put("k", "exact-value-123")
     assert provider.resolve("k") == "exact-value-123"
+
+
+# ---------------------------------------- Unit A (reconstructed 2026-08-13):
+# CachingSecretsProvider -- bounded-TTL cache closing the Keychain prompt
+# storm (see tests/test_run_dashboard.py's own measured-count test for the
+# real-call-path reproduction this class exists to fix).
+
+class _CountingProvider(InMemorySecretsProvider):
+    def __init__(self, mode="PAPER"):
+        super().__init__(mode=mode)
+        self.resolve_count = 0
+
+    def resolve(self, secret_ref):
+        self.resolve_count += 1
+        return super().resolve(secret_ref)
+
+
+def test_repeated_resolves_within_ttl_hit_the_underlying_provider_once():
+    underlying = _CountingProvider()
+    underlying.put("alpaca_secret", "s3cr3t")
+    clock = [0.0]
+    cache = CachingSecretsProvider(underlying, ttl_seconds=300.0, now_fn=lambda: clock[0])
+    for _ in range(10):
+        assert cache.resolve("alpaca_secret") == "s3cr3t"
+        clock[0] += 1.0   # 10 calls, 9 seconds apart in total -- well within TTL
+    assert underlying.resolve_count == 1
+
+
+def test_a_call_after_ttl_expiry_hits_the_underlying_provider_again():
+    underlying = _CountingProvider()
+    underlying.put("alpaca_secret", "s3cr3t")
+    clock = [0.0]
+    cache = CachingSecretsProvider(underlying, ttl_seconds=300.0, now_fn=lambda: clock[0])
+    cache.resolve("alpaca_secret")
+    clock[0] += 301.0   # just past the TTL
+    cache.resolve("alpaca_secret")
+    assert underlying.resolve_count == 2
+
+
+def test_a_secretnotfounderror_is_never_cached_and_is_retried_next_call():
+    """A transient failure (e.g. keychain briefly locked after sleep, see
+    agent/secrets_provider.py's own KEYCHAIN MECHANISM section) must never
+    be remembered as permanently absent -- caching only PRESENT values,
+    never absence, is the whole point (see CachingSecretsProvider's own
+    docstring)."""
+    underlying = _CountingProvider()   # nothing put() -- always raises
+    cache = CachingSecretsProvider(underlying, ttl_seconds=300.0, now_fn=lambda: 0.0)
+    with pytest.raises(SecretNotFoundError):
+        cache.resolve("alpaca_secret")
+    underlying.put("alpaca_secret", "now-provisioned")
+    assert cache.resolve("alpaca_secret") == "now-provisioned"
+    assert underlying.resolve_count == 2   # both calls reached the underlying provider
+
+
+def test_different_secret_refs_are_cached_independently():
+    underlying = _CountingProvider()
+    underlying.put("ref-a", "value-a")
+    underlying.put("ref-b", "value-b")
+    cache = CachingSecretsProvider(underlying, ttl_seconds=300.0, now_fn=lambda: 0.0)
+    assert cache.resolve("ref-a") == "value-a"
+    assert cache.resolve("ref-b") == "value-b"
+    assert cache.resolve("ref-a") == "value-a"
+    assert underlying.resolve_count == 2
+
+
+def test_caching_provider_exposes_the_wrapped_providers_mode():
+    underlying = InMemorySecretsProvider(mode="PAPER")
+    cache = CachingSecretsProvider(underlying)
+    assert cache.mode == "PAPER"
+
+
+def test_caching_provider_is_itself_a_secretsprovider():
+    assert issubclass(CachingSecretsProvider, SecretsProvider)
+
+
+def test_default_now_fn_is_time_monotonic_not_wall_clock(monkeypatch):
+    """Injectable now_fn defaults to time.monotonic, immune to real
+    wall-clock changes (e.g. NTP adjustment, sleep/wake) -- a TTL is a
+    duration, not a deadline against wall-clock time."""
+    import agent.secrets_provider as secrets_provider_module
+    calls = []
+    monkeypatch.setattr(secrets_provider_module.time, "monotonic",
+                        lambda: calls.append(1) or 42.0)
+    underlying = InMemorySecretsProvider(mode="PAPER")
+    underlying.put("k", "v")
+    cache = CachingSecretsProvider(underlying)
+    cache.resolve("k")
+    assert calls   # time.monotonic was actually consulted

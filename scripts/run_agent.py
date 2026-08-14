@@ -301,7 +301,9 @@ from agent.pipeline_stage import PipelineRuntime
 from agent.run_loop import (AccountRuntime, in_session_now,
                             seconds_until_next_session_open, run_loop as real_run_loop)
 from agent import runtime_status as runtime_status_module
-from agent.secrets_provider import KeychainSecretsProvider, SecretsProvider
+from agent.process_lock import acquire_process_lock
+from agent.secrets_provider import (SecretsProvider,
+                                    default_keychain_secrets_provider_factory)
 from agent.startup import _reconcile_mode_persistence
 from agent.store import FactStore
 
@@ -1461,7 +1463,8 @@ def _parse_args(argv: list[str] | None):
 
 def main(argv: list[str] | None = None, *,
         run_loop_fn: Callable = real_run_loop,
-        secrets_provider_factory: Callable[[str], SecretsProvider] = KeychainSecretsProvider,
+        secrets_provider_factory: Callable[[str], SecretsProvider]
+            = default_keychain_secrets_provider_factory,
         notify_fn: Callable[[str], None] = _default_notify,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         ) -> int:
@@ -1656,81 +1659,82 @@ def main(argv: list[str] | None = None, *,
             log.warning("runtime_status write itself failed: %s", status_exc)
 
     try:
-        # Runtime-recovery unit (2026-08-13): the data-dir sanity guard
-        # runs BEFORE anything else in this block -- before config is even
-        # read -- so a conflicting sibling directory is refused as early as
-        # possible, never after a store has already been opened against it.
-        # Gated on data_dir_relevant (see _parse_args's own comment): a
-        # caller who supplied every individual store path explicitly never
-        # actually used --data-dir, so there is nothing meaningful to check.
-        if getattr(args, "data_dir_relevant", False):
-            _check_data_dir_sanity(Path(args.data_dir), account_id=args.account_id)
+        with acquire_process_lock(args.data_dir):
+            # Runtime-recovery unit (2026-08-13): the data-dir sanity guard
+            # runs BEFORE anything else in this block -- before config is even
+            # read -- so a conflicting sibling directory is refused as early as
+            # possible, never after a store has already been opened against it.
+            # Gated on data_dir_relevant (see _parse_args's own comment): a
+            # caller who supplied every individual store path explicitly never
+            # actually used --data-dir, so there is nothing meaningful to check.
+            if getattr(args, "data_dir_relevant", False):
+                _check_data_dir_sanity(Path(args.data_dir), account_id=args.account_id)
 
-        cfg = config_module.load(json.loads(Path(args.config).read_text()))
-        secrets_provider = secrets_provider_factory(cfg.mode)
-        signing_key = _resolve_gatekeeper_signing_key(secrets_provider,
-                                                       args.signing_key_secret_ref)
-        credentials = BrokerCredentials(account_id=args.account_id, key_id=args.key_id,
-                                       secret_ref=args.secret_ref)
-        account = build_account_runtime(
-            cfg, account_id=args.account_id, credentials=credentials,
-            ledger_store_path=args.ledger_store_path,
-            quarantine_store_path=args.quarantine_store_path,
-            cash_quarantine_store_path=args.cash_quarantine_store_path,
-        )
+            cfg = config_module.load(json.loads(Path(args.config).read_text()))
+            secrets_provider = secrets_provider_factory(cfg.mode)
+            signing_key = _resolve_gatekeeper_signing_key(secrets_provider,
+                                                           args.signing_key_secret_ref)
+            credentials = BrokerCredentials(account_id=args.account_id, key_id=args.key_id,
+                                           secret_ref=args.secret_ref)
+            account = build_account_runtime(
+                cfg, account_id=args.account_id, credentials=credentials,
+                ledger_store_path=args.ledger_store_path,
+                quarantine_store_path=args.quarantine_store_path,
+                cash_quarantine_store_path=args.cash_quarantine_store_path,
+            )
 
-        mode_store = ModeStore(args.mode_store_path)
-        audit_log = AuditLog(path=args.audit_log_path)
-        # Runtime-recovery unit (2026-08-13): one row per process start,
-        # recording exactly which absolute directory this run resolved
-        # --data-dir to -- an operator reading audit.jsonl after the fact
-        # (or comparing two directories' own audit logs, the way this
-        # unit's own investigation had to) no longer has to infer it from
-        # file mtimes.
-        audit_log.append(
-            actor="system", action="data_dir_resolved", object_type="startup",
-            object_id="system",
-            after={"data_dir": str(Path(args.data_dir).resolve()),
-                  "account_id": args.account_id},
-            timestamp=now_fn(),
-        )
-        approval_service = ApprovalService(
-            expiration=timedelta(minutes=cfg.approval_expiration_minutes),
-            min_display=timedelta(seconds=cfg.approval_min_display_seconds),
-            max_per_day=cfg.max_approval_requests_per_day,
-            # Operator decision surface unit, 2026-08-03: `cfg.price_band_pct`
-            # is new this commit -- this construction used to omit it
-            # entirely, silently relying on `ApprovalService`'s own
-            # `price_band_pct: float = 1.0` default rather than a real,
-            # configured value (see that field's own comment in
-            # agent/config.py).
-            price_band_pct=cfg.price_band_pct,
-        )
-        pipeline = build_pipeline_runtime(
-            cfg, account_id=args.account_id, credentials=credentials,
-            secrets_provider=secrets_provider,
-            account_type=AccountType(args.account_type),
-            audit_log=audit_log, approval_service=approval_service,
-            signing_key=signing_key,
-            fact_store_path=args.fact_store_path,
-            cost_ledger_path=args.cost_ledger_path,
-            extraction_cache_path=args.extraction_cache_path,
-            analysis_result_store_path=args.analysis_result_store_path,
-            approval_request_store_path=args.approval_request_store_path,
-            opportunity_tracker_path=args.opportunity_tracker_path,
-        )
+            mode_store = ModeStore(args.mode_store_path)
+            audit_log = AuditLog(path=args.audit_log_path)
+            # Runtime-recovery unit (2026-08-13): one row per process start,
+            # recording exactly which absolute directory this run resolved
+            # --data-dir to -- an operator reading audit.jsonl after the fact
+            # (or comparing two directories' own audit logs, the way this
+            # unit's own investigation had to) no longer has to infer it from
+            # file mtimes.
+            audit_log.append(
+                actor="system", action="data_dir_resolved", object_type="startup",
+                object_id="system",
+                after={"data_dir": str(Path(args.data_dir).resolve()),
+                      "account_id": args.account_id},
+                timestamp=now_fn(),
+            )
+            approval_service = ApprovalService(
+                expiration=timedelta(minutes=cfg.approval_expiration_minutes),
+                min_display=timedelta(seconds=cfg.approval_min_display_seconds),
+                max_per_day=cfg.max_approval_requests_per_day,
+                # Operator decision surface unit, 2026-08-03: `cfg.price_band_pct`
+                # is new this commit -- this construction used to omit it
+                # entirely, silently relying on `ApprovalService`'s own
+                # `price_band_pct: float = 1.0` default rather than a real,
+                # configured value (see that field's own comment in
+                # agent/config.py).
+                price_band_pct=cfg.price_band_pct,
+            )
+            pipeline = build_pipeline_runtime(
+                cfg, account_id=args.account_id, credentials=credentials,
+                secrets_provider=secrets_provider,
+                account_type=AccountType(args.account_type),
+                audit_log=audit_log, approval_service=approval_service,
+                signing_key=signing_key,
+                fact_store_path=args.fact_store_path,
+                cost_ledger_path=args.cost_ledger_path,
+                extraction_cache_path=args.extraction_cache_path,
+                analysis_result_store_path=args.analysis_result_store_path,
+                approval_request_store_path=args.approval_request_store_path,
+                opportunity_tracker_path=args.opportunity_tracker_path,
+            )
 
-        run_loop_fn(
-            accounts=[account],
-            adapter_factory=_real_adapter_factory(secrets_provider),
-            mode_store=mode_store, audit_log=audit_log,
-            approval_service=approval_service, target_mode=cfg.mode,
-            confirmed=args.confirmed,
-            cadence_seconds=cfg.reconciliation_cycle_interval_seconds,
-            logger=log, pipeline=pipeline,
-            on_cycle_success=_on_cycle_success,
-        )
-        return 0
+            run_loop_fn(
+                accounts=[account],
+                adapter_factory=_real_adapter_factory(secrets_provider),
+                mode_store=mode_store, audit_log=audit_log,
+                approval_service=approval_service, target_mode=cfg.mode,
+                confirmed=args.confirmed,
+                cadence_seconds=cfg.reconciliation_cycle_interval_seconds,
+                logger=log, pipeline=pipeline,
+                on_cycle_success=_on_cycle_success,
+            )
+            return 0
     except Exception as exc:   # noqa: BLE001 -- see agent.run_loop.run_loop's
         # own docstring: this loop deliberately does not distinguish a
         # StartupHalted from any other error; every one of them means state

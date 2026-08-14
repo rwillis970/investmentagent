@@ -28,6 +28,7 @@ from agent.execution_quarantine import ADMITTED, REJECTED, ExecutionQuarantineSt
 from agent.ledger_store import LedgerStore
 from agent.mode_store import ModeStore
 from agent.secrets_provider import InMemorySecretsProvider
+from agent.process_lock import acquire_process_lock
 from scripts.run_agent import (DataDirConflict, _account_ids_in,
                                _check_data_dir_sanity, build_account_runtime,
                                main)
@@ -2004,3 +2005,57 @@ def test_data_dir_relevant_stays_false_when_every_store_path_is_explicit(tmp_pat
     argv = _argv(tmp_path, tmp_path / "config.json")
     args = _parse_args(argv)
     assert args.data_dir_relevant is False
+
+
+# ---------------------------------------- Unit B (reconstructed 2026-08-13):
+# process lock wiring in main()'s scheduled-loop path.
+
+def test_main_refuses_and_returns_nonzero_when_the_data_dir_is_already_locked(tmp_path, caplog):
+    """Wiring proof, not a re-test of agent.process_lock itself (see
+    tests/test_process_lock.py for the primitive's own subprocess/SIGKILL
+    tests): if another process already holds the lock for --data-dir, main()
+    must fail safe -- non-zero exit, a clear log line, never a raised
+    exception, never proceeding to construct any store or touch the loop."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    def run_loop_that_must_never_be_called(**kwargs):
+        raise AssertionError("run_loop_fn must never be called when the "
+                             "data_dir lock could not be acquired")
+
+    argv = [
+        "--config", str(config_path), "--data-dir", str(data_dir),
+        "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
+    ]
+    with acquire_process_lock(data_dir):   # simulates a second real process already running
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(
+                argv, run_loop_fn=run_loop_that_must_never_be_called,
+                secrets_provider_factory=_secrets_provider_factory,
+            )
+    assert code == 1
+    assert any("run_agent halted" in r.message for r in caplog.records)
+
+
+def test_main_succeeds_normally_once_the_competing_lock_is_released(tmp_path):
+    """The other half of the proof above: the SAME data_dir, SAME argv,
+    with no competing lock held -- must succeed normally, proving the
+    failure above was genuinely about lock contention, not some other
+    defect the first test's assertions happened not to catch."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(__import__("json").dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    def succeeding_run_loop(**kwargs):
+        return None
+
+    argv = [
+        "--config", str(config_path), "--data-dir", str(data_dir),
+        "--account-id", "acct-a", "--key-id", "k", "--secret-ref", "ref",
+        "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
+    ]
+    code = main(argv, run_loop_fn=succeeding_run_loop,
+               secrets_provider_factory=_secrets_provider_factory)
+    assert code == 0

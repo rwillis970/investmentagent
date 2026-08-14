@@ -731,3 +731,67 @@ def test_get_api_state_with_no_refresh_fn_keeps_old_one_shot_behavior(tmp_path):
     assert runtime.broker_state_refresh_fn is None
     payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
     assert payload["risk_gates"]["settled_cash_usd"] == 77.0
+
+
+# ---------------------------------------- Unit E (reconstructed 2026-08-13):
+# operational_state_refresh_fn -- mirrors broker_state_refresh_fn's own
+# per-request-refresh tests exactly, same reasoning (see that field's own
+# docstring): a long-running dashboard process and the real scheduled
+# run_agent.py are separate OS processes, so operational_state must be
+# re-read per request, never captured once at construction.
+
+def test_get_api_state_calls_operational_state_refresh_fn_when_set(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        return "PAUSED", "PRODUCTION_ACTIVE"
+
+    runtime.operational_state_refresh_fn = refresh
+    result = route_request(runtime, method="GET", path="/api/state")
+    payload = json.loads(result.body)
+    assert len(calls) == 1
+    assert payload["operational_state"] == "PAUSED"
+    assert payload["operational_state_paused_from"] == "PRODUCTION_ACTIVE"
+
+
+def test_get_api_state_calls_operational_state_refresh_fn_again_on_a_second_request(tmp_path):
+    """A second, separate process (the real run_agent.py) writing a new
+    mode between two dashboard polls must be visible on the very next
+    poll -- proves this is a per-request re-read, not captured once."""
+    runtime, _ = make_runtime(tmp_path)
+    readings = iter([("PAUSED", "PRODUCTION_ACTIVE"), ("PRODUCTION_ACTIVE", None)])
+
+    def refresh():
+        return next(readings)
+
+    runtime.operational_state_refresh_fn = refresh
+    first = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    second = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert first["operational_state"] == "PAUSED"
+    assert second["operational_state"] == "PRODUCTION_ACTIVE"
+
+
+def test_get_api_state_with_no_operational_state_refresh_fn_reports_unavailable(tmp_path):
+    """`operational_state_refresh_fn=None` (the field's own default): the
+    dashboard must never fabricate a state -- rendered as an honest null,
+    never inferred from broker_environment/mode."""
+    runtime, _ = make_runtime(tmp_path)
+    assert runtime.operational_state_refresh_fn is None
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["operational_state"] is None
+    assert payload["operational_state_unavailable_reason"] is not None
+
+
+def test_get_api_state_operational_state_paper_broker_environment_does_not_imply_active(tmp_path):
+    """THE bug this unit exists to close, proven at the route_request
+    layer (not just build_dashboard_state's own unit tests): PAPER broker
+    environment + PAUSED persisted operational state must both be visible,
+    simultaneously, disagreeing -- never one masking the other."""
+    runtime, _ = make_runtime(tmp_path)
+    runtime.operational_state_refresh_fn = lambda: ("PAUSED", "PRODUCTION_ACTIVE")
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["mode"] == runtime.config.mode
+    assert payload["broker_environment"] == runtime.config.mode
+    assert payload["operational_state"] == "PAUSED"

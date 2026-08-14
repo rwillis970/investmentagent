@@ -203,6 +203,69 @@ def test_none_sector_ret_under_a_nonzero_weight_is_refused_not_guessed():
         compute_score(unknown, POLICY, analyses_today=0, max_model_analyses_per_day=8)
 
 
+# --------------------------------------- Unit D (reconstructed 2026-08-13):
+# non-finite inputs (NaN/Infinity) must refuse to score, never silently
+# produce a NaN/Infinity score that then silently fails every threshold
+# comparison (NaN compares False to everything, including >=) -- observed
+# here as the actual, reproducible defect before the fix below existed.
+
+def test_nan_atr_20_is_rejected_not_silently_scored():
+    """`atr_20 <= 0` (compute_score's own existing guard) does NOT catch
+    NaN: `float('nan') <= 0` is False in Python (every comparison with NaN
+    is False), so a NaN atr_20 slips past that guard, divides ret_since_open
+    by NaN, and produces a NaN score -- which then compares False to
+    `score >= threshold` for ANY threshold, silently reporting
+    "not material" for what is actually "we don't know," with no error
+    logged anywhere."""
+    cand = candidate(atr_20=float("nan"))
+    with pytest.raises(MaterialityInputError):
+        compute_score(cand, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
+
+def test_infinite_ret_since_open_is_rejected_not_silently_scored():
+    cand = candidate(ret_since_open=float("inf"))
+    with pytest.raises(MaterialityInputError):
+        compute_score(cand, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
+
+def test_nan_volume_so_far_is_rejected_not_silently_scored():
+    cand = candidate(volume_so_far=float("nan"))
+    with pytest.raises(MaterialityInputError):
+        compute_score(cand, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
+
+def test_infinite_median_volume_same_time_is_rejected_not_silently_scored():
+    cand = candidate(median_volume_same_time=float("inf"))
+    with pytest.raises(MaterialityInputError):
+        compute_score(cand, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
+
+def test_nan_earnings_proximity_is_rejected_when_w4_is_nonzero():
+    cand = candidate(earnings_proximity=float("nan"))
+    with pytest.raises(MaterialityInputError):
+        compute_score(cand, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
+
+def test_infinite_sector_ret_is_rejected_when_w5_is_nonzero():
+    cand = candidate(sector_ret=float("inf"))
+    with pytest.raises(MaterialityInputError):
+        compute_score(cand, POLICY, analyses_today=0, max_model_analyses_per_day=8)
+
+
+def test_nan_earnings_proximity_is_harmless_when_w4_is_zero():
+    """Mirrors the existing UNKNOWN-INPUT RULE: a non-finite value under a
+    ZERO weight is still structurally inert -- must not be rejected only
+    because SOME field somewhere is non-finite; only a LIVE (nonzero
+    weight) non-finite input is refused."""
+    zero_w4_policy = MaterialityPolicy(version="mat-v1", w1=1.0, w2=1.0, w3=1.0,
+                                       w4=0.0, w5=1.0, w6=1.0, threshold=2.0,
+                                       filing_weights=DEFAULT_FILING_WEIGHTS)
+    cand = candidate(earnings_proximity=float("nan"))
+    score, components = compute_score(cand, zero_w4_policy, analyses_today=0,
+                                      max_model_analyses_per_day=8)
+    assert math.isfinite(score)
+
+
 def test_compute_score_matches_hand_calculation():
     cand = candidate(ret_since_open=0.5, atr_20=0.25, volume_so_far=300.0,
                      median_volume_same_time=100.0, sector_ret=0.1,
@@ -334,6 +397,43 @@ def test_below_threshold_is_not_material_and_not_suppressed():
     o = run(candidate(ret_since_open=0.0, atr_20=1.0))   # score well under 2.0
     assert o.analysis_status == "NOT_MATERIAL"
     assert o.suppressed_reason is None
+
+
+# --------------------------------------- Unit D (reconstructed 2026-08-13):
+# threshold equality at exactly 2.0 -- `screen()` uses `score >= policy.
+# threshold` (verified directly against current source, not assumed) --
+# INCLUSIVE at the boundary. A single-term, single-weight policy isolates
+# score == threshold exactly, deterministically (momentum term only:
+# ret_since_open / atr_20).
+
+_SINGLE_TERM_POLICY = MaterialityPolicy(
+    version="mat-v1-single-term", w1=1.0, w2=0.0, w3=0.0, w4=0.0, w5=0.0,
+    w6=0.0, threshold=2.0, filing_weights=DEFAULT_FILING_WEIGHTS,
+)
+
+
+def test_score_exactly_equal_to_threshold_triggers_inclusive_boundary():
+    cand = candidate(ret_since_open=2.0, atr_20=1.0)   # term1 = 2.0/1.0 = 2.0 exactly
+    score, _ = compute_score(cand, _SINGLE_TERM_POLICY, analyses_today=0,
+                             max_model_analyses_per_day=8)
+    assert score == 2.0
+    o = run(cand, policy=_SINGLE_TERM_POLICY)
+    assert o.analysis_status == "PENDING_ANALYSIS"
+    assert o.score_components["gates"]["meets_threshold"] is True
+
+
+def test_score_just_below_threshold_does_not_trigger():
+    cand = candidate(ret_since_open=1.999999, atr_20=1.0)
+    o = run(cand, policy=_SINGLE_TERM_POLICY)
+    assert o.analysis_status == "NOT_MATERIAL"
+    assert o.score_components["gates"]["meets_threshold"] is False
+
+
+def test_score_just_above_threshold_triggers():
+    cand = candidate(ret_since_open=2.000001, atr_20=1.0)
+    o = run(cand, policy=_SINGLE_TERM_POLICY)
+    assert o.analysis_status == "PENDING_ANALYSIS"
+    assert o.score_components["gates"]["meets_threshold"] is True
 
 
 def test_below_threshold_is_not_suppressed_even_if_another_gate_would_also_fail():

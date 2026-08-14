@@ -96,9 +96,10 @@ from agent.execution_quarantine import ExecutionQuarantineStore
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger import Ledger
 from agent.ledger_store import LedgerStore
+from agent.mode_store import ModeStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
-from agent.secrets_provider import (KeychainSecretsProvider, SecretNotFoundError,
-                                    SecretsProvider)
+from agent.secrets_provider import (SecretNotFoundError, SecretsProvider,
+                                    default_keychain_secrets_provider_factory)
 
 
 def _build_broker_state(
@@ -193,10 +194,11 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
                            audit_log_path: str | Path,
                            ledger_store_path: str | Path,
                            quarantine_store_path: str | Path,
+                           mode_store_path: str | Path | None = None,
                            key_id: str | None = None,
                            secret_ref: str | None = None,
                            secrets_provider_factory: Callable[[str], SecretsProvider]
-                               = KeychainSecretsProvider,
+                               = default_keychain_secrets_provider_factory,
                            credential_preflight: dict | None = None,
                            now: datetime | None = None,
                            now_fn: Callable[[], datetime] | None = None,
@@ -261,6 +263,37 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
             now=now_fn(),
         )
 
+    # UNIT E (reconstructed 2026-08-13): PAPER-vs-PAUSED truth. A fresh
+    # ModeStore PER CALL, same cross-process-staleness reasoning as
+    # `_refresh` immediately above (ModeStore.__init__ loads its history
+    # once into memory and never re-reads its file -- see that class's own
+    # docstring -- and scripts/run_agent.py's own real, scheduled process
+    # is what actually writes new mode transitions, a genuinely separate
+    # OS process under its own LaunchAgent). `mode_store_path=None` (this
+    # closure's own guard) means no --mode-store-path was given -- returns
+    # (None, None), rendered by build_dashboard_state as an honest "not
+    # supplied," never as a fabricated DISABLED/PAUSED/PRODUCTION_ACTIVE
+    # value. `.current() is None` is ModeStore's OWN documented fresh-
+    # install baseline (a real, legitimate value, not "unknown" -- see
+    # agent.mode_store.ModeStore.current()'s own docstring) -- translated
+    # to the literal string "DISABLED" here, matching agent.mode.
+    # assert_legal_startup's own semantics for the same never-written case.
+    # ANY exception (corrupt file, permissions, anything else) degrades to
+    # (None, None) -- never raises, never takes GET /api/state down with
+    # it, matching every other refresh path in this module.
+    def _refresh_operational_state():
+        if mode_store_path is None:
+            return None, None
+        try:
+            store = ModeStore(mode_store_path)
+            current = store.current()
+            if current is None:
+                return "DISABLED", None
+            paused_from = store.paused_from() if current == "PAUSED" else None
+            return current, paused_from
+        except Exception:
+            return None, None
+
     return DashboardRuntime(
         config=cfg, config_path=config_path,
         cost_ledger=CostLedger(monthly_budget=cfg.monthly_budget_usd,
@@ -278,6 +311,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         ledger=ledger,
         credential_preflight=credential_preflight or {},
         broker_state_refresh_fn=_refresh,
+        operational_state_refresh_fn=_refresh_operational_state,
     )
 
 
@@ -312,6 +346,11 @@ _DEFAULT_STORE_FILENAMES = {
     "audit_log_path": "audit.jsonl",
     "ledger_store_path": "ledger.jsonl",
     "quarantine_store_path": "quarantine.jsonl",
+    # UNIT E (reconstructed 2026-08-13): SAME filename scripts/run_agent.py's
+    # own _DEFAULT_STORE_FILENAMES uses for it -- pointing --data-dir at the
+    # same directory a running run_agent.py process uses must resolve to the
+    # SAME mode_state.jsonl, not a second, independently-named copy.
+    "mode_store_path": "mode_state.jsonl",
 }
 
 
@@ -365,6 +404,13 @@ def _parse_args(argv: list[str] | None):
                              "via --admit-execution/--reject-execution, so the positions "
                              "seed's pending-quarantine guard (agent.account_wiring) sees "
                              "real, current review state, never a stale/empty file")
+    parser.add_argument("--mode-store-path",
+                        help="defaults to <data-dir>/mode_state.jsonl -- point this at "
+                             "the SAME file a running scripts/run_agent.py process "
+                             "writes, so GET /api/state's operational_state field "
+                             "reflects the real, persisted PRODUCTION_ACTIVE/PAUSED/"
+                             "DISABLED history (Unit E), never the broker-environment "
+                             "'mode' field re-purposed to mean something it does not")
     parser.add_argument("--host", default="127.0.0.1",
                         help="must stay a loopback address (see agent.dashboard_server)")
     parser.add_argument("--port", type=int, default=8765)
@@ -432,7 +478,8 @@ def _require_credentials_for_alpaca_paper(cfg: config_module.Config, *,
 
 
 def main(argv: list[str] | None = None, *,
-        secrets_provider_factory: Callable[[str], SecretsProvider] = KeychainSecretsProvider,
+        secrets_provider_factory: Callable[[str], SecretsProvider]
+            = default_keychain_secrets_provider_factory,
         ) -> int:
     """`secrets_provider_factory` is injectable (default: the real
     `KeychainSecretsProvider`) purely for tests -- mirrors `scripts/
@@ -467,6 +514,7 @@ def main(argv: list[str] | None = None, *,
         audit_log_path=args.audit_log_path,
         ledger_store_path=args.ledger_store_path,
         quarantine_store_path=args.quarantine_store_path,
+        mode_store_path=args.mode_store_path,
         key_id=args.key_id, secret_ref=args.secret_ref,
         secrets_provider_factory=secrets_provider_factory,
         credential_preflight=credential_preflight,
