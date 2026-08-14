@@ -262,6 +262,13 @@ class DuplicateCashAdjustmentError(LedgerError):
     is a bug in the caller."""
 
 
+class DuplicateOpeningBalanceCorrectionError(LedgerError):
+    """The same correction_id was recorded twice with DIFFERENT contents --
+    the `OpeningBalanceCorrection` analogue of `DuplicateCashAdjustmentError`,
+    same reasoning: an identical replay is a safe no-op, two different
+    facts sharing an id is a bug in the caller."""
+
+
 @dataclass(frozen=True)
 class Fill:
     """One executed trade. Append-only input to `Ledger` -- never mutated,
@@ -315,6 +322,53 @@ class CashAdjustment:
     description: str
     effective_date: date
     symbol: str | None = None
+
+
+@dataclass(frozen=True)
+class OpeningBalanceCorrection:
+    """A correction to THIS LEDGER'S OWN opening_settled_cash baseline --
+    NOT a broker-reported cash event (contrast `CashAdjustment`), and not
+    a claim about any new activity at the broker. Exists for exactly one
+    situation, found real against a live paper account (2026-08-14, see
+    `agent.account_wiring`'s own module docstring for the full incident):
+    an `opening_settled_cash` value was seeded from a broker cash figure
+    that -- unknown at seed time -- already reflected a fill this ledger
+    later ALSO recorded and replayed through the ordinary BUY-debit path
+    in `settled_cash()`, double-counting it. This ledger's append-only
+    persistence has no other legitimate way to correct that after the
+    fact: `opening_balance` is written exactly once, by design (see
+    `agent.ledger_store`'s own docstring), and `CashAdjustment.
+    adjustment_id` must be the broker's own Account Activities id, never
+    a fabricated one -- an accounting correction to THIS system's own
+    prior mistake has no such id to reuse, and forcing it into that shape
+    would misrepresent an internal correction as a broker-sourced fact.
+
+    `amount`: the signed correction -- for the incident this exists for,
+    POSITIVE, since the baseline was too LOW by the double-counted fill's
+    own notional (see the repair-plan tool that computes this exact
+    value from the affected fill's own already-recorded qty/price,
+    deterministically -- never a typed-in or estimated number).
+    `corrects_opening_balance_established_at`: the `at` timestamp of the
+    SPECIFIC `opening_balance` row this correction addresses -- full
+    audit traceability back to exactly which seed is being corrected, not
+    merely "a correction happened at some point."
+    `reason`: free text, human-readable, explaining the derivation --
+    intended to name the specific fill_id(s) whose notional the
+    correction offsets.
+    `correction_id`: THIS LEDGER'S OWN stable identifier for the
+    correction itself -- self-issued (there is no broker-side event to
+    reuse an id from, unlike `Fill.fill_id`/`CashAdjustment.
+    adjustment_id`), but append-only replay-safety still applies
+    identically: an identical replay of an already-known `correction_id`
+    is a safe no-op; a DIFFERENT one under the same id is a hard
+    `DuplicateOpeningBalanceCorrectionError`, the same discipline every
+    other append-only record in this module already follows."""
+    correction_id: str
+    account_id: str
+    amount: Decimal
+    reason: str
+    corrects_opening_balance_established_at: datetime
+    recorded_at: datetime
 
 
 @dataclass(frozen=True)
@@ -454,12 +508,15 @@ class Ledger:
         self._fill_ids: dict[str, Fill] = {}
         self._cash_adjustments: list[CashAdjustment] = []
         self._cash_adjustment_ids: dict[str, CashAdjustment] = {}
+        self._opening_balance_corrections: list[OpeningBalanceCorrection] = []
+        self._opening_balance_correction_ids: dict[str, OpeningBalanceCorrection] = {}
 
     @classmethod
     def from_records(cls, *, account_id: str, opening_settled_cash: Decimal,
                      policy_registry: HoldingPolicyRegistry, t_plus: int = 1,
                      lot_selection_policy: LotSelectionPolicy = ALPACA_DEFAULT_POLICY,
                      fills=(), order_records=(), cash_adjustments=(),
+                     opening_balance_corrections=(),
                      opening_positions: dict[str, Decimal] | None = None) -> "Ledger":
         """Reconstruct a ledger from a previously-recorded (fills,
         order_records, cash_adjustments) triple, plus `opening_positions`
@@ -486,6 +543,8 @@ class Ledger:
             ledger.record_order_status(r)
         for a in cash_adjustments:
             ledger.record_cash_adjustment(a)
+        for c in opening_balance_corrections:
+            ledger.record_opening_balance_correction(c)
         return ledger
 
     # -- read-only views of the append-only record -------------------------
@@ -500,6 +559,10 @@ class Ledger:
     @property
     def cash_adjustments(self) -> tuple[CashAdjustment, ...]:
         return tuple(self._cash_adjustments)
+
+    @property
+    def opening_balance_corrections(self) -> tuple[OpeningBalanceCorrection, ...]:
+        return tuple(self._opening_balance_corrections)
 
     # -- write (append-only) -------------------------------------------------
     def record_cash_adjustment(self, adjustment: CashAdjustment) -> None:
@@ -523,6 +586,29 @@ class Ledger:
             return   # idempotent replay of the exact same adjustment
         self._cash_adjustments.append(adjustment)
         self._cash_adjustment_ids[adjustment.adjustment_id] = adjustment
+
+    def record_opening_balance_correction(self, correction: OpeningBalanceCorrection) -> None:
+        """Append-only, same replay discipline as `record_cash_adjustment`
+        (see `OpeningBalanceCorrection`'s own docstring): an identical
+        replay of an already-known `correction_id` is a safe no-op; a
+        DIFFERENT one under the same id is
+        `DuplicateOpeningBalanceCorrectionError`. Never touches
+        `self._fills` -- same "cannot disturb lot accounting even by
+        accident" guarantee `record_cash_adjustment` already makes."""
+        if correction.account_id != self.account_id:
+            raise CrossAccountError(self.account_id, correction.account_id,
+                                    "Ledger.record_opening_balance_correction")
+        existing = self._opening_balance_correction_ids.get(correction.correction_id)
+        if existing is not None:
+            if existing != correction:
+                raise DuplicateOpeningBalanceCorrectionError(
+                    f"correction_id {correction.correction_id!r} was already recorded "
+                    "with different contents -- append-only replay requires the "
+                    "identical record"
+                )
+            return   # idempotent replay of the exact same correction
+        self._opening_balance_corrections.append(correction)
+        self._opening_balance_correction_ids[correction.correction_id] = correction
 
     def record_fill(self, fill: Fill) -> None:
         if fill.account_id != self.account_id:
@@ -785,6 +871,13 @@ class Ledger:
         # mirror the SELL branch above.
         for a in self._cash_adjustments:
             total += a.amount
+        # Same "applies immediately, unconditionally" treatment as a cash
+        # adjustment -- an opening-balance correction is not a fill or a
+        # broker event with its own settlement timeline; it is a
+        # bookkeeping fix to a number already folded into `total` above,
+        # so it must be visible on exactly the same terms.
+        for c in self._opening_balance_corrections:
+            total += c.amount
         return total
 
     def unsettled_cash(self, *, now: datetime) -> Decimal:

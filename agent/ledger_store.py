@@ -212,7 +212,7 @@ from pathlib import Path
 from .accounts import CrossAccountError
 from .broker.base import Position
 from .holding import HoldingPolicyRegistry
-from .ledger import CashAdjustment, Fill, Ledger, OrderRecord
+from .ledger import CashAdjustment, Fill, Ledger, OpeningBalanceCorrection, OrderRecord
 from .lot_selection import ALPACA_DEFAULT_POLICY, LotSelectionPolicy
 from .money import to_decimal
 
@@ -463,6 +463,29 @@ class LedgerStore:
             return   # byte-identical replay -- Ledger already no-op'd it
         self._append_row(dict(kind="cash_adjustment", **_encode_cash_adjustment(adjustment)))
 
+    def write_opening_balance_correction(self, correction: OpeningBalanceCorrection) -> None:
+        """Same validate-then-persist discipline as `write_cash_adjustment`
+        -- a rejection (`CrossAccountError`,
+        `DuplicateOpeningBalanceCorrectionError`) raises exactly what a
+        bare `Ledger.record_opening_balance_correction` would and leaves
+        the file untouched. Deliberately does NOT require
+        `self._opening is not None` -- a correction addresses a specific
+        PAST opening_balance row by its own `corrects_opening_balance_
+        established_at` timestamp, a fact this store's caller is
+        responsible for getting right (see the repair-plan tool that
+        constructs one); this store does not re-validate that the
+        timestamp actually matches its own current `self._opening_
+        established_at`, the same "this store validates fill/order/cash-
+        adjustment SHAPE, not an operator's semantic judgment" boundary
+        `write_cash_adjustment` already draws."""
+        already_known = any(c.correction_id == correction.correction_id
+                            for c in self._ledger.opening_balance_corrections)
+        self._ledger.record_opening_balance_correction(correction)   # raises before persist
+        if already_known:
+            return   # byte-identical replay -- Ledger already no-op'd it
+        self._append_row(dict(kind="opening_balance_correction",
+                              **_encode_opening_balance_correction(correction)))
+
     def load(self) -> tuple[Decimal | None, tuple[Fill, ...], tuple[OrderRecord, ...]]:
         return self._opening, self._ledger.fills, self._ledger.order_records
 
@@ -480,6 +503,13 @@ class LedgerStore:
         checks to decide whether a broker-reported activity is already
         durably recorded (mirrors `open_order_ids()`'s own delegation)."""
         return frozenset(a.adjustment_id for a in self._ledger.cash_adjustments)
+
+    def known_opening_balance_correction_ids(self) -> frozenset[str]:
+        """Delegates to the internal validating `Ledger`'s own
+        `opening_balance_corrections` -- the repair-plan tool's own
+        idempotency check (has this correction already been applied),
+        mirroring `known_cash_adjustment_ids`'s own delegation."""
+        return frozenset(c.correction_id for c in self._ledger.opening_balance_corrections)
 
     def open_order_ids(self) -> frozenset[str]:
         """Delegates to the internal validating `Ledger`'s own
@@ -513,6 +543,7 @@ class LedgerStore:
             lot_selection_policy=self._lot_selection_policy,
             fills=self._ledger.fills, order_records=self._ledger.order_records,
             cash_adjustments=self._ledger.cash_adjustments,
+            opening_balance_corrections=self._ledger.opening_balance_corrections,
             opening_positions=self._opening_positions,
         )
 
@@ -554,6 +585,9 @@ class LedgerStore:
                 ledger.record_order_status(_decode_order_record(row))
             elif kind == "cash_adjustment":
                 ledger.record_cash_adjustment(_decode_cash_adjustment(row))
+            elif kind == "opening_balance_correction":
+                ledger.record_opening_balance_correction(
+                    _decode_opening_balance_correction(row))
             elif kind == "opening_position":
                 # Direct field assignment, NOT re-invoking write_opening_
                 # positions -- same discipline the "opening_balance" branch
@@ -648,4 +682,23 @@ def _decode_cash_adjustment(d: dict) -> CashAdjustment:
         description=d["description"],
         effective_date=_date.fromisoformat(d["effective_date"]),
         symbol=d.get("symbol"),
+    )
+
+
+def _encode_opening_balance_correction(c: OpeningBalanceCorrection) -> dict:
+    d = asdict(c)
+    d["amount"] = str(c.amount)
+    d["corrects_opening_balance_established_at"] = \
+        c.corrects_opening_balance_established_at.isoformat()
+    d["recorded_at"] = c.recorded_at.isoformat()
+    return d
+
+
+def _decode_opening_balance_correction(d: dict) -> OpeningBalanceCorrection:
+    return OpeningBalanceCorrection(
+        correction_id=d["correction_id"], account_id=d["account_id"],
+        amount=to_decimal(d["amount"]), reason=d["reason"],
+        corrects_opening_balance_established_at=datetime.fromisoformat(
+            d["corrects_opening_balance_established_at"]),
+        recorded_at=datetime.fromisoformat(d["recorded_at"]),
     )

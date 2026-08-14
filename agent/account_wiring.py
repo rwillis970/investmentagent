@@ -33,39 +33,84 @@ is not None` and skips straight to `to_ledger()` -- never re-seeding, never
 re-deriving `opening_settled_cash` from a fresh broker read on top of
 history that already exists.
 
-TWO SHAPES OF "FIRST EVER," NOT ONE (bootstrap gap fixed 2026-07-30). "No
-opening balance yet" splits into two genuinely different cases, and this
-function now checks `store.load()`'s own `fills` to tell them apart:
+THREE SHAPES OF "FIRST EVER," NOT TWO (cash-seed-ordering fix, found against
+the real paper account, 2026-08-14 -- a $20 double-debit, see this fix's own
+delivery report for the full incident trace). "No opening balance yet"
+splits into three genuinely different cases, and this function now checks
+BOTH `store.load()`'s own `fills` AND `execution_quarantine.pending_count()`
+to tell them apart:
 
-  * NO local fills either -- the ordinary fresh-install path. Seeded via
-    the plain `write_opening_balance(broker_account.settled_cash, ...)`,
-    unchanged from before.
-  * Local fills ALREADY exist -- the account's broker had fill history
-    from before this account's very first cycle ever ran (a reused paper
-    account, or a deleted/never-created ledger file), so `sync_fills`
-    (which always runs before this function, per agent/run_loop.py's own
-    ordering) already wrote them here. Seeding with the current broker
-    figure VERBATIM would double-count those fills -- exactly the bug
-    `LedgerStore.write_opening_balance`'s own refusal exists to prevent,
-    and that refusal is UNCHANGED, still hit if this function's own check
-    below is ever bypassed. Seeded instead via
-    `store.seed_opening_balance_from_broker(...)`, which backdates the
-    correct value from the fills the store already has (see
+  * A PENDING, unreviewed execution exists -- seeding is DEFERRED ENTIRELY,
+    for cash as well as positions (see the REAL INCIDENT paragraph below
+    for why the cash side did not already have this guard). Neither
+    `write_opening_balance` nor `seed_opening_balance_from_broker` is
+    called; `opening` stays `None`; `store.to_ledger()` at the bottom of
+    this function raises `LedgerStoreError`, the same "refuses to guess"
+    failure mode this function already produces for a never-seeded store
+    reached any other way -- propagating out of `agent.run_loop.run_cycle`
+    uncaught, exactly like any other reconciliation-infrastructure failure
+    (see that module's own docstring: "this system's own fail-safe-to-
+    NO-TRADE invariant does not distinguish state is untrusted because
+    run_startup halted from state is untrusted because the reconciliation
+    infrastructure itself just errored"). This is not a new failure mode
+    invented for this fix -- it reuses the exact mechanism `to_ledger()`
+    already had.
+  * NO pending execution, and NO local fills either -- the ordinary
+    fresh-install path. Seeded via the plain
+    `write_opening_balance(broker_account.settled_cash, ...)`, unchanged
+    from before.
+  * NO pending execution, but local fills ALREADY exist -- the account's
+    broker had fill history from before this account's very first cycle
+    ever ran (a reused paper account, or a deleted/never-created ledger
+    file), so `sync_fills` (which always runs before this function, per
+    agent/run_loop.py's own ordering) already wrote them here. Seeding
+    with the current broker figure VERBATIM would double-count those
+    fills -- exactly the bug `LedgerStore.write_opening_balance`'s own
+    refusal exists to prevent, and that refusal is UNCHANGED, still hit
+    if this function's own check below is ever bypassed. Seeded instead
+    via `store.seed_opening_balance_from_broker(...)`, which backdates
+    the correct value from the fills the store already has (see
     `agent/ledger_store.py`'s own docstring for the arithmetic). Before
-    this fix, this case had no recovery path at all: `write_opening_
-    balance` refused every call, forever, and the account's ledger could
-    never be seeded through this loop (see this fix's own delivery
-    report and the test this replaced,
-    `tests/test_run_loop.py::test_a_pre_existing_broker_fill_before_the_
-    very_first_cycle_now_seeds_correctly`).
+    the 2026-07-30 fix, this case had no recovery path at all:
+    `write_opening_balance` refused every call, forever, and the
+    account's ledger could never be seeded through this loop.
 
-Re-seeding on a store that already has fills is still exactly the
-double-count bug `LedgerStore.write_opening_balance`'s refusal exists to
-prevent; this function's `fills` check is what routes that case to the
-method built specifically to handle it correctly, not a second copy of
-either check itself (see `agent/ledger_store.py`'s own docstring for why
-the refusal, and its narrower bootstrap counterpart, both belong solely in
-the store).
+REAL INCIDENT THIS FIX CLOSES (found against the real paper account,
+2026-08-14). The cash seed and the positions seed were added in the SAME
+commit ("opening-position-seed unit"/"opening-position-seed-with-
+quarantine-check unit", both 2026-08-12), but only the positions seed got
+the `execution_quarantine.pending_count() == 0` guard below -- the cash
+seed ran unconditionally whenever `opening is None`, with no equivalent
+check. On the real account, a manually-placed SPY BUY had no staged
+`OrderRecord` (no `holding_policy_version`), so `sync_fills` quarantined
+it rather than recording a `Fill` -- at the EXACT SAME instant, this
+function's cash-seed branch saw `fills` empty (correctly, from this
+store's point of view) and seeded `write_opening_balance` from the raw
+broker figure, which ALREADY reflected that trade's cash effect (the
+trade itself had executed on the broker's books weeks earlier). When the
+execution was later admitted and `sync_fills` turned it into a real
+`Fill`, `Ledger.settled_cash()`'s ordinary BUY-debit replay subtracted
+that fill's notional a SECOND time -- a double-count that was
+architecturally identical to the bootstrap-fills case above, just
+reached through quarantine instead of through an already-recorded fill.
+Rather than estimate the quarantined execution's cash effect from its own
+recorded qty/price (which this fix deliberately does NOT do -- see below),
+the correction is to defer seeding entirely until the execution is
+resolved one way or the other, mirroring the positions seed's own,
+already-correct posture exactly.
+
+DELIBERATELY DOES NOT ESTIMATE A PENDING EXECUTION'S CASH EFFECT.
+`ExecutionQuarantineStore` records a pending execution's own `qty`/`price`
+(see `agent/execution_quarantine.py`), and it would be technically
+possible to compute a notional from those fields and subtract it from the
+broker's current cash the same way `seed_opening_balance_from_broker`
+backdates for an already-recorded `Fill`. This is deliberately NOT done:
+a quarantined execution is, by definition, one this system has explicitly
+refused to trust with an intent (a holding-policy version, a lot_id) --
+computing ANY derived figure from it, even a cash-only one with no lot
+implications, would be trusting exactly the input this codebase's own
+fail-safe posture says not to guess about. The correct, and only,
+resolution is for an operator to admit or reject it first.
 
 CROSS-ACCOUNT DISCIPLINE. `adapter`, `store` and `day_trade_guard` are each
 already bound to their own `account_id` at their own construction (the same
@@ -152,63 +197,63 @@ def build_account_reconciliation(*, account_id: str, adapter: BrokerAdapter,
 
     opening, fills, _ = store.load()
     if opening is None:
-        if fills:
-            # BOOTSTRAP CASE (fixed 2026-07-30): a broker with fill history
-            # from BEFORE this account's very first cycle -- sync_fills
-            # necessarily ran before this seeding step got a chance to run
-            # (agent/run_loop.py's own required ordering), so those fills
-            # are already recorded here. write_opening_balance would
-            # refuse this outright (correctly -- see its own docstring);
-            # seed_opening_balance_from_broker is the narrower path built
-            # specifically for this case, backdating the correct opening
-            # value from the fills this store already has rather than
-            # seeding the current broker figure verbatim (which would
-            # double-count them). See agent/ledger_store.py's own
-            # docstring for the full reasoning.
-            store.seed_opening_balance_from_broker(broker_account.settled_cash, now=now)
-        else:
-            # The ordinary first-ever startup path (see module docstring)
-            # -- every subsequent call sees `opening is not None` here and
-            # skips this entirely.
-            store.write_opening_balance(broker_account.settled_cash, at=now)
+        # CASH-SEED-ORDERING FIX (2026-08-14): checked FIRST, before either
+        # seeding branch below gets a chance to run -- see module
+        # docstring's REAL INCIDENT / DELIBERATELY DOES NOT ESTIMATE
+        # sections for the full reasoning. A pending, unreviewed execution
+        # blocks seeding entirely, for cash exactly as it already did for
+        # positions: `opening` is left `None`, neither
+        # `write_opening_balance` nor `seed_opening_balance_from_broker`
+        # nor `write_opening_positions` runs, and `store.to_ledger()`
+        # below raises `LedgerStoreError` -- the same "refuses to guess"
+        # failure this function already produces for a never-seeded store
+        # reached any other way, propagating uncaught exactly like any
+        # other reconciliation-infrastructure failure (agent/run_loop.py's
+        # own module docstring).
+        if execution_quarantine.pending_count() == 0:
+            if fills:
+                # BOOTSTRAP CASE (fixed 2026-07-30): a broker with fill
+                # history from BEFORE this account's very first cycle --
+                # sync_fills necessarily ran before this seeding step got a
+                # chance to run (agent/run_loop.py's own required
+                # ordering), so those fills are already recorded here.
+                # write_opening_balance would refuse this outright
+                # (correctly -- see its own docstring);
+                # seed_opening_balance_from_broker is the narrower path
+                # built specifically for this case, backdating the correct
+                # opening value from the fills this store already has
+                # rather than seeding the current broker figure verbatim
+                # (which would double-count them). See
+                # agent/ledger_store.py's own docstring for the full
+                # reasoning.
+                store.seed_opening_balance_from_broker(broker_account.settled_cash, now=now)
+            else:
+                # The ordinary first-ever startup path (see module
+                # docstring) -- every subsequent call sees `opening is not
+                # None` here and skips this entirely.
+                store.write_opening_balance(broker_account.settled_cash, at=now)
 
-        # POSITIONS SEED (opening-position-seed unit, 2026-08-12; gated on
-        # quarantine, opening-position-seed-with-quarantine-check unit,
-        # 2026-08-12): same guard as the cash seed immediately above --
-        # only on first startup, mirrored exactly -- PLUS a second,
-        # independent guard: `execution_quarantine.pending_count() == 0`.
-        # Checked via a FRESH `store.to_ledger().positions()`, not the
-        # `fills` list already in hand above: "empty" here means "no
-        # positions recorded at all yet" (fill-derived OR opening-seeded),
-        # and those are two different questions -- an account with fill
-        # history that nets to zero (bought then fully sold) has `fills`
-        # truthy but `positions()` empty, and should still be seeded here;
-        # the opening-balance branch above only ever asks about `fills`
-        # because IT is bootstrapping cash, not positions. Safe to call
-        # `to_ledger()` here: `self._opening` is already set by one of the
-        # two branches above by the time this line runs.
-        #
-        # THE QUARANTINE GUARD, AND WHY IT IS NOT OPTIONAL. Seeding from
-        # `adapter.positions()` trusts the broker's CURRENT snapshot
-        # verbatim, with no lot behind it and no operator review -- exactly
-        # the trust `agent.execution_quarantine` exists to withhold from an
-        # execution with no resolvable local intent (agent/fill_sync.py's
-        # own module docstring: sync_fills quarantines rather than
-        # fabricating a Fill). If a pending, unreviewed execution exists
-        # for this account, its effect is ALREADY present in
-        # `adapter.positions()` (a real broker fill already happened) but
-        # NOT yet in the local ledger by design -- seeding here would
-        # silently launder exactly the review this account is waiting on.
-        # So: any pending quarantine entry blocks the seed entirely (not
-        # per-symbol -- a pending execution on one symbol says nothing
-        # about whether ANOTHER symbol's broker-reported quantity is safe
-        # to trust unreviewed either) and reconciliation is left to halt
-        # on the resulting real mismatch, same as before this unit existed
-        # -- forcing `--admit-execution`/`--reject-execution` first. The
-        # NEXT startup, after that review, seeds against a clean slate.
-        if (not store.to_ledger().positions()
-                and execution_quarantine.pending_count() == 0):
-            store.write_opening_positions(list(adapter.positions()))
+            # POSITIONS SEED (opening-position-seed unit, 2026-08-12).
+            # Nested inside the `pending_count() == 0` branch above, so the
+            # quarantine check below is now structurally redundant with
+            # the outer one (a pending execution never reaches this line
+            # at all any more) -- kept anyway as defense-in-depth, the
+            # same "checked twice on purpose" posture this codebase
+            # already takes elsewhere for a load-bearing guard (e.g.
+            # `agent.config.validate`'s membership check duplicating
+            # `agent.broker.selection.select_broker_adapter`'s own).
+            # Checked via a FRESH `store.to_ledger().positions()`, not the
+            # `fills` list already in hand above: "empty" here means "no
+            # positions recorded at all yet" (fill-derived OR
+            # opening-seeded), and those are two different questions -- an
+            # account with fill history that nets to zero (bought then
+            # fully sold) has `fills` truthy but `positions()` empty, and
+            # should still be seeded here. Safe to call `to_ledger()`
+            # here: `self._opening` is already set by one of the two
+            # branches immediately above by the time this line runs.
+            if (not store.to_ledger().positions()
+                    and execution_quarantine.pending_count() == 0):
+                store.write_opening_positions(list(adapter.positions()))
 
     ledger = store.to_ledger()
 
