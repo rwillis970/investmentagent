@@ -53,6 +53,16 @@ happen -- the store itself refuses a second one), or none exist, or the
 proposed correction amount is exactly zero, this script reports that and
 proposes nothing.
 
+WRITER LOCK (writer-lock-gap unit, round 2, 2026-08-14). `--apply` acquires
+the SAME canonical `agent.process_lock.acquire_process_lock`, scoped to
+`Path(--ledger-path).resolve().parent`, that `scripts/run_agent.py
+--data-dir` and every other writer in this codebase use -- immediately
+before the single real write, after every read-only STEP above has already
+completed. If the scheduled loop (or any other writer) already holds that
+directory's lock, `--apply` refuses cleanly instead of racing it. Dry-run
+(the default) never touches the lock at all -- it is read-only start to
+finish.
+
 Usage:
     python3 scripts/repair_settled_cash_baseline.py \
         --ledger-path data/ledger.jsonl --account-id PA3XZX944LRR
@@ -91,6 +101,7 @@ from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger import Ledger, OpeningBalanceCorrection
 from agent.ledger_store import LedgerStore, LedgerStoreError
 from agent.money import to_decimal
+from agent.process_lock import ProcessLockError, acquire_process_lock
 
 
 def _print_header(title: str) -> None:
@@ -322,8 +333,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     _print_header("APPLYING (--apply --confirmed both present)")
+    # WRITER-LOCK GAP CLOSED (writer-lock-gap unit, round 2, 2026-08-14). This
+    # script has no --data-dir flag of its own -- it takes --ledger-path
+    # directly -- but in every real deployment `--ledger-path` is `<data_dir>/
+    # ledger.jsonl`, so `Path(args.ledger_path).resolve().parent` IS the same
+    # canonicalized directory `scripts/run_agent.py --data-dir` locks (see
+    # agent/process_lock.py's own module docstring for why "same
+    # canonicalized data dir = same lock identity" needs no shared flag, only
+    # a shared resolved path). Acquired immediately before the single real
+    # write below -- everything above this point (STEPs 1-6) is read-only and
+    # already complete by the time this line runs, so there is nothing to
+    # lose by acquiring the lock this late and nothing gained by acquiring it
+    # earlier. Contention -> ProcessLockError -> a clear stderr refusal and a
+    # non-zero exit, same fail-closed posture as every other writer in this
+    # codebase; the write below is never reached.
+    data_dir = ledger_path.resolve().parent
     try:
-        store.write_opening_balance_correction(correction)
+        with acquire_process_lock(data_dir):
+            store.write_opening_balance_correction(correction)
+    except ProcessLockError as exc:
+        print(f"REFUSING: {exc}", file=sys.stderr)
+        return 1
     except LedgerStoreError as e:
         print(f"REFUSED by the store: {e}", file=sys.stderr)
         return 1
