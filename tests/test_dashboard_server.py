@@ -11,6 +11,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,7 @@ from agent.cost import CostLedger
 from agent.dashboard_server import (STATIC_DIR, DashboardRuntime,
                                     make_server, route_request)
 from agent.opportunity_event_tracker import OpportunityEventTracker
+from agent.process_lock import acquire_process_lock
 from tests.test_config_fixture import valid_raw_config
 
 ACCT = "acct-1"
@@ -274,6 +276,124 @@ def test_patch_config_response_never_includes_the_full_config_object(tmp_path):
                         "value": 10}).encode(),
     )
     assert "config" not in json.loads(result.body)
+
+
+# ----------------------------------------------------- writer-lock (2026-08-14)
+# `DashboardRuntime.process_lock_data_dir` closes the gap this dashboard
+# process previously left open: it and the scheduled `scripts/run_agent.py`
+# process both write `approval_request_store`/`audit_log`/`config.json` with
+# no coordination. These tests hold the SAME `agent.process_lock.
+# acquire_process_lock` the scheduled loop would hold mid-cycle (a real
+# `fcntl.flock`, not a mock -- see tests/test_process_lock.py for the
+# primitive's own coverage) and assert the two writable routes refuse
+# instead of racing it, while every read-only route is untouched by the
+# same contention.
+
+def test_post_approve_refuses_with_503_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    runtime, store = make_runtime(tmp_path, now=T0)
+    runtime.process_lock_data_dir = tmp_path
+    req = add_pending(store, now=T0)
+    runtime.now_fn = lambda: T0 + timedelta(seconds=46)
+    with acquire_process_lock(tmp_path):   # simulates the scheduled loop mid-cycle
+        result = route_request(
+            runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+            body=b"{}",
+        )
+    assert result.status == 503
+    payload = json.loads(result.body)
+    assert "error" in payload
+    # Non-secret: no filesystem path, no stack trace, nothing about the
+    # competing process -- see _with_writer_lock's own docstring for why
+    # this is deliberately more conservative than ProcessLockError.str().
+    assert str(tmp_path) not in payload["error"]
+    # And the write genuinely never happened -- refused before mutation,
+    # not rolled back after.
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_reject_refuses_with_503_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    runtime, store = make_runtime(tmp_path, now=T0)
+    runtime.process_lock_data_dir = tmp_path
+    req = add_pending(store, now=T0)
+    with acquire_process_lock(tmp_path):
+        result = route_request(
+            runtime, method="POST", path=f"/api/approval/{req.request_id}/reject",
+            body=b"{}",
+        )
+    assert result.status == 503
+    assert store.get(req.request_id).decision is None
+
+
+def test_patch_config_refuses_with_503_while_the_scheduled_loop_holds_the_lock(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    runtime.process_lock_data_dir = tmp_path
+    before = runtime.config.opportunity_screen_interval_minutes
+    with acquire_process_lock(tmp_path):
+        result = route_request(
+            runtime, method="PATCH", path="/api/config",
+            body=json.dumps({"key": "opportunity_screen_interval_minutes",
+                            "value": 10}).encode(),
+        )
+    assert result.status == 503
+    # config.json itself was never touched, and the in-memory runtime.config
+    # -- what every subsequent GET /api/state reads -- was never swapped in.
+    assert runtime.config.opportunity_screen_interval_minutes == before
+    assert not json.loads(Path(runtime.config_path).read_text()).get(
+        "opportunity_screen_interval_minutes") == 10
+
+
+def test_writable_routes_succeed_normally_once_the_lock_is_released(tmp_path):
+    """The other half of the proof above: identical runtime, identical
+    request, no competing lock held -- must succeed, proving the 503s above
+    were genuinely about contention and not some other defect."""
+    runtime, store = make_runtime(tmp_path, now=T0)
+    runtime.process_lock_data_dir = tmp_path
+    req = add_pending(store, now=T0)
+    runtime.now_fn = lambda: T0 + timedelta(seconds=46)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=b"{}",
+    )
+    assert result.status == 200
+
+
+def test_process_lock_data_dir_unset_preserves_the_old_unlocked_behavior(tmp_path):
+    """`process_lock_data_dir` defaults to `None` -- every existing test
+    above this section (and any real deployment that has not opted in)
+    must be completely unaffected: a POST/PATCH succeeds even while some
+    OTHER, unrelated directory's lock is held, because this runtime was
+    never told which directory to serialize against."""
+    runtime, store = make_runtime(tmp_path, now=T0)
+    assert runtime.process_lock_data_dir is None
+    req = add_pending(store, now=T0)
+    runtime.now_fn = lambda: T0 + timedelta(seconds=46)
+    with acquire_process_lock(tmp_path / "unrelated"):
+        result = route_request(
+            runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+            body=b"{}",
+        )
+    assert result.status == 200
+
+
+def test_get_api_state_is_never_locked_even_while_the_scheduled_loop_holds_it(tmp_path):
+    """Requirement: never hold a lock merely for a read-only GET. Proven
+    here the same way the writable routes are proven locked -- the
+    scheduled loop holds the SAME directory's lock throughout, and the read
+    must still succeed immediately, not queue or refuse."""
+    runtime, _ = make_runtime(tmp_path)
+    runtime.process_lock_data_dir = tmp_path
+    with acquire_process_lock(tmp_path):
+        result = route_request(runtime, method="GET", path="/api/state")
+    assert result.status == 200
+    assert json.loads(result.body)["mode"] == "PAPER"
+
+
+def test_get_api_credentials_is_never_locked_either(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    runtime.process_lock_data_dir = tmp_path
+    with acquire_process_lock(tmp_path):
+        result = route_request(runtime, method="GET", path="/api/credentials")
+    assert result.status == 200
 
 
 # ------------------------------------------------------------------- static serving

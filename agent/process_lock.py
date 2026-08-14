@@ -36,14 +36,28 @@ SAME lock file and correctly contend with each other. Two GENUINELY
 different data directories never contend, by construction (each gets its
 own `.agent.lock` file, inside itself).
 
-WHAT THIS MODULE DOES NOT DO (disclosed, not fixed here -- see
-docs/unit_b_process_lock.md for the full audit). `scripts/run_agent.py`'s
-one-shot CLI paths (`--admit-execution`/`--reject-execution`/
-`--admit-cash-event`/`--reject-cash-event`/`--submit-approved`/
-`--advance-mode-to`) do NOT acquire this lock as of this unit -- only the
-main scheduled-loop path does. A manual CLI action while the scheduled
-loop is running can therefore still race it. This is a real, disclosed gap,
-not a silent one."""
+WRITER COVERAGE (writer-lock-gap unit, 2026-08-14 -- supersedes the
+narrower claim in docs/unit_b_process_lock.md's original audit, which
+covered only the scheduled loop). Every path in this codebase that can
+mutate the durable stores this module protects now acquires this SAME
+lock, scoped to the SAME canonicalized `data_dir`, before touching a
+store: the scheduled loop (`scripts/run_agent.py`'s own bottom `with
+acquire_process_lock(args.data_dir):` block, unchanged since this unit),
+all four one-shot CLI writer dispatches (`--advance-mode-to`,
+`--admit-execution`/`--reject-execution`, `--admit-cash-event`/
+`--reject-cash-event`, `--submit-approved` -- each via `scripts/
+run_agent.py`'s `_run_one_shot_locked`, which acquires the lock before
+any handler touches a store or `--submit-approved` can ever reach
+`adapter.submit`), and the dashboard's writable HTTP paths (`POST /api/
+approval/<id>/approve|reject` and `PATCH /api/config`, via `agent.
+dashboard_server.route_request`'s own lock acquisition when a
+`process_lock_data_dir` is configured on `DashboardRuntime` -- see that
+module). Read-only paths (`GET /api/state` and every other dashboard GET,
+`--dry-run`, `scripts/diagnose_runtime.py`, `scripts/phase_acceptance.py`)
+never acquire this lock -- see each call site's own docstring for why.
+Lock contention fails closed: `ProcessLockError` is raised, caught at the
+single acquisition site for that path, and turned into a plain refusal --
+never a silent queue, never a partial write."""
 from __future__ import annotations
 
 import contextlib

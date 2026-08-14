@@ -202,6 +202,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
                            credential_preflight: dict | None = None,
                            now: datetime | None = None,
                            now_fn: Callable[[], datetime] | None = None,
+                           data_dir: str | Path | None = None,
                            ) -> DashboardRuntime:
     """CREDENTIALS (Unit 16, 2026-08-12): `key_id`/`secret_ref` are both
     optional, matching `_parse_args`'s own `--key-id`/`--secret-ref`
@@ -213,7 +214,13 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
     call `scripts/run_agent.py`'s own `main` makes -- same factory
     injectable for tests (`agent.secrets_provider.InMemorySecretsProvider`,
     never a real keychain there), same mode-binding off `cfg.mode`, not a
-    second, independently-invented credential path."""
+    second, independently-invented credential path.
+
+    `data_dir` (writer-lock-gap unit, 2026-08-14), when given, is passed
+    straight through to `DashboardRuntime.process_lock_data_dir` -- see
+    that field's own docstring. `None` (this parameter's own default)
+    preserves the exact prior, unlocked behavior for any existing caller/
+    test that has no opinion on locking."""
     approval_service = ApprovalService(
         expiration=timedelta(minutes=cfg.approval_expiration_minutes),
         min_display=timedelta(seconds=cfg.approval_min_display_seconds),
@@ -312,6 +319,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         credential_preflight=credential_preflight or {},
         broker_state_refresh_fn=_refresh,
         operational_state_refresh_fn=_refresh_operational_state,
+        process_lock_data_dir=data_dir,
     )
 
 
@@ -518,6 +526,7 @@ def main(argv: list[str] | None = None, *,
         key_id=args.key_id, secret_ref=args.secret_ref,
         secrets_provider_factory=secrets_provider_factory,
         credential_preflight=credential_preflight,
+        data_dir=args.data_dir,
     )
     server = make_server(runtime, host=args.host, port=args.port)
     print(f"operator dashboard serving on http://{args.host}:{args.port}/ "
