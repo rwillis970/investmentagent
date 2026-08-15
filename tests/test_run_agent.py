@@ -2860,3 +2860,580 @@ def test_reconcile_once_does_not_change_the_scheduled_loops_own_session_gate(tmp
     assert in_session_now(in_session_instant) is True
     assert in_session_now(_RO_OUT_OF_SESSION) is False
     assert seconds_until_next_session_open(_RO_OUT_OF_SESSION) > 0
+
+
+# ------------------------------------------------- PAUSED-reconcile follow-up
+#
+# PAUSED-reconcile follow-up (2026-08-14). The real host run of
+# --reconcile-once failed:
+#
+#   PAUSED does not exercise the market calendar (no order is ever routed
+#   through Gatekeeper.stage or DayTradeGuard.reconcile in this mode);
+#   refusing 1 account(s) handed to a startup that should not be
+#   reconciling any.
+#
+# ROOT CAUSE: the FIRST version of --reconcile-once called agent.run_loop.
+# run_cycle with target_mode=ModeStore.current() -- correct in that it never
+# itself proposed a mode transition (target_mode == persisted_mode is
+# unconditionally legal), but run_cycle always ends by calling agent.
+# startup.run_startup(target_mode=..., accounts=reconciliations, ...), and
+# run_startup refuses OUTRIGHT -- before its own per-account reconciliation
+# loop ever runs -- whenever accounts is non-empty and target_mode does not
+# exercise the market calendar (agent.startup.AccountsNotExpectedForMode;
+# agent.market_calendar.exercises_calendar("PAUSED") is False). That refusal
+# fires for PAUSED regardless of whether target_mode == persisted_mode --
+# it is not a transition check, it is a "should a real account ever reach a
+# startup targeting this mode" check.
+#
+# THE FIX: --reconcile-once no longer calls run_cycle or run_startup at
+# all. It now calls agent.run_loop.sync_and_build_reconciliations (the
+# mode-independent broker-read-plus-local-bookkeeping half of a cycle,
+# extracted verbatim out of run_cycle) followed by agent.startup.
+# reconcile_accounts_or_raise (the exact per-account positions/settled-cash/
+# open-orders/day-trade-count comparison loop, extracted verbatim out of
+# run_startup) -- neither of which references ModeStore, target_mode, or
+# the market calendar at all. See scripts/run_agent.py's own
+# `_run_reconcile_once` docstring ("ROOT CAUSE OF THE PAUSED FAILURE") for
+# the full account.
+#
+# The tests below repeat the central --reconcile-once proofs above with
+# PAUSED (not PAPER) as the persisted mode, add the PAUSED-specific proofs
+# the mission's own numbered list called for, and add a direct regression
+# test pinned to the real failure text/path so this exact defect cannot
+# regress silently.
+
+from agent import market_calendar as market_calendar_module
+from agent.startup import AccountsNotExpectedForMode, run_startup
+
+
+def _reconcile_once_seed_paused_mode(mode_store_path, *, from_mode="PAPER",
+                                     from_at=_RO_FILL_NOW, paused_at=_RO_QUARANTINED_AT):
+    """Real incident shape: an account already legally running in
+    `from_mode` (PAPER, in the real deploy) for days, then PAUSED -- e.g.
+    because a prior reconciliation attempt failed (agent.startup._halt
+    forces PAUSED on any mismatch, and that is exactly what the real
+    incident's own timeline was: "the persisted operational state is
+    intentionally PAUSED because reconciliation previously failed"). Every
+    PAUSED-reconcile test below seeds this real two-step history via
+    ModeStore.write directly (never a bare fresh-store PAUSED, which no
+    real account could ever actually be in) -- mirroring the live incident
+    this whole follow-up unit responds to. Returns the constructed
+    ModeStore so a caller can inspect `.history()`/`.paused_from()`
+    without re-opening the file."""
+    store = ModeStore(mode_store_path)
+    store.write(from_mode, changed_at=from_at)
+    store.write("PAUSED", changed_at=paused_at, paused_from=from_mode,
+                reason="reconciliation previously failed")
+    return store
+
+
+def _reconcile_once_seed_admitted_recovery_paused(tmp_path, *, execution: Execution):
+    """Exactly `_reconcile_once_seed_admitted_recovery` above, except the
+    persisted mode this fixture seeds is PAUSED (via
+    `_reconcile_once_seed_paused_mode`), not PAPER -- the real incident's
+    own operational state at the moment --reconcile-once needs to run."""
+    from decimal import Decimal
+    from agent.ledger import CashAdjustment
+    ledger_path = tmp_path / "ledger.jsonl"
+    quarantine_path = tmp_path / "quarantine.jsonl"
+    cash_quarantine_path = tmp_path / "cash_quarantine.jsonl"
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+
+    ledger_store = LedgerStore(ledger_path, account_id=_RO_ACCT,
+                              policy_registry=_reconcile_once_registry())
+    ledger_store.write_opening_balance(Decimal("480"), at=_RO_QUARANTINED_AT)
+    ledger_store.write_cash_adjustment(CashAdjustment(
+        adjustment_id="ro-cat-fee-1", account_id=_RO_ACCT, amount=Decimal("-0.01"),
+        activity_type="FEE", description="CAT fee for a real trade",
+        effective_date=_RO_QUARANTINED_AT.date(), symbol=None,
+    ))
+
+    quarantine_store = ExecutionQuarantineStore(quarantine_path, account_id=_RO_ACCT)
+    quarantine_store.quarantine(
+        execution, reason="BUY with no holding_policy_version recorded at staging time",
+        at=_RO_QUARANTINED_AT,
+    )
+    quarantine_store.admit(execution.execution_id, decided_by="operator",
+                          decided_at=_RO_ADMITTED_AT, holding_policy_version="config")
+
+    _reconcile_once_seed_paused_mode(mode_path)
+
+    return dict(
+        ledger_store_path=ledger_path, quarantine_store_path=quarantine_path,
+        cash_quarantine_store_path=cash_quarantine_path, mode_store_path=mode_path,
+        audit_log_path=audit_path,
+    )
+
+
+def test_reconcile_once_regression_paused_account_no_longer_hits_the_real_failure(
+    tmp_path, monkeypatch, caplog,
+):
+    """THE REGRESSION TEST, pinned to the real failure text and the real
+    failure path. Two parts:
+
+    (1) Proves the OLD failure path still exists and still produces the
+        EXACT real error text, so this test would fail loudly if
+        `AccountsNotExpectedForMode`'s message ever drifted out of sync
+        with what this test asserts against -- calling `agent.startup.
+        run_startup` directly with `target_mode="PAUSED"` and one account
+        (exactly what the FIRST version of --reconcile-once used to do)
+        still raises `AccountsNotExpectedForMode` with the exact real
+        message. This is CORRECT behavior for run_startup itself (a real
+        scheduled cycle must never hand a PAUSED account to it) -- this
+        part of the test documents the trap, it does not report a defect.
+
+    (2) Proves --reconcile-once itself no longer falls into that trap:
+        run against a PAUSED-persisted account (items 1, 18), it succeeds,
+        and the real failure text never appears anywhere in its own log
+        output."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    # Part 1: the trap still exists, and still says exactly what the real
+    # incident's own traceback said -- calling run_startup the way the OLD
+    # --reconcile-once used to.
+    with pytest.raises(AccountsNotExpectedForMode) as exc_info:
+        run_startup(
+            target_mode="PAUSED", confirmed=False,
+            audit_log=AuditLog(path=tmp_path / "trap_audit.jsonl"),
+            mode_store=ModeStore(tmp_path / "trap_mode.jsonl"),
+            accounts=["not-empty"], approval_service=None, now=_RO_OUT_OF_SESSION,
+        )
+    assert (
+        "PAUSED does not exercise the market calendar (no order is ever "
+        "routed through Gatekeeper.stage or DayTradeGuard.reconcile in "
+        "this mode); refusing 1 account(s) handed to a startup that "
+        "should not be reconciling any."
+    ) in str(exc_info.value)
+
+    # Part 2: the ACTUAL --reconcile-once, run against a real PAUSED
+    # account, never reaches this trap at all.
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+        code = main(
+            _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+            secrets_provider_factory=_secrets_provider_factory,
+            now_fn=lambda: _RO_OUT_OF_SESSION,
+        )
+    assert code == 0
+    assert not any("does not exercise the market calendar" in r.message
+                   for r in caplog.records)
+    assert not any("AccountsNotExpectedForMode" in r.message for r in caplog.records)
+
+
+def test_reconcile_once_succeeds_while_persisted_mode_is_paused(tmp_path, monkeypatch):
+    """Items 1 and 18: the exact scenario the real host run hit -- a
+    persisted PAUSED account, run outside any market session -- now
+    succeeds."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    assert not in_session_now(_RO_OUT_OF_SESSION)
+    assert not market_calendar_module.exercises_calendar("PAUSED")
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+
+
+def test_reconcile_once_leaves_persisted_mode_paused_before_and_after(tmp_path, monkeypatch):
+    """Items 2 and 3: the persisted mode is PAUSED before the run, PAUSED
+    after it, and no additional ModeChange row (in particular, no
+    mode_transition) was appended by this run at all -- `ModeStore.write`
+    is never called anywhere in `_run_reconcile_once`'s own reachable code
+    (see the static test below), so this is a structural guarantee, not
+    merely an observed outcome, but this test still observes it directly,
+    from the outside, the same way an operator inspecting the real durable
+    file after running this live would."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    mode_path = data_dir / "mode_state.jsonl"
+    seeded_store = _reconcile_once_seed_paused_mode(mode_path)
+    history_before = seeded_store.history()
+    assert ModeStore(mode_path).current() == "PAUSED"
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+
+    after_store = ModeStore(mode_path)
+    assert after_store.current() == "PAUSED"                      # mode unchanged
+    assert after_store.paused_from() == "PAPER"                   # paused_from unchanged
+    assert len(after_store.history()) == len(history_before)      # no new ModeChange row at all
+
+
+def test_reconcile_once_recovers_the_admitted_fill_while_paused_and_is_idempotent(
+    tmp_path, monkeypatch,
+):
+    """Items 4, 5, 6, 7 and 8, under PAUSED: exactly `test_reconcile_once_
+    recovers_the_admitted_fill_exactly_once_and_is_idempotent` above, with
+    the persisted mode PAUSED instead of PAPER -- the same golden figures
+    (SPY position 0.027087234, settled cash $460.00, exactly one Fill,
+    idempotent on a second run) must hold identically regardless of
+    persisted mode, since neither function this path now calls reads it."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+    from agent.money import to_decimal
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    broker, execution = _reconcile_once_broker_with_a_pending_fill()
+    paths = _reconcile_once_seed_admitted_recovery_paused(tmp_path, execution=execution)
+    _reconcile_once_pin_account_snapshot(broker, settled_cash="460.00")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: broker)
+
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(paths["ledger_store_path"]),
+        "--quarantine-store-path", str(paths["quarantine_store_path"]),
+        "--cash-quarantine-store-path", str(paths["cash_quarantine_store_path"]),
+        "--mode-store-path", str(paths["mode_store_path"]),
+        "--audit-log-path", str(paths["audit_log_path"]),
+    ]
+
+    first = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert first == 0
+
+    check_store = LedgerStore(paths["ledger_store_path"], account_id=_RO_ACCT,
+                              policy_registry=_reconcile_once_registry())
+    ledger = check_store.to_ledger()
+    assert ledger.positions() == {"SPY": to_decimal("0.027087234")}   # item 7
+    assert ledger.settled_cash(now=_RO_OUT_OF_SESSION) == to_decimal("460.00")   # item 8
+    assert len(ledger.fills) == 1   # item 5
+
+    assert ModeStore(paths["mode_store_path"]).current() == "PAUSED"   # still PAUSED mid-way
+
+    second = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                 now_fn=lambda: _RO_OUT_OF_SESSION + timedelta(minutes=5))
+    assert second == 0   # item 6: second reconciliation is idempotent
+    check_store_2 = LedgerStore(paths["ledger_store_path"], account_id=_RO_ACCT,
+                               policy_registry=_reconcile_once_registry())
+    ledger_2 = check_store_2.to_ledger()
+    assert len(ledger_2.fills) == 1
+    assert ledger_2.positions() == {"SPY": to_decimal("0.027087234")}
+    assert ledger_2.settled_cash(now=_RO_OUT_OF_SESSION) == to_decimal("460.00")
+    assert ModeStore(paths["mode_store_path"]).current() == "PAUSED"   # still PAUSED at the end
+
+
+def test_reconcile_once_reports_paused_broker_settled_cash_mismatch_not_hidden(
+    tmp_path, monkeypatch,
+):
+    """Item 9, under PAUSED: a broker-reported settled-cash figure that
+    disagrees with the local ledger must still halt loudly -- never
+    silently accepted just because the persisted mode is PAUSED."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    broker, execution = _reconcile_once_broker_with_a_pending_fill()
+    paths = _reconcile_once_seed_admitted_recovery_paused(tmp_path, execution=execution)
+    # Local will compute exactly $460.00; pin the broker's own reported
+    # settled_cash to something else entirely, on purpose.
+    _reconcile_once_pin_account_snapshot(broker, settled_cash="475.00")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: broker)
+
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(paths["ledger_store_path"]),
+        "--quarantine-store-path", str(paths["quarantine_store_path"]),
+        "--cash-quarantine-store-path", str(paths["cash_quarantine_store_path"]),
+        "--mode-store-path", str(paths["mode_store_path"]),
+        "--audit-log-path", str(paths["audit_log_path"]),
+    ]
+    code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+               now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert code == 1   # reported as a failure, not silently accepted
+    # And still never touched the persisted mode, even on this halt --
+    # reconcile_accounts_or_raise has no _halt-equivalent of its own (see
+    # that function's own docstring): unlike run_startup, a mismatch here
+    # propagates as a bare exception, never forcing PAUSED (already PAUSED,
+    # in this fixture, so a forced-PAUSED write would have been invisible
+    # to a naive check -- paused_from is what actually distinguishes it).
+    assert ModeStore(paths["mode_store_path"]).current() == "PAUSED"
+    assert ModeStore(paths["mode_store_path"]).paused_from() == "PAPER"
+
+
+def test_reconcile_once_never_calls_adapter_submit_or_cancel_while_paused(tmp_path, monkeypatch):
+    """Items 10 and 11, under PAUSED: exactly `test_reconcile_once_never_
+    calls_adapter_submit_or_cancel` above, with PAUSED as the persisted
+    mode."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    broker, execution = _reconcile_once_broker_with_a_pending_fill()
+    paths = _reconcile_once_seed_admitted_recovery_paused(tmp_path, execution=execution)
+    _reconcile_once_pin_account_snapshot(broker, settled_cash="460.00")
+
+    submit_calls = []
+    cancel_calls = []
+    real_submit, real_cancel = broker.submit, broker.cancel
+    broker.submit = lambda *a, **k: (submit_calls.append((a, k)), real_submit(*a, **k))[1]
+    broker.cancel = lambda *a, **k: (cancel_calls.append((a, k)), real_cancel(*a, **k))[1]
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: broker)
+
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(paths["ledger_store_path"]),
+        "--quarantine-store-path", str(paths["quarantine_store_path"]),
+        "--cash-quarantine-store-path", str(paths["cash_quarantine_store_path"]),
+        "--mode-store-path", str(paths["mode_store_path"]),
+        "--audit-log-path", str(paths["audit_log_path"]),
+    ]
+    code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+               now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert code == 0
+    assert submit_calls == []   # item 10
+    assert cancel_calls == []   # item 11
+
+
+def test_reconcile_once_static_proof_holds_regardless_of_persisted_mode(tmp_path):
+    """Items 12 and 13, restated: the static source-grep proof
+    (`test_reconcile_once_statically_cannot_reach_an_order_or_approval_
+    machinery` above) is unconditional on persisted mode --
+    `_run_reconcile_once`'s own source never branches on mode at all, and
+    -- new, since the PAUSED fix -- never references `ModeStore.write`,
+    `run_cycle`, `run_startup`, `ApprovalService`, or `target_mode`
+    anywhere either. Restated here as its own test, specifically for this
+    section's own numbered items, rather than relying on a test elsewhere
+    in the file to cover them."""
+    import ast
+    import inspect
+    import scripts.run_agent as run_agent_module
+
+    full_source = inspect.getsource(run_agent_module._run_reconcile_once)
+    tree = ast.parse(full_source)
+    func_node = tree.body[0]
+    has_docstring = (
+        func_node.body and isinstance(func_node.body[0], ast.Expr)
+        and isinstance(func_node.body[0].value, ast.Constant)
+        and isinstance(func_node.body[0].value.value, str)
+    )
+    if has_docstring:
+        doc_end_line = func_node.body[0].end_lineno
+        source = "\n".join(full_source.splitlines()[doc_end_line:])
+    else:
+        source = full_source
+    for forbidden in (
+        "execute_approved_request", "approval_execution", "Gatekeeper",
+        "PipelineRuntime", "pipeline_stage", "build_pipeline_runtime",
+        ".submit(", ".cancel(", "mint_approval_token", "pipeline=",
+        "run_startup", "run_cycle(", "ApprovalService", "target_mode",
+        "mode_store.write",
+    ):
+        assert forbidden not in source, (
+            f"_run_reconcile_once's own source unexpectedly references "
+            f"{forbidden!r} -- items 12/13 (no pipeline/candidate/"
+            "materiality/approval execution reachable) and the PAUSED fix "
+            "itself (no run_cycle/run_startup/ApprovalService/target_mode/"
+            "ModeStore.write anywhere) both require this to hold "
+            "regardless of persisted mode, including PAUSED"
+        )
+    # Comments are prose, not code -- but this codebase's own convention
+    # (see the docstring-stripping above) is that a static "cannot reach"
+    # proof should hold against the REACHABLE code, not trip on a comment
+    # that merely NAMES the forbidden thing while explaining its absence.
+    # `mode_store.write` above already covers the one call this function
+    # must never make; a bare `.write(` is deliberately not checked (every
+    # inline comment in this function that explains what it does NOT do
+    # would otherwise make this test fail on its own prose).
+
+
+def test_reconcile_once_paused_requires_the_writer_lock(tmp_path, monkeypatch, caplog):
+    """Item 14, under PAUSED: --reconcile-once against a PAUSED account
+    still refuses while a competing process (simulated: the scheduled
+    loop, or another --reconcile-once) holds the same data_dir's writer
+    lock."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    with acquire_process_lock(data_dir):
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(
+                _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+                secrets_provider_factory=_secrets_provider_factory,
+                now_fn=lambda: _RO_OUT_OF_SESSION,
+            )
+    assert code == 1
+    assert any("reconcile-once" in r.message for r in caplog.records)
+
+
+def test_reconcile_once_paused_lock_contention_fails_before_any_mutation(tmp_path, monkeypatch):
+    """Item 15, under PAUSED: mirroring `test_reconcile_once_refuses_and_
+    never_touches_the_adapter_while_the_scheduled_loop_holds_the_lock`
+    above -- the fake adapter raises if constructed at all, proving the
+    lock is acquired BEFORE any local mutation could occur, not merely
+    that one happens to also be held somewhere, for the PAUSED case
+    specifically."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    def _must_not_be_constructed(**kwargs):
+        raise AssertionError(
+            "--reconcile-once must never construct a broker adapter while "
+            "the process lock could not be acquired, PAUSED or otherwise")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _must_not_be_constructed)
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(ledger_path),
+    ]
+    with acquire_process_lock(data_dir):
+        code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                   now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert code == 1
+    assert not ledger_path.exists()   # refused before any local mutation
+
+
+def test_scheduled_loop_still_refuses_a_paused_account_via_run_startup(tmp_path):
+    """Item 16: the SCHEDULED loop's own PAUSED behavior is unchanged --
+    and unchanged is CORRECT here, not a bug: `agent.startup.run_startup`
+    (what the scheduled loop's own `run_cycle` still calls, unmodified)
+    must still categorically refuse a non-empty `accounts` list when
+    `target_mode="PAUSED"`, with `AccountsNotExpectedForMode` and the
+    exact real error text -- this is the SAME check the regression test
+    above confirms still exists; restated here under this section's own
+    item numbering as its own test, run directly against `run_startup`
+    (never through --reconcile-once, which no longer calls it at all)."""
+    with pytest.raises(AccountsNotExpectedForMode) as exc_info:
+        run_startup(
+            target_mode="PAUSED", confirmed=False,
+            audit_log=AuditLog(path=tmp_path / "audit.jsonl"),
+            mode_store=ModeStore(tmp_path / "mode.jsonl"),
+            accounts=["not-empty"], approval_service=None, now=_RO_OUT_OF_SESSION,
+        )
+    assert "PAUSED does not exercise the market calendar" in str(exc_info.value)
+
+
+def test_normal_scheduled_market_session_behavior_is_unaffected_by_the_paused_fix(tmp_path):
+    """Item 17: ordinary in-session behavior for the scheduled loop (the
+    calendar gate `agent.run_loop.in_session_now`/`seconds_until_next_
+    session_open`, and `agent.market_calendar.exercises_calendar` for the
+    modes that DO exercise it) is completely unaffected by anything this
+    follow-up unit changed -- spot-checked directly here, the same way
+    `test_reconcile_once_does_not_change_the_scheduled_loops_own_session_
+    gate` above already does for the ORIGINAL --reconcile-once unit."""
+    in_session_instant = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)   # a real trading Monday
+    assert in_session_now(in_session_instant) is True
+    assert market_calendar_module.exercises_calendar("PAPER") is True
+    assert market_calendar_module.exercises_calendar("PRODUCTION_ACTIVE") is True
+    assert market_calendar_module.exercises_calendar("PAUSED") is False
+    assert market_calendar_module.exercises_calendar("DISABLED") is False
+    assert market_calendar_module.exercises_calendar("RESEARCH") is False
+
+
+def test_reconcile_once_still_works_normally_for_paper_and_production_active(tmp_path, monkeypatch):
+    """Item 19: PAPER/PRODUCTION safety gates are not weakened by this
+    fix -- --reconcile-once still succeeds normally for a PAPER-persisted
+    account (the ORIGINAL --reconcile-once tests above already prove this
+    exhaustively; this test adds PRODUCTION_ACTIVE, which the original
+    unit never exercised, to confirm the new mode-agnostic implementation
+    genuinely does not care which real mode is persisted, PAUSED, PAPER or
+    PRODUCTION_ACTIVE alike) -- and that the PAPER->PRODUCTION_ACTIVE
+    re-authentication gate itself (§9.2, agent.mode.assert_legal_startup)
+    lives entirely in run_startup/--advance-mode-to, neither of which
+    --reconcile-once calls or bypasses."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    mode_path = data_dir / "mode_state.jsonl"
+    mode_store = ModeStore(mode_path)
+    mode_store.write("PAPER", changed_at=_RO_FILL_NOW)
+    mode_store.write("PRODUCTION_ACTIVE", changed_at=_RO_QUARANTINED_AT)
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+    # Still never advanced/changed the persisted mode.
+    assert ModeStore(mode_path).current() == "PRODUCTION_ACTIVE"
+
+
+def test_reconcile_once_introduces_no_settled_cash_tolerance_while_paused(tmp_path, monkeypatch):
+    """Item 20, under PAUSED: exactly `test_reconcile_once_introduces_no_
+    settled_cash_tolerance` above -- a single cent of drift is still a
+    halt, not a pass -- with PAUSED as the persisted mode."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    broker, execution = _reconcile_once_broker_with_a_pending_fill()
+    paths = _reconcile_once_seed_admitted_recovery_paused(tmp_path, execution=execution)
+    _reconcile_once_pin_account_snapshot(broker, settled_cash="460.01")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: broker)
+
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(paths["ledger_store_path"]),
+        "--quarantine-store-path", str(paths["quarantine_store_path"]),
+        "--cash-quarantine-store-path", str(paths["cash_quarantine_store_path"]),
+        "--mode-store-path", str(paths["mode_store_path"]),
+        "--audit-log-path", str(paths["audit_log_path"]),
+    ]
+    code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+               now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert code == 1   # a real cent of drift is still a halt, not a pass

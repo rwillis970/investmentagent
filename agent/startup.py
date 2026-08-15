@@ -429,6 +429,88 @@ def _halt(mode_store: ModeStore, audit_log: AuditLog, *, persisted_mode: str | N
                      correlation_id=correlation_id, timestamp=now)
 
 
+def reconcile_accounts_or_raise(accounts: list[AccountReconciliation], *,
+                                audit_log: AuditLog, now: datetime,
+                                correlation_id: str | None = None) -> tuple[str, ...]:
+    """Exactly §8.1 step 1 -- the per-account positions/settled-cash/open-
+    orders/day-trade comparison loop, extracted out of `run_startup`
+    (PAUSED-reconcile follow-up, 2026-08-14) so a caller that must NOT go
+    through `run_startup`'s own mode-transition/calendar-coverage/audit-
+    chain-verification/approval-sweep machinery can still get the SAME
+    exact, unmodified reconciliation comparison `run_startup` performs --
+    not a second, parallel implementation of "what counts as a match."
+    `run_startup` itself now calls this too (below), so there remains
+    exactly ONE place this codebase ever compares local vs. broker state --
+    this extraction removes a would-be duplicate, it does not create one.
+
+    THE REAL CALLER THIS WAS BUILT FOR: `scripts.run_agent._run_reconcile_
+    once`, when the persisted mode is PAUSED (or any other mode `agent.
+    market_calendar.exercises_calendar` says doesn't need a real adapter).
+    `run_startup` categorically refuses a non-empty `accounts` list in that
+    case (`AccountsNotExpectedForMode`) -- correct for the real scheduled
+    loop (a PAUSED cycle has no business staging orders), wrong for an
+    operator who explicitly wants to reconcile and repair a PAUSED
+    account's local bookkeeping WITHOUT resuming trading. This function
+    answers ONLY "did local and broker state actually match" -- it never
+    asks or answers "what should the persisted mode become," which is
+    `run_startup`'s question alone.
+
+    A mismatch on ANY of the four Day 3 exit-criterion items (day-trade
+    count, positions, settled cash, open orders) raises exactly the
+    exception `run_startup`'s own loop would raise (`CrossAccountError`,
+    `PostureMismatch`, `ReconciliationMismatch`) -- propagated to the
+    caller UNMODIFIED, never caught or downgraded here. This function does
+    not call `_halt` and does not touch `mode_store` at all: "was this
+    reconciliation clean" and "what should the persisted mode become" are
+    two different questions, and `run_startup` is the only place that ever
+    answers the second one -- a caller reconciling a PAUSED account must
+    stay PAUSED, mismatch or not, and this function cannot accidentally
+    change that because it never references `ModeStore` in the first
+    place.
+
+    Appends ONE `reconcile_account` audit row per successfully-reconciled
+    account -- the exact same shape `run_startup`'s own loop appends -- so
+    a PAUSED reconciliation leaves the same kind of durable evidence a
+    normal cycle's reconciliation does. Appends NOTHING for an account that
+    mismatches: the raised exception is the caller's signal, and there is
+    no partial/successful state worth recording for that account.
+
+    Returns the tuple of account_ids that reconciled cleanly, mirroring
+    `StartupResult.reconciled_accounts`'s own shape."""
+    today = market_calendar.session_for_instant(now)
+    reconciled: list[str] = []
+    for acct in accounts:
+        acct.day_trade_guard.reconcile(
+            account_id=acct.account_id,
+            broker_reported=acct.broker_reported_day_trades,
+            as_of=today,
+        )
+        reconcile_positions(
+            account_id=acct.account_id, local_positions=acct.local_positions,
+            broker_positions=list(acct.broker_positions),
+        )
+        reconcile_settled_cash(
+            account_id=acct.account_id, local_settled_cash=acct.local_settled_cash,
+            broker_account=acct.broker_account,
+        )
+        reconcile_open_orders(
+            account_id=acct.account_id, local_open_order_ids=acct.local_open_order_ids,
+            broker_open_orders=list(acct.broker_open_orders),
+        )
+        audit_log.append(
+            actor="system", action="reconcile_account", object_type="account",
+            object_id=acct.account_id,
+            after={"broker_reported_day_trades": acct.broker_reported_day_trades,
+                  "as_of": today.isoformat(),
+                  "positions": {sym: str(qty) for sym, qty in acct.local_positions.items()},
+                  "settled_cash": str(acct.local_settled_cash),
+                  "open_order_ids": sorted(acct.local_open_order_ids)},
+            correlation_id=correlation_id, timestamp=now,
+        )
+        reconciled.append(acct.account_id)
+    return tuple(reconciled)
+
+
 def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLog,
                 mode_store: ModeStore, accounts: list[AccountReconciliation],
                 approval_service: ApprovalService, now: datetime,
@@ -495,47 +577,22 @@ def run_startup(*, target_mode: str, confirmed: bool = False, audit_log: AuditLo
     #    a plain loop, and a mismatch on ANY of the four is a halt, not a
     #    skip: the loop stops at the first bad account rather than
     #    reconciling the rest and reporting a partial result.
-    reconciled: list[str] = []
-    for acct in accounts:
-        try:
-            acct.day_trade_guard.reconcile(
-                account_id=acct.account_id,
-                broker_reported=acct.broker_reported_day_trades,
-                as_of=today,
-            )
-            reconcile_positions(
-                account_id=acct.account_id, local_positions=acct.local_positions,
-                broker_positions=list(acct.broker_positions),
-            )
-            reconcile_settled_cash(
-                account_id=acct.account_id, local_settled_cash=acct.local_settled_cash,
-                broker_account=acct.broker_account,
-            )
-            reconcile_open_orders(
-                account_id=acct.account_id, local_open_order_ids=acct.local_open_order_ids,
-                broker_open_orders=list(acct.broker_open_orders),
-            )
-        except (CrossAccountError, PostureMismatch, ReconciliationMismatch,
-               market_calendar.CalendarCoverageError) as exc:
-            _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=str(exc),
-                 now=now, correlation_id=correlation_id)
-            raise
-        audit_log.append(
-            actor="system", action="reconcile_account", object_type="account",
-            object_id=acct.account_id,
-            # Decimal is not JSON-native -- agent.audit.AuditLog._assert_
-            # json_native rejects it outright, by design (see that module's
-            # own docstring). str() here, not float(), preserves the exact
-            # digits in the permanent audit record -- the same reasoning
-            # agent/money.py gives for never routing money through float.
-            after={"broker_reported_day_trades": acct.broker_reported_day_trades,
-                  "as_of": today.isoformat(),
-                  "positions": {sym: str(qty) for sym, qty in acct.local_positions.items()},
-                  "settled_cash": str(acct.local_settled_cash),
-                  "open_order_ids": sorted(acct.local_open_order_ids)},
-            correlation_id=correlation_id, timestamp=now,
-        )
-        reconciled.append(acct.account_id)
+    # Delegates to reconcile_accounts_or_raise (PAUSED-reconcile follow-up,
+    # 2026-08-14) -- the exact same per-account comparison this loop used to
+    # perform inline, now the ONE implementation both this function and a
+    # PAUSED-tolerant one-shot reconciliation share (see that function's own
+    # docstring). `_halt` is still THIS function's own responsibility, not
+    # the shared function's -- "what should the persisted mode become on a
+    # mismatch" is a run_startup-only question.
+    try:
+        reconciled_tuple = reconcile_accounts_or_raise(
+            accounts, audit_log=audit_log, now=now, correlation_id=correlation_id)
+    except (CrossAccountError, PostureMismatch, ReconciliationMismatch,
+           market_calendar.CalendarCoverageError) as exc:
+        _halt(mode_store, audit_log, persisted_mode=persisted_mode, reason=str(exc),
+             now=now, correlation_id=correlation_id)
+        raise
+    reconciled: list[str] = list(reconciled_tuple)
 
     # -- §8.1 step 2: verify the hash chain. A bool return value is exactly
     #    what a caller can accidentally ignore -- convert it into a raise

@@ -298,13 +298,14 @@ from agent.money import to_decimal
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.pipeline import Gatekeeper
 from agent.pipeline_stage import PipelineRuntime
-from agent.run_loop import (AccountRuntime, in_session_now, run_cycle,
-                            seconds_until_next_session_open, run_loop as real_run_loop)
+from agent.run_loop import (AccountRuntime, in_session_now,
+                            seconds_until_next_session_open, run_loop as real_run_loop,
+                            sync_and_build_reconciliations)
 from agent import runtime_status as runtime_status_module
 from agent.process_lock import ProcessLockError, acquire_process_lock
 from agent.secrets_provider import (SecretsProvider,
                                     default_keychain_secrets_provider_factory)
-from agent.startup import _reconcile_mode_persistence
+from agent.startup import _reconcile_mode_persistence, reconcile_accounts_or_raise
 from agent.store import FactStore
 
 LOGGER_NAME = "investmentagent.run_loop"
@@ -1024,27 +1025,70 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
                         secrets_provider_factory: Callable[[str], SecretsProvider],
                         now_fn: Callable[[], datetime], log: logging.Logger) -> int:
     """ONE out-of-market-session recovery/reconciliation cycle, then exit
-    (out-of-session-recovery unit, 2026-08-14 -- see deploy/README.md's own
-    section on when to reach for this). Built because investigation found
-    no existing command already did this: `main()`'s real scheduled-loop
-    path only ever reaches `agent.run_loop.run_cycle` through `run_loop`'s
-    own `while` loop, gated on `in_session_now(now)` -- there was no way to
-    run exactly one cycle, in or out of session, from the command line.
+    (out-of-session-recovery unit, 2026-08-14; PAUSED-reconcile follow-up,
+    same date -- see deploy/README.md's own section on when to reach for
+    this). Built because investigation found no existing command already
+    did this: `main()`'s real scheduled-loop path only ever reaches
+    `agent.run_loop.run_cycle` through `run_loop`'s own `while` loop, gated
+    on `in_session_now(now)` -- there was no way to run exactly one cycle,
+    in or out of session, from the command line.
 
-    THIS IS NOT A SECOND CODE PATH. It calls the exact same `agent.run_loop.
-    run_cycle` the scheduled loop calls every cycle it ever runs -- same
-    adapter factory (`_real_adapter_factory`, below, the same PAPER-bound
-    one the scheduled loop already uses), same `build_account_runtime`, same
-    `sync_fills` -> `close_terminal_orders` -> `sync_cash_events` ->
-    `build_account_reconciliation` -> `run_startup` sequence inside it. The
-    ONLY differences from a real scheduled cycle: (1) `run_cycle` is called
-    ONCE, directly, bypassing `run_loop`'s `in_session_now` gate entirely --
-    that gate lives in `run_loop`'s own `while` loop, never inside
-    `run_cycle` itself, so calling `run_cycle` directly was always
-    session-independent, not a new bypass invented here; (2) no `pipeline`
-    is attached (the keyword is simply omitted, leaving `run_cycle`'s own
-    default of `None`) -- see CANNOT REACH AN ORDER, below, for why that
-    single omission is what keeps this command read-plus-reconcile-only.
+    ROOT CAUSE OF THE PAUSED FAILURE (why this function no longer calls
+    `run_cycle`/`run_startup` at all). The FIRST version of this function
+    called `agent.run_loop.run_cycle` with `target_mode = ModeStore.
+    current()` -- correct in that it never itself proposed a mode
+    transition (`target_mode == persisted_mode` is unconditionally legal,
+    `agent.mode.is_legal_step`), but `run_cycle` always ends by calling
+    `agent.startup.run_startup(target_mode=..., accounts=reconciliations,
+    ...)`, and `run_startup` refuses OUTRIGHT -- before ever reaching its
+    own per-account reconciliation loop -- whenever `accounts` is non-empty
+    and `target_mode` does not exercise the market calendar
+    (`agent.startup.AccountsNotExpectedForMode`; `agent.market_calendar.
+    exercises_calendar("PAUSED")` is `False`, by design: PAUSED trading
+    a real cycle over that account was never supposed to happen). That
+    check is correct for the SCHEDULED loop (a PAUSED cycle has no business
+    handing a real account to a startup sequence that can stage orders) but
+    wrong for THIS command's real use case: an operator explicitly
+    reconciling and repairing a PAUSED account's local bookkeeping WITHOUT
+    resuming trading. Passing a fake, non-PAUSED `target_mode` just to get
+    past that check was rejected outright (it would be lying to
+    `run_startup` about what mode this account is really in, and would
+    route through code -- the calendar-coverage check, the mode-transition
+    write path -- that has no business running at all here).
+
+    THE FIX: this function no longer calls `run_cycle` or `run_startup` in
+    any form. It calls `agent.run_loop.sync_and_build_reconciliations`
+    (the mode-independent HALF of a cycle: broker reads, `sync_fills`,
+    `close_terminal_orders`, `sync_cash_events`, `build_account_
+    reconciliation` -- extracted verbatim out of `run_cycle`, byte-for-byte
+    identical behaviour, see that function's own docstring) followed by
+    `agent.startup.reconcile_accounts_or_raise` (the exact per-account
+    positions/settled-cash/open-orders/day-trade-count comparison loop --
+    extracted verbatim out of `run_startup`, same exceptions, same audit
+    row, see that function's own docstring). Neither of these two functions
+    references `ModeStore`, `target_mode`, the market calendar, or
+    `ApprovalService` AT ALL -- there is structurally no mode this path can
+    be "inappropriate for": it performs the identical broker-read-plus-
+    local-reconciliation work regardless of whether the persisted mode is
+    PAPER, PAUSED, DISABLED, RESEARCH or PRODUCTION_ACTIVE. `ModeStore` is
+    still constructed here and its `.current()` is still read once -- ONLY
+    to include the persisted mode in the log line below, exactly the way an
+    operator reading this log a week later would want to know what mode the
+    account was in when this ran. `.write()` is never called on it, on any
+    path, successful or not -- see NO MODE TRANSITION, EVER, below.
+
+    NO MODE TRANSITION, EVER (stricter than the real scheduled loop,
+    deliberately, and now structural rather than merely arranged). The real
+    loop's `run_cycle` -> `run_startup` can legitimately write `ModeStore`
+    (a real `target_mode != persisted_mode` transition, or `_halt` forcing
+    PAUSED on a mismatch). This function calls neither `run_cycle` nor
+    `run_startup` -- `agent.mode_store.ModeStore.write` is not merely
+    unreached at runtime, it is not imported, referenced, or reachable from
+    any code path inside this function AT ALL (checked directly: the only
+    `ModeStore` method this function calls is `.current()`, a pure read).
+    The persisted mode -- PAUSED, in the real incident this exists to fix,
+    or any other value -- cannot change as a result of running this
+    command, structurally, not by convention.
 
     CANNOT REACH AN ORDER (proof, not merely a claim -- see also tests/
     test_run_agent.py's own static grep tests for --reconcile-once, mirroring
@@ -1054,36 +1098,20 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
     refuses a subclass that overrides either), and both REQUIRE a
     `agent.pipeline.StagedOrder` -- the output of `Gatekeeper.stage`, which
     itself only ever runs inside `agent.pipeline_stage.run_pipeline_stage`,
-    which `run_cycle` only ever calls when its own `pipeline` argument is
-    not `None` (see agent/run_loop.py's own `pipeline_result = None \n if
-    pipeline is not None: ...` guard). This function never constructs a
-    `PipelineRuntime` and never passes `pipeline=` to `run_cycle` at all --
-    there is therefore no `Gatekeeper`, no `StagedOrder`, and structurally no
-    value this function could hand to `submit`/`cancel` even if it wanted
-    to. `sync_fills`/`close_terminal_orders`/`sync_cash_events`/
-    `build_account_reconciliation`/`run_startup` -- the only things
-    `run_cycle` calls without a `pipeline` -- read the broker and write only
-    to the local append-only stores (`LedgerStore`, `ExecutionQuarantineStore`,
-    `CashEventQuarantineStore`, `ModeStore`, `AuditLog`); none of them import
-    `agent.pipeline`, construct a `StagedOrder`, or call `.submit`/`.cancel`
-    (checked directly against each module's own imports).
-
-    NO MODE ADVANCEMENT (stricter than the real scheduled loop, deliberately).
-    The real loop always targets `cfg.mode` (main()'s own scheduled-loop
-    call to `run_loop_fn`) -- safe there only because a mismatched `cfg.mode`
-    is the kind of drift an attended deploy is expected to catch. This
-    command instead reads `ModeStore.current()` itself and passes THAT back
-    as `run_cycle`'s own `target_mode` -- so `target_mode == persisted_mode`
-    is unconditionally true (falling back to `cfg.mode` only in the
-    never-yet-initialized case, identical to a real first-ever cycle) and
-    `agent.mode.is_legal_step` always short-circuits True on `target ==
-    persisted` before any transition or `ConfirmationRequired` gate is even
-    considered (agent/mode.py's own `is_legal_step`) -- `run_startup` takes
-    the `target_mode != persisted_mode` branch that WRITES `ModeStore`/
-    appends a `mode_transition` audit row (agent/startup.py) never, by
-    construction, no matter what `--confirmed` is passed or what `config.
-    json` currently says `mode` is. An out-of-session recovery run can never
-    itself be the reason the persisted mode changes.
+    which only `run_cycle` (never called here) ever invokes, and only when
+    its own `pipeline` argument is not `None`. This function never
+    constructs a `PipelineRuntime`, a `Gatekeeper`, or a `StagedOrder`, and
+    never imports `agent.pipeline` at all -- there is therefore structurally
+    no value this function could hand to `submit`/`cancel` even if it
+    wanted to. `sync_and_build_reconciliations` and `reconcile_accounts_or_
+    raise` -- the only two functions this path calls -- read the broker and
+    write only to the local append-only stores (`LedgerStore`,
+    `ExecutionQuarantineStore`, `CashEventQuarantineStore`, `AuditLog`);
+    neither imports `agent.pipeline`, constructs a `StagedOrder`, or calls
+    `.submit`/`.cancel` (checked directly against each module's own
+    imports). `ModeStore` is the only store this function touches that
+    neither of those two functions touches at all -- and, per the section
+    above, only ever via `.current()`.
 
     WRITER LOCK: dispatched through `_run_one_shot_locked`, below, exactly
     like the other four one-shot writers -- acquires the SAME
@@ -1097,17 +1125,24 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
     first, run this once, confirm, then restart the loop -- not "run this
     alongside it."
 
-    FAILS CLOSED. Like every other step in `run_cycle`, this function does
-    not catch `run_cycle`'s own exceptions selectively -- ANY failure
-    (a broker `TransportError`, a `SecretNotFoundError`, a genuine
-    `ReconciliationMismatch`/other `StartupHalted` from `run_startup`) is
-    caught by this function's own outer `except Exception`, LOGGED IN FULL
-    (never summarized to a bare "failed"), and turned into `return 1` --
-    the same fail-safe-to-NO-TRADE posture `run_loop` itself documents for
-    every uncaught exception, applied here to a single manually-triggered
-    cycle instead of an unattended one. A reconciliation mismatch is
-    therefore reported (in the log line, and in AuditLog if run_startup got
-    that far), never silently swallowed or downgraded to a warning.
+    FAILS CLOSED. This function does not catch `sync_and_build_
+    reconciliations`'s or `reconcile_accounts_or_raise`'s own exceptions
+    selectively -- ANY failure (a broker `TransportError`, a
+    `SecretNotFoundError`, a genuine `CrossAccountError`/`PostureMismatch`/
+    `ReconciliationMismatch`/`market_calendar.CalendarCoverageError` from
+    `reconcile_accounts_or_raise`) is caught by this function's own outer
+    `except Exception`, LOGGED IN FULL (never summarized to a bare
+    "failed"), and turned into `return 1` -- the same fail-safe-to-NO-TRADE
+    posture `run_loop` itself documents for every uncaught exception,
+    applied here to a single manually-triggered cycle instead of an
+    unattended one. A reconciliation mismatch (for example, a broker
+    settled-cash figure that disagrees with the local ledger) is therefore
+    REPORTED -- in the log line, and via `reconcile_accounts_or_raise`'s own
+    `reconcile_account` audit row for every account that DID reconcile
+    clean before the mismatch was hit -- never silently swallowed,
+    downgraded to a warning, or given a tolerance it didn't have before
+    (`agent.reconciliation.reconcile_settled_cash` is exact-equality only,
+    unchanged by this function).
 
     Deliberately does NOT touch `agent.failure_sentinel` (same reasoning as
     `_run_advance_mode`/`_run_admit_or_reject`/`_run_submit_approved`: this
@@ -1137,41 +1172,32 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
             cash_quarantine_store_path=cash_quarantine_store_path,
         )
 
+        # Read-only, once, for the log line below ONLY -- see this
+        # function's own "ROOT CAUSE OF THE PAUSED FAILURE"/"NO MODE
+        # TRANSITION, EVER" docstring sections. `.write()` is never called
+        # on this object anywhere in this function.
         mode_store = ModeStore(mode_store_path)
         audit_log = AuditLog(path=audit_log_path)
         now = now_fn()
+        persisted_mode = mode_store.current()
 
-        # NO MODE ADVANCEMENT -- see this function's own docstring section
-        # of the same name for the full reasoning.
-        persisted = mode_store.current()
-        target_mode = persisted if persisted is not None else cfg.mode
-
-        approval_service = ApprovalService(
-            expiration=timedelta(minutes=cfg.approval_expiration_minutes),
-            min_display=timedelta(seconds=cfg.approval_min_display_seconds),
-            max_per_day=cfg.max_approval_requests_per_day,
-            price_band_pct=cfg.price_band_pct,
-        )
-
-        report = run_cycle(
+        sync_result = sync_and_build_reconciliations(
             accounts=[account], adapter_factory=_real_adapter_factory(secrets_provider),
-            mode_store=mode_store, audit_log=audit_log,
-            approval_service=approval_service, target_mode=target_mode,
-            confirmed=False, now=now, logger=log,
-            # `pipeline` intentionally OMITTED (defaults to None) -- see
-            # this function's own "CANNOT REACH AN ORDER" docstring section.
-            # No candidate generation, no materiality screen, no T4
-            # analysis, no approval request is ever attempted on this path.
+            now=now, audit_log=audit_log,
         )
-        recon = report.reconciliations[0] if report.reconciliations else None
+        reconciled_accounts = reconcile_accounts_or_raise(
+            list(sync_result.reconciliations), audit_log=audit_log, now=now,
+        )
+
+        recon = sync_result.reconciliations[0] if sync_result.reconciliations else None
         log.info(
-            "--reconcile-once complete: account=%s mode=%s new_fills=%d "
+            "--reconcile-once complete: account=%s persisted_mode=%s new_fills=%d "
             "new_cash_adjustments=%d reconciled_accounts=%s positions=%s "
             "settled_cash local=%s broker=%s",
-            account_id, report.result.mode,
-            len(report.new_fills.get(account_id, ())),
-            len(report.new_cash_adjustments.get(account_id, ())),
-            report.result.reconciled_accounts,
+            account_id, persisted_mode,
+            len(sync_result.new_fills.get(account_id, ())),
+            len(sync_result.new_cash_adjustments.get(account_id, ())),
+            reconciled_accounts,
             recon.local_positions if recon is not None else {},
             recon.local_settled_cash if recon is not None else None,
             recon.broker_account.settled_cash if recon is not None else None,
@@ -1587,24 +1613,31 @@ def _parse_args(argv: list[str] | None):
                              "would be.")
     parser.add_argument("--reconcile-once", action="store_true",
                         help="run ONE broker-read + sync_fills + sync_cash_events + account "
-                             "reconciliation cycle -- the exact same agent.run_loop.run_cycle "
-                             "the scheduled loop calls every cycle -- then exit. Unlike the "
-                             "scheduled loop, does NOT require the market to be in session "
-                             "(agent.run_loop.run_cycle has no session gate of its own; that "
-                             "gate lives only in run_loop's own while-loop, never reached "
-                             "here). No pipeline is attached: no candidate generation, no "
+                             "reconciliation cycle -- agent.run_loop.sync_and_build_"
+                             "reconciliations followed by agent.startup.reconcile_accounts_or_"
+                             "raise, the same two functions extracted out of the scheduled "
+                             "loop's own run_cycle/run_startup -- then exit. Does NOT require "
+                             "the market to be in session, and does NOT require (or care) that "
+                             "the persisted mode exercise the market calendar -- unlike the "
+                             "real scheduled loop, this command never calls run_startup at "
+                             "all, so it works identically whether the persisted mode is "
+                             "PAPER, PAUSED, DISABLED, RESEARCH or PRODUCTION_ACTIVE (built "
+                             "specifically so a PAUSED account can be reconciled without ever "
+                             "being handed to a startup sequence that refuses it -- see "
+                             "_run_reconcile_once's own docstring for the incident this "
+                             "closes). No pipeline is attached: no candidate generation, no "
                              "materiality screen, no T4 analysis, no approval request, and -- "
                              "structurally, not merely by convention -- no path to "
                              "adapter.submit/cancel (see _run_reconcile_once's own docstring "
-                             "for the proof). Never advances the persisted mode (targets "
-                             "ModeStore.current() itself, not --config's mode). Mirrors "
-                             "--admit-execution's SHAPE (one-shot, narrow, wrapped in the "
-                             "same process lock the scheduled loop holds) but not its "
-                             "collaborators: this command DOES construct a real broker "
-                             "adapter and DOES write to LedgerStore/ExecutionQuarantineStore/"
-                             "CashEventQuarantineStore, same as a real cycle. Requires "
-                             "--account-id, --config, --key-id and --secret-ref; every "
-                             "pipeline/approval flag is ignored.")
+                             "for the proof). NEVER writes ModeStore, on any path -- the "
+                             "persisted mode cannot change as a result of running this "
+                             "command. Mirrors --admit-execution's SHAPE (one-shot, narrow, "
+                             "wrapped in the same process lock the scheduled loop holds) but "
+                             "not its collaborators: this command DOES construct a real "
+                             "broker adapter and DOES write to LedgerStore/"
+                             "ExecutionQuarantineStore/CashEventQuarantineStore, same as a "
+                             "real cycle. Requires --account-id, --config, --key-id and "
+                             "--secret-ref; every pipeline/approval flag is ignored.")
     parser.add_argument("--confirmed", action="store_true",
                         help="required for the PAPER/PAUSED -> PRODUCTION_ACTIVE edges (§9.2); "
                              "irrelevant, and harmless, for PAPER")
@@ -1774,15 +1807,18 @@ def main(argv: list[str] | None = None, *,
     given, dispatches to `_run_submit_approved` and returns immediately --
     see module docstring's --SUBMIT-APPROVED section. If `--reconcile-once`
     was given, dispatches to `_run_reconcile_once` and returns immediately
-    (out-of-session-recovery unit, 2026-08-14) -- see that function's own
-    docstring: unlike the other four, this one DOES reuse the real
-    scheduled-loop's own `_real_adapter_factory`/`build_account_runtime`/
-    `agent.run_loop.run_cycle`, just called once, directly, with no
-    `pipeline` attached and no session-gate check. None of the account/
-    broker/failure-sentinel machinery below is touched on any of the first
-    four paths (`--submit-approved` builds its OWN adapter, inside
-    `_run_submit_approved` -- not the `run_loop_fn`/`_real_adapter_factory`
-    path below, which that flag never reaches).
+    (out-of-session-recovery unit, 2026-08-14; PAUSED-reconcile follow-up,
+    same date) -- see that function's own docstring: unlike the other four,
+    this one DOES reuse the real scheduled-loop's own `_real_adapter_
+    factory`/`build_account_runtime`, but calls `agent.run_loop.sync_and_
+    build_reconciliations` + `agent.startup.reconcile_accounts_or_raise`
+    directly -- NOT `agent.run_loop.run_cycle` and NOT `agent.startup.
+    run_startup` -- so it never constructs a `pipeline`, never checks the
+    market calendar, and never touches `ModeStore` beyond one read. None of
+    the account/broker/failure-sentinel machinery below is touched on any
+    of the first four paths (`--submit-approved` builds its OWN adapter,
+    inside `_run_submit_approved` -- not the `run_loop_fn`/
+    `_real_adapter_factory` path below, which that flag never reaches).
 
     All five of these one-shot dispatches are wrapped in `_run_one_shot_
     locked`, which acquires the SAME `acquire_process_lock(args.data_dir)`

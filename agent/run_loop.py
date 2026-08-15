@@ -228,6 +228,30 @@ class AccountRuntime:
 
 
 @dataclass(frozen=True)
+class AccountSyncResult:
+    """What `sync_and_build_reconciliations` produced for one call -- the
+    mode-independent HALF of a cycle (broker reads, sync_fills,
+    close_terminal_orders, sync_cash_events, build_account_reconciliation),
+    extracted out of `run_cycle` (PAUSED-reconcile follow-up, 2026-08-14) so
+    a caller that must NOT go through `run_startup`'s own mode-transition/
+    calendar-coverage/audit-chain-verification machinery can still get the
+    exact same reads-plus-local-bookkeeping `run_cycle` itself performs --
+    see that function's own docstring for why this split exists and
+    `scripts.run_agent._run_reconcile_once`'s own docstring for the real
+    caller this was built for (a PAUSED-persisted account still needs its
+    condition reconciled/repaired without ever being handed to `run_startup`,
+    which categorically refuses real accounts in any mode that doesn't
+    exercise the market calendar -- see `agent.startup.run_startup`'s own
+    `AccountsNotExpectedForMode` check)."""
+    new_fills: dict[str, tuple[Fill, ...]]
+    new_cash_adjustments: dict[str, tuple[CashAdjustment, ...]]
+    reconciliations: tuple[AccountReconciliation, ...]
+    # The FIRST account's Ledger -- see agent.pipeline_stage's own module
+    # docstring for why only one account feeds Unit 4's pipeline stage.
+    primary_ledger: object | None
+
+
+@dataclass(frozen=True)
 class CycleReport:
     """What one call to `run_cycle` produced -- returned for a caller (or
     a test) that wants more than the log line, and to keep `run_cycle`
@@ -316,41 +340,41 @@ def _log_cycle(log: logging.Logger, *, now: datetime,
         log.warning("  calendar warning: %s", w)
 
 
-def run_cycle(*, accounts: list[AccountRuntime],
-             adapter_factory: Callable[[AccountRuntime], BrokerAdapter],
-             mode_store: ModeStore, audit_log: AuditLog,
-             approval_service: ApprovalService, target_mode: str,
-             confirmed: bool = False, now: datetime,
-             logger: logging.Logger | None = None,
-             pipeline: PipelineRuntime | None = None,
-             last_collected_at: datetime | None = None,
-             last_screened_at: datetime | None = None,
-             run_id: str = "") -> CycleReport:
-    """One cycle: per account, construct the adapter/store/guard, sync
-    fills, build a real AccountReconciliation -- then run_startup ONCE for
-    every account together, then log. Raises whatever any step raises
-    (CrossAccountError, SyncFillsError, any StartupHalted subclass, a
-    broker TransportError, a SecretNotFoundError...); nothing here is
-    caught -- see run_loop's own docstring for why that is deliberate and
-    wider than only a StartupHalted.
+def sync_and_build_reconciliations(*, accounts: list[AccountRuntime],
+                                   adapter_factory: Callable[[AccountRuntime], BrokerAdapter],
+                                   now: datetime,
+                                   audit_log: AuditLog) -> AccountSyncResult:
+    """The mode-independent HALF of a cycle, extracted out of `run_cycle`
+    (PAUSED-reconcile follow-up, 2026-08-14): per account, construct the
+    adapter/store/guard/quarantine stores, sync fills, close terminal
+    orders, sync cash events, and build a real `AccountReconciliation` --
+    exactly what `run_cycle` itself used to do inline, before this
+    extraction, in the exact same order for the exact same load-bearing
+    reasons (see `run_cycle`'s own docstring, unchanged, for why sync_fills
+    must run before build_account_reconciliation and why each store is
+    reconstructed fresh every call). Does NOT call `run_startup` and does
+    NOT touch `ModeStore`, `ApprovalService`, or any calendar/mode check --
+    those are `run_startup`'s job alone, not this function's.
 
-    `pipeline` (unattended wiring unit, 2026-08-01): `None` (the default)
-    means exactly today's behaviour -- no collection, no screening, no T4,
-    no approval request, `pipeline_result` on the returned `CycleReport` is
-    `None`. When given, the collection -> screening -> T4 -> approval-
-    request stage (`agent.pipeline_stage.run_pipeline_stage`) runs ONCE,
-    AFTER `run_startup` succeeds for every account this cycle -- a halted
-    cycle never reaches it (fail-safe). `last_collected_at`/
-    `last_screened_at` are threaded through and echoed back (possibly
-    updated) on `CycleReport.pipeline_result` for `run_loop` to carry
-    across iterations -- see `agent.pipeline_stage`'s own module docstring
-    for why this is not new durable state. Every new stage `pipeline`
-    could run is independently flagged and defaults to off (`agent.config.
-    Config.data_collection_enabled`/`materiality_screen_enabled`/
-    `t4_analysis_enabled`/`approval_request_enabled`) -- see agent.
-    pipeline_stage's own module docstring for the full money-guardrail
-    reasoning."""
-    log = logger or logging.getLogger(LOGGER_NAME)
+    WHY THIS SPLIT EXISTS. `agent.startup.run_startup` categorically
+    refuses a non-empty `accounts` list when `target_mode` does not
+    exercise the market calendar (`AccountsNotExpectedForMode`) -- correct
+    for the real scheduled loop (a PAUSED/DISABLED/RESEARCH cycle has no
+    business handing real accounts to a startup sequence that stages
+    orders), but wrong for an operator who explicitly wants to reconcile
+    and repair a PAUSED account's local bookkeeping WITHOUT resuming
+    trading (`scripts.run_agent._run_reconcile_once`'s own real use case,
+    found live: a real PAUSED-persisted account needed exactly this).
+    Reusing `run_cycle` wholesale for that case would mean either lying to
+    `run_startup` about the target mode (rejected -- see that function's
+    own caller for the full reasoning) or being refused outright. This
+    function is the reusable, mode-agnostic core both paths now share: the
+    real scheduled loop calls it via `run_cycle` below, unchanged; a
+    PAUSED-tolerant one-shot reconciliation calls it directly, then
+    reconciles via `agent.startup.reconcile_accounts_or_raise` instead of
+    `run_startup` -- the SAME exact-comparison functions, none of
+    `run_startup`'s mode-transition/calendar-coverage/audit-chain-
+    verification/approval-sweep machinery."""
     new_fills: dict[str, tuple[Fill, ...]] = {}
     new_cash_adjustments: dict[str, tuple[CashAdjustment, ...]] = {}
     reconciliations: list[AccountReconciliation] = []
@@ -365,7 +389,7 @@ def run_cycle(*, accounts: list[AccountRuntime],
         adapter = adapter_factory(acct)
         if adapter.account_id != acct.account_id:
             raise CrossAccountError(acct.account_id, adapter.account_id,
-                                    "run_cycle adapter_factory")
+                                    "sync_and_build_reconciliations adapter_factory")
 
         store = LedgerStore(acct.ledger_store_path, account_id=acct.account_id,
                             policy_registry=acct.policy_registry, t_plus=acct.t_plus)
@@ -420,6 +444,54 @@ def run_cycle(*, accounts: list[AccountRuntime],
         reconciliations.append(recon)
         if primary_ledger is None:
             primary_ledger = store.to_ledger()
+
+    return AccountSyncResult(new_fills=new_fills, new_cash_adjustments=new_cash_adjustments,
+                             reconciliations=tuple(reconciliations),
+                             primary_ledger=primary_ledger)
+
+
+def run_cycle(*, accounts: list[AccountRuntime],
+             adapter_factory: Callable[[AccountRuntime], BrokerAdapter],
+             mode_store: ModeStore, audit_log: AuditLog,
+             approval_service: ApprovalService, target_mode: str,
+             confirmed: bool = False, now: datetime,
+             logger: logging.Logger | None = None,
+             pipeline: PipelineRuntime | None = None,
+             last_collected_at: datetime | None = None,
+             last_screened_at: datetime | None = None,
+             run_id: str = "") -> CycleReport:
+    """One cycle: per account, construct the adapter/store/guard, sync
+    fills, build a real AccountReconciliation -- then run_startup ONCE for
+    every account together, then log. Raises whatever any step raises
+    (CrossAccountError, SyncFillsError, any StartupHalted subclass, a
+    broker TransportError, a SecretNotFoundError...); nothing here is
+    caught -- see run_loop's own docstring for why that is deliberate and
+    wider than only a StartupHalted.
+
+    `pipeline` (unattended wiring unit, 2026-08-01): `None` (the default)
+    means exactly today's behaviour -- no collection, no screening, no T4,
+    no approval request, `pipeline_result` on the returned `CycleReport` is
+    `None`. When given, the collection -> screening -> T4 -> approval-
+    request stage (`agent.pipeline_stage.run_pipeline_stage`) runs ONCE,
+    AFTER `run_startup` succeeds for every account this cycle -- a halted
+    cycle never reaches it (fail-safe). `last_collected_at`/
+    `last_screened_at` are threaded through and echoed back (possibly
+    updated) on `CycleReport.pipeline_result` for `run_loop` to carry
+    across iterations -- see `agent.pipeline_stage`'s own module docstring
+    for why this is not new durable state. Every new stage `pipeline`
+    could run is independently flagged and defaults to off (`agent.config.
+    Config.data_collection_enabled`/`materiality_screen_enabled`/
+    `t4_analysis_enabled`/`approval_request_enabled`) -- see agent.
+    pipeline_stage's own module docstring for the full money-guardrail
+    reasoning."""
+    log = logger or logging.getLogger(LOGGER_NAME)
+    sync_result = sync_and_build_reconciliations(
+        accounts=accounts, adapter_factory=adapter_factory, now=now, audit_log=audit_log,
+    )
+    new_fills = sync_result.new_fills
+    new_cash_adjustments = sync_result.new_cash_adjustments
+    reconciliations = list(sync_result.reconciliations)
+    primary_ledger = sync_result.primary_ledger
 
     result = run_startup(
         target_mode=target_mode, confirmed=confirmed, audit_log=audit_log,
