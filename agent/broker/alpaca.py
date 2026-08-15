@@ -244,10 +244,63 @@ without ever risking a credential or a full account's financial detail in
 a log line. `scripts/diagnose_runtime.py`'s own `--debug-shapes` flag
 (added by this same unit) is the one, read-only, submit/cancel-incapable
 command that wires a real, printing sink into a real adapter -- see that
-script's own module docstring."""
+script's own module docstring.
+
+BROKER ACCOUNT IDENTITY BINDING (security-remediation unit, 2026-08-15;
+MEDIUM finding, Codex Security scan). Before this fix, `account()` built
+every `AccountSnapshot` with `account_id=self.account_id` -- the LOCAL,
+operator-typed label passed to this adapter's constructor (`--account-id`)
+-- and never checked it, or anything else, against what Alpaca's own
+`/v2/account` response actually reported. Nothing stopped a misconfigured
+`--key-id`/`--secret-ref` pair (pointing at a DIFFERENT real Alpaca
+account than the one the operator believes they are running against) from
+being silently accepted: reconciliation, the dashboard, and every gate
+downstream would trust broker state from the wrong account, labeled with
+the RIGHT account's local name.
+
+THE FIX: `AlpacaPaperAdapter.__init__` gained an optional `expected_
+broker_account_id: str | None = None`. When supplied, `account()` compares
+it against Alpaca's own `id` field (a UUID, e.g.
+`"98b34e82-04fc-4e19-ab3b-99ee312c8478"` -- confirmed via a real captured
+`/v2/account` response, `scripts/fixtures/account.json`; Alpaca's docs and
+the `alpaca-py` `TradeAccount` model both describe this as the account's
+permanent, immutable primary key, distinct from `account_number` (a
+human-readable string like `"PA3XZX944LRR"`, also present but not what
+this binds to -- `id` is the one Alpaca itself calls immutable) BEFORE
+`account()` returns anything: a mismatch raises `AlpacaAccountIdentityMismatch`
+-- fail closed, per Appendix E, before any caller (reconciliation, a
+submit gate, a dashboard read) ever sees broker state credited to the
+wrong local label.
+
+NOT MANDATORY, BECAUSE IT CANNOT BE: an operator has no way to know an
+Alpaca account's own immutable `id` before ever successfully connecting to
+it once (there is no "look it up in advance" path -- it comes FROM this
+same endpoint). So `expected_broker_account_id=None` (the default) skips
+the check entirely, exactly like today's un-pinned behaviour, but now logs
+one WARNING at construction time (`_log.warning(...)`, never raised, never
+blocking) naming the gap explicitly, so it is visible in real operation
+rather than silent. The intended operational flow: run once un-pinned (or
+via `scripts/alpaca_probe.py`, which already captures this exact field),
+copy the reported `id` into `Config.broker_account_uuid`
+(`config.example.json`), and every subsequent run is pinned and fails
+closed on drift. `scripts/run_agent.py` threads `cfg.broker_account_uuid`
+into both real-adapter construction sites (`_real_adapter_factory`, the
+scheduled loop's reads, and `_run_submit_approved`, the one path that
+calls `adapter.submit`) -- see that module's own docstring for the exact
+wiring.
+
+WHY `account()` ONLY, NOT EVERY ENDPOINT: `/v2/account` is the one Alpaca
+response that reports the account's own identity at all -- `/v2/positions`,
+`/v2/orders`, `/v2/account/activities/FILL` describe HOLDINGS reached via
+the same authenticated credentials, not a fresh identity claim, so there is
+nothing additional to bind on those endpoints; every real caller in this
+codebase already calls `account()` at least once per cycle (reconciliation)
+or once per submit (`_run_submit_approved`), so gating there is equivalent
+to gating all four."""
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -331,6 +384,23 @@ STATUS_MAP: dict[str, str] = {
 
 class AlpacaError(AdapterError):
     """Base for Alpaca-adapter-specific failures."""
+
+
+class AlpacaAccountIdentityMismatch(AlpacaError):
+    """`expected_broker_account_id` was supplied at construction, and the
+    account this adapter's credentials actually reached at Alpaca reports
+    a DIFFERENT immutable `id` (security-remediation unit, 2026-08-15,
+    MEDIUM finding, Codex Security scan: "broker account identity not
+    cryptographically bound" -- see module docstring's "BROKER ACCOUNT
+    IDENTITY BINDING" section). Raised BEFORE `account()` returns a
+    snapshot -- nothing downstream (reconciliation, a submit gate, a
+    dashboard read) ever sees broker state from an account this adapter
+    was not actually pinned to. Never caught anywhere in this codebase;
+    it is meant to halt whatever one-shot command or cycle triggered it,
+    the same as any other unexpected `AdapterError`."""
+
+
+_log = logging.getLogger("investmentagent.broker.alpaca")
 
 
 class AmbiguousOrderState(AlpacaError):
@@ -472,7 +542,8 @@ class AlpacaPaperAdapter(BrokerAdapter):
                 transport: Transport | None = None,
                 http_timeout_seconds: float = 10.0,
                 http_max_retries: int = 2,
-                shape_debug_sink: Callable[[dict], None] | None = None):
+                shape_debug_sink: Callable[[dict], None] | None = None,
+                expected_broker_account_id: str | None = None):
         if credentials is None:
             raise AlpacaError(f"{self.name}: credentials are required")
         super().__init__(account_id, credentials, capability_policy, staging_key)
@@ -491,6 +562,22 @@ class AlpacaPaperAdapter(BrokerAdapter):
         # "SAFE DIAGNOSTIC SHAPE LOGGING" section. `None` (the default)
         # means exactly today's behaviour, no observable change at all.
         self._shape_debug_sink = shape_debug_sink
+        # See module docstring's "BROKER ACCOUNT IDENTITY BINDING" section
+        # (security-remediation unit, 2026-08-15). `None` means not yet
+        # pinned -- `account()` logs one WARNING per adapter instance
+        # (here, at construction, not on every call) rather than silently
+        # saying nothing.
+        self._expected_broker_account_id = expected_broker_account_id
+        if expected_broker_account_id is None:
+            _log.warning(
+                "%s constructed with no expected_broker_account_id -- broker "
+                "account identity is NOT bound to anything beyond the local "
+                "--account-id label %r. A misconfigured key/secret pair "
+                "pointing at a different real Alpaca account would not be "
+                "detected. See agent/broker/alpaca.py's own module docstring, "
+                "\"BROKER ACCOUNT IDENTITY BINDING\" section, for how to pin it.",
+                self.name, account_id,
+            )
 
     # -- transport plumbing -------------------------------------------------
     def _headers(self) -> dict[str, str]:
@@ -548,6 +635,27 @@ class AlpacaPaperAdapter(BrokerAdapter):
         status, data = self._request("GET", "/v2/account", retryable=True)
         _ensure_ok(status, data, endpoint="GET /v2/account")
         data = _expect_dict(data, endpoint="GET /v2/account")
+        # BROKER ACCOUNT IDENTITY BINDING (security-remediation unit,
+        # 2026-08-15) -- checked BEFORE any field is trusted for the
+        # snapshot below, and BEFORE the `_FIELD_PARSE_ERRORS` try/except,
+        # since a mismatch is not a parse failure: the response parsed
+        # fine, it is just not the account this adapter was pinned to. See
+        # module docstring's "BROKER ACCOUNT IDENTITY BINDING" section.
+        if self._expected_broker_account_id is not None:
+            reported_id = data.get("id")
+            if reported_id != self._expected_broker_account_id:
+                raise AlpacaAccountIdentityMismatch(
+                    f"{self.name}: GET /v2/account reported id="
+                    f"{reported_id!r}, but this adapter was constructed "
+                    f"with expected_broker_account_id="
+                    f"{self._expected_broker_account_id!r} -- refusing to "
+                    "accept broker state from an account this adapter was "
+                    "not pinned to. This is fail-closed by design; if this "
+                    "account's id genuinely changed (e.g. a deliberate "
+                    "re-pin to a new paper account), update "
+                    "Config.broker_account_uuid to match, deliberately, "
+                    "rather than removing the pin."
+                )
         try:
             return AccountSnapshot(
                 account_id=self.account_id,

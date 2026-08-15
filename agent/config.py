@@ -134,6 +134,20 @@ class Config:
     risk_profile: str = "MODERATE"
     assert_account_posture: str = "UNKNOWN"
 
+    # BROKER ACCOUNT IDENTITY BINDING (security-remediation unit,
+    # 2026-08-15; MEDIUM finding, Codex Security scan) -- see
+    # agent/broker/alpaca.py's own module docstring, "BROKER ACCOUNT
+    # IDENTITY BINDING" section, for the full defect this closes.
+    # `None` (the default) means not yet pinned: `scripts/run_agent.py`
+    # threads this straight into `AlpacaPaperAdapter`'s
+    # `expected_broker_account_id`, which logs a WARNING (not an error)
+    # when it is `None`, rather than silently trusting an unpinned
+    # account forever. Once set (the immutable `id` UUID field from a
+    # real `/v2/account` response -- NOT `account_number`, the human-
+    # readable string; see that module's docstring for why), a mismatch
+    # fails closed before any broker state is accepted.
+    broker_account_uuid: str | None = None
+
     # Broker adapter selection (config-driven-broker-selection unit,
     # 2026-08-10) -- consumed by agent.broker.selection.select_broker_
     # adapter, the one place scripts/run_dashboard.py constructs a real
@@ -630,6 +644,12 @@ def validate(cfg: Config) -> None:
         err.append(f"news_feed_provider must be one of {NEWS_PROVIDER_TYPES}")
     if cfg.news_lookback_hours <= 0:
         err.append("news_lookback_hours must be positive")
+    if cfg.broker_account_uuid is not None and not cfg.broker_account_uuid.strip():
+        err.append(
+            "broker_account_uuid, if set, must be a non-empty string (the "
+            "immutable Alpaca account id) -- use null/None to leave "
+            "identity binding un-pinned, not an empty string"
+        )
     if not cfg.require_human_trade_approval:
         err.append("require_human_trade_approval cannot be false in this release (§6)")
 

@@ -165,6 +165,28 @@ def test_news_lookback_hours_must_be_positive():
         C.load(base(news_lookback_hours=0))
 
 
+# --------------------- broker_account_uuid (security-remediation unit, 2026-08-15)
+
+def test_broker_account_uuid_defaults_to_none():
+    cfg = C.load(base())
+    assert cfg.broker_account_uuid is None
+
+
+def test_broker_account_uuid_can_be_pinned():
+    cfg = C.load(base(broker_account_uuid="98b34e82-04fc-4e19-ab3b-99ee312c8478"))
+    assert cfg.broker_account_uuid == "98b34e82-04fc-4e19-ab3b-99ee312c8478"
+
+
+def test_broker_account_uuid_rejects_an_empty_string():
+    with pytest.raises(C.ConfigError, match="broker_account_uuid"):
+        C.load(base(broker_account_uuid=""))
+
+
+def test_broker_account_uuid_rejects_whitespace_only():
+    with pytest.raises(C.ConfigError, match="broker_account_uuid"):
+        C.load(base(broker_account_uuid="   "))
+
+
 def test_build_provider_defaults_to_null_news_provider():
     from agent.news_provider import NullNewsProvider
     cfg = C.load(base())
