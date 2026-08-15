@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.investmentagent.admin-console</string>
+<key>ProgramArguments</key><array>
+<string>/usr/bin/python3</string><string>/REPLACE/WITH/REPO/scripts/run_admin_console.py</string>
+<string>--repo-root</string><string>/REPLACE/WITH/REPO</string>
+<string>--data-dir</string><string>/REPLACE/WITH/DATA</string>
+<string>--backup-dir</string><string>/REPLACE/WITH/BACKUPS</string>
+<string>--host</string><string>127.0.0.1</string><string>--port</string><string>8766</string>
+</array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>ThrottleInterval</key><integer>60</integer><key>ProcessType</key><string>Background</string>
+<key>StandardOutPath</key><string>/REPLACE/WITH/LOGS/admin-console.out.log</string>
+<key>StandardErrorPath</key><string>/REPLACE/WITH/LOGS/admin-console.err.log</string>
+</dict></plist>

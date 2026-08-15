@@ -1,0 +1,7 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="investmentagent-csrf" content="__CSRF_TOKEN__"><title>InvestmentAgent Control Center</title><link rel="stylesheet" href="/style.css"></head><body>
+<main><header><p class="eyebrow">LOCAL OPERATOR TOOLING</p><h1>InvestmentAgent Control Center</h1><p id="updated">Loading…</p></header>
+<section><h2>System</h2><div id="system" class="grid"></div></section>
+<section><h2>Controls</h2><div id="controls"></div><p class="warning">Trade approval, execution, mode changes, credentials, and ledger mutation are intentionally absent.</p></section>
+<section><h2>Runtime protection</h2><div id="protection" class="grid"></div></section>
+<section><h2>Utility</h2><div><button onclick="utility('health')">Run Health Check</button><button onclick="utility('backup')">Run Backup</button><button onclick="utility('pre-reboot')">Pre-Reboot Check</button><button onclick="logs()">View Logs</button><button onclick="utility('evidence')">View Evidence</button></div><pre id="utility-output">Select a utility to view its result.</pre><a id="dashboard" class="button disabled">Open Dashboard — Unavailable</a></section>
+</main><script src="/app.js"></script></body></html>
