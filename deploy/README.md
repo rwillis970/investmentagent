@@ -1,3 +1,20 @@
+# Admin Console V1
+
+Install only the localhost admin console (the script never invokes `launchctl`
+or changes either trading service):
+
+```sh
+/usr/bin/python3 scripts/install_admin_console.py --data-dir /ABSOLUTE/PATH/TO/data --backup-dir /ABSOLUTE/PATH/TO/backups --log-dir /ABSOLUTE/PATH/TO/logs
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.investmentagent.admin-console.plist"
+```
+
+Open `http://127.0.0.1:8766`. Uninstall only this console with:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.investmentagent.admin-console"
+/usr/bin/python3 scripts/uninstall_admin_console.py
+```
+
 # Installing the reconciliation loop (`com.investmentagent.reconcile-loop`)
 
 This installs `scripts/run_agent.py` as a macOS **LaunchAgent** so it runs
