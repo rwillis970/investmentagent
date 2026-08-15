@@ -42,7 +42,8 @@ def credentials(account_id=ACCT):
 
 
 def adapter(transport=None, *, secrets_provider=None, staging_key=None,
-           policy=None, max_retries=2, account_id=ACCT):
+           policy=None, max_retries=2, account_id=ACCT,
+           expected_broker_account_id=None):
     return AlpacaPaperAdapter(
         account_id=account_id, credentials=credentials(account_id),
         secrets_provider=secrets_provider or secrets(),
@@ -50,12 +51,23 @@ def adapter(transport=None, *, secrets_provider=None, staging_key=None,
         staging_key=staging_key,
         transport=transport or ScriptedTransport(),
         http_timeout_seconds=1.0, http_max_retries=max_retries,
+        expected_broker_account_id=expected_broker_account_id,
     )
+
+
+# The real, captured immutable Alpaca account id (scripts/fixtures/
+# account.json, §13 probe, 2026-07-27) -- used as `account_json()`'s own
+# default `id` so every pre-existing test in this file (none of which pass
+# `expected_broker_account_id`) keeps parsing a REAL-shaped response, and
+# the new BROKER ACCOUNT IDENTITY BINDING tests below have a concrete,
+# realistic value to assert against/away from.
+REAL_ACCOUNT_UUID = "98b34e82-04fc-4e19-ab3b-99ee312c8478"
 
 
 def account_json(**over):
     base = dict(cash="500.00", equity="500.00", buying_power="500.00",
-               multiplier="1", pattern_day_trader=False, daytrade_count=0)
+               multiplier="1", pattern_day_trader=False, daytrade_count=0,
+               id=REAL_ACCOUNT_UUID, account_number="PA3XZX944LRR")
     base.update(over)
     return base
 
@@ -221,6 +233,88 @@ def test_account_read_with_zero_retries_makes_exactly_one_attempt():
     with pytest.raises(TransportTimeout):
         adapter(t, max_retries=0).account()
     assert len(t.calls) == 1
+
+
+# ---------------------------- BROKER ACCOUNT IDENTITY BINDING (new, 2026-08-15)
+#
+# security-remediation unit -- MEDIUM finding, Codex Security scan: "broker
+# account identity not cryptographically bound to configured account; a
+# misconfigured credential pair could silently reach a different real
+# account." See agent/broker/alpaca.py's own module docstring, "BROKER
+# ACCOUNT IDENTITY BINDING" section, for the full fix these tests prove.
+
+def test_account_succeeds_when_the_reported_id_matches_the_pinned_expectation():
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(id=REAL_ACCOUNT_UUID))
+    snap = adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID).account()
+    assert snap.cash == 500.0   # the read still succeeds and returns real data
+
+
+def test_account_fails_closed_when_the_reported_id_does_not_match():
+    """The load-bearing case: credentials that authenticate fine but reach
+    a DIFFERENT real Alpaca account than the one pinned in config must
+    never have that account's state accepted anywhere -- not returned as
+    an AccountSnapshot at all, let alone one silently labeled with the
+    locally-configured account_id."""
+    from agent.broker.alpaca import AlpacaAccountIdentityMismatch
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(id="a-completely-different-account-uuid"))
+    with pytest.raises(AlpacaAccountIdentityMismatch, match="a-completely-different-account-uuid"):
+        adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID).account()
+
+
+def test_account_fails_closed_when_the_reported_id_is_missing_entirely():
+    """Same fail-closed posture as a genuine mismatch -- an absent `id` on
+    a response that otherwise parses is not treated as "skip the check,"
+    it is treated as "cannot confirm identity," which this module's own
+    fail-safe-to-NO-TRADE invariant (Appendix E) requires refusing, not
+    guessing past."""
+    from agent.broker.alpaca import AlpacaAccountIdentityMismatch
+    t = ScriptedTransport()
+    body = account_json()
+    del body["id"]
+    t.enqueue(200, body)
+    with pytest.raises(AlpacaAccountIdentityMismatch):
+        adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID).account()
+
+
+def test_account_identity_mismatch_is_raised_before_any_field_parsing_could_mask_it():
+    """A mismatch is checked BEFORE the `_FIELD_PARSE_ERRORS` try/except
+    that wraps `AccountSnapshot` construction -- so even a response that is
+    ALSO missing other required fields (equity, cash, ...) still raises the
+    identity-specific error, not a generic AlpacaResponseError that would
+    obscure the real problem."""
+    from agent.broker.alpaca import AlpacaAccountIdentityMismatch
+    t = ScriptedTransport()
+    t.enqueue(200, {"id": "wrong-id"})   # missing equity/cash/etc too
+    with pytest.raises(AlpacaAccountIdentityMismatch):
+        adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID).account()
+
+
+def test_account_with_no_pinned_expectation_accepts_any_id_unchanged():
+    """Default, pre-existing behaviour when `expected_broker_account_id`
+    is left `None` (not yet pinned) -- every pre-existing test in this file
+    already exercises this implicitly; this test makes the "un-pinned is
+    still accepted, deliberately" contract explicit and asserts it directly
+    against a mismatched id, which a pinned adapter would refuse."""
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(id="some-other-account-entirely"))
+    snap = adapter(t).account()   # expected_broker_account_id defaults to None
+    assert snap.cash == 500.0
+
+
+def test_constructing_with_no_pinned_expectation_logs_a_warning(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="investmentagent.broker.alpaca"):
+        adapter(expected_broker_account_id=None)
+    assert any("expected_broker_account_id" in r.message for r in caplog.records)
+
+
+def test_constructing_with_a_pinned_expectation_logs_no_such_warning(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="investmentagent.broker.alpaca"):
+        adapter(expected_broker_account_id=REAL_ACCOUNT_UUID)
+    assert not any("expected_broker_account_id" in r.message for r in caplog.records)
 
 
 # -------------------------------------------------------------- positions()
@@ -772,33 +866,58 @@ def test_non_fill_activities_stops_paging_on_an_empty_page():
     assert len(t.calls) == 1
 
 
-def test_non_fill_activities_against_the_real_committed_fixture():
-    """Found real, 2026-07-31: the first unattended launchd run crashed
-    with `KeyError: 'created_at'` -- the real FILL row in
-    scripts/fixtures/activities_since.json carries `transaction_time`, not
-    `created_at` (it wasn't in this file's fixture-driven suite at all,
-    every prior test built its own FILL dict by hand -- activity_json(),
-    used above, doesn't have created_at either, but that's still a
-    hand-built dict, not the actual committed evidence). Drives
-    non_fill_activities() against the REAL captured payload directly, not
-    a hand-built one, per the standing rule that the fixture exists so
-    real broker shapes are testable."""
-    import json
-    from pathlib import Path
-    raw = json.loads(
-        (Path(__file__).parent.parent / "scripts/fixtures/activities_since.json")
-        .read_text()
-    )["activities"]
-    assert raw[2]["activity_type"] == "FILL" and "created_at" not in raw[2]   # sanity on the fixture itself
+# SYNTHETIC, NOT A REAL CAPTURE (security-remediation unit, 2026-08-15;
+# LOW finding, Codex Security scan: "real broker captures tracked as
+# fixtures" -- these fabricated rows mirror the REAL shape this test
+# previously read straight from scripts/fixtures/activities_since.json
+# (found real, 2026-07-31: the first unattended launchd run crashed with
+# `KeyError: 'created_at'` because a real FILL row carries
+# `transaction_time`, not `created_at`) without asserting on, or exposing
+# in committed source, the actual captured account/order/activity
+# identifiers. See scripts/fixtures/README.md's own "SYNTHETIC TEST DATA"
+# section and scripts/fixture_privacy_scan.py for the fuller remediation.
+_SYNTH_JNLC_ACTIVITY = {
+    "activity_type": "JNLC", "created_at": "2026-01-05T13:00:50.193924Z",
+    "currency": "USD", "date": "2026-01-05", "description": "",
+    "id": "20260105000000000::00000000-0000-4000-8000-000000000001",
+    "net_amount": "500", "status": "executed",
+}
+_SYNTH_CAT_FEE_ACTIVITY = {
+    "activity_sub_type": "CAT", "activity_type": "FEE",
+    "created_at": "2026-01-06T00:07:16.323361Z", "currency": "USD",
+    "date": "2026-01-05",
+    "description": "CAT fee for proceed of 1 trades on 2026-01-05 by PA00SYNTHETIC1",
+    "id": "20260105000000000::00000000-0000-4000-8000-000000000002",
+    "net_amount": "-0.01", "status": "executed",
+}
+_SYNTH_FILL_ACTIVITY_NO_CREATED_AT = {
+    # Deliberately has NO "created_at" key -- the real shape quirk this
+    # test exists to guard against, reproduced structurally.
+    "activity_type": "FILL", "cum_qty": "1", "id": "synth-fill-id-1",
+    "leaves_qty": "0", "order_id": "synth-order-id-1", "order_status": "filled",
+    "price": "100.00", "qty": "1", "side": "buy", "symbol": "SPY",
+    "transaction_time": "2026-01-05T14:42:51.412408Z", "type": "fill",
+}
 
+
+def test_non_fill_activities_against_a_synthetic_capture_shaped_fixture():
+    """Regression coverage for the real 2026-07-31 defect (see module-level
+    comment above the synthetic fixtures just above this test), using
+    fabricated rows that reproduce the exact structural quirk that broke
+    it (a FILL row with `transaction_time` but no `created_at`) instead of
+    reading real captured broker data."""
+    assert (_SYNTH_FILL_ACTIVITY_NO_CREATED_AT["activity_type"] == "FILL"
+           and "created_at" not in _SYNTH_FILL_ACTIVITY_NO_CREATED_AT)   # sanity on the fixture itself
+
+    raw = [_SYNTH_JNLC_ACTIVITY, _SYNTH_CAT_FEE_ACTIVITY, _SYNTH_FILL_ACTIVITY_NO_CREATED_AT]
     t = ScriptedTransport()
     t.enqueue(200, raw)
     activities = adapter(t).non_fill_activities()
 
     assert [a.activity_type for a in activities] == ["JNLC", "FEE"]
-    assert activities[0].created_at == datetime(2026, 7, 27, 13, 0, 50, 193924,
+    assert activities[0].created_at == datetime(2026, 1, 5, 13, 0, 50, 193924,
                                                 tzinfo=timezone.utc)
-    assert activities[1].created_at == datetime(2026, 7, 29, 0, 7, 16, 323361,
+    assert activities[1].created_at == datetime(2026, 1, 6, 0, 7, 16, 323361,
                                                 tzinfo=timezone.utc)
 
 
@@ -864,24 +983,88 @@ from pathlib import Path as _Path
 
 from agent.broker.alpaca import AlpacaResponseError
 
-_FIXTURES_DIR = _Path(__file__).resolve().parent.parent / "scripts" / "fixtures"
+# SYNTHETIC TEST DATA, NOT A REAL CAPTURE (security-remediation unit,
+# 2026-08-15; LOW finding, Codex Security scan: "real broker captures
+# tracked as fixtures"). The four tests immediately below this comment
+# used to read `scripts/fixtures/{account,positions,orders,
+# activities_since}.json` directly and assert against the REAL account
+# UUID/account_number/order/execution identifiers those files capture --
+# see scripts/fixtures/README.md's own "SYNTHETIC TEST DATA" section for
+# the full remediation rationale. The real fixture files themselves are
+# UNCHANGED and still committed (this codebase's own "do not delete
+# evidence blindly" posture, applied here) -- only these four tests no
+# longer read them or assert on their real values. Each dict below
+# reproduces the exact real WIRE SHAPE (field names, the notional-order
+# null-qty quirk, the FILL-row-has-no-created_at quirk) with fabricated
+# values, so the shape-correctness regression coverage these tests exist
+# for is fully preserved.
 
+_SYNTH_ACCOUNT_BODY = {
+    "account_blocked": False, "account_number": "PA00SYNTHETIC1",
+    "accrued_fees": "0", "balance_asof": "2026-01-05", "buying_power": "480",
+    "cash": "480", "created_at": "2026-01-01T00:00:00Z", "currency": "USD",
+    "equity": "500.12", "id": "00000000-0000-4000-8000-0000000000aa",
+    "initial_margin": "20.12", "last_equity": "500.06784818124",
+    "long_market_value": "20.12", "maintenance_margin": "6.04",
+    "multiplier": "1", "pattern_day_trader": False, "daytrade_count": 0,
+    "portfolio_value": "500.12", "position_market_value": "20.12",
+    "shorting_enabled": False, "sma": "500.07", "status": "ACTIVE",
+    "trading_blocked": False, "transfers_blocked": False,
+}
 
-def _real_fixture_body(name: str):
-    return _json.loads((_FIXTURES_DIR / name).read_text())["body"]
+_SYNTH_POSITION_BODY = [{
+    "asset_class": "us_equity", "asset_id": "00000000-0000-4000-8000-0000000000bb",
+    "asset_marginable": True, "avg_entry_price": "737.986",
+    "change_today": "0.0185", "cost_basis": "19.989999",
+    "current_price": "742.9585", "exchange": "ARCA", "lastday_price": "729.46",
+    "market_value": "20.124691", "qty": "0.027087234", "qty_available": "0.027087234",
+    "side": "long", "symbol": "SPY", "unrealized_intraday_pl": "0.365637",
+    "unrealized_intraday_plpc": "0.0185", "unrealized_pl": "0.134692",
+    "unrealized_plpc": "0.00674",
+}]
+
+_SYNTH_ORDER_BODY = [{
+    "asset_class": "us_equity", "asset_id": "00000000-0000-4000-8000-0000000000bb",
+    "canceled_at": None, "client_order_id": "00000000-0000-4000-8000-0000000000cc",
+    "created_at": "2026-01-05T14:42:51.357501Z", "expired_at": None,
+    "expires_at": "2026-01-05T20:00:00Z", "extended_hours": False,
+    "failed_at": None, "filled_at": "2026-01-05T14:42:51.412408Z",
+    "filled_avg_price": "737.986", "filled_qty": "0.027087234", "hwm": None,
+    "id": "00000000-0000-4000-8000-0000000000dd", "legs": None,
+    "limit_price": None, "notional": "20", "order_class": "",
+    "order_type": "market", "position_intent": "buy_to_open",
+    # `qty: null`, `filled_qty` populated -- the real notional-order-
+    # fallback shape `_to_broker_order` must handle; the load-bearing
+    # structural detail this test exists to guard, preserved exactly.
+    "qty": None, "replaced_at": None, "replaced_by": None, "replaces": None,
+    "side": "buy", "source": None, "status": "filled", "stop_price": None,
+    "submitted_at": "2026-01-05T14:42:51.357501Z", "subtag": None,
+    "symbol": "SPY", "time_in_force": "day", "trail_percent": None,
+    "trail_price": None, "type": "market", "updated_at": "2026-01-05T14:42:51.41351Z",
+}]
+
+_SYNTH_FILL_ROW = {
+    "activity_type": "FILL", "cum_qty": "0.027087234",
+    "id": "20260105104251412::00000000-0000-4000-8000-0000000000ee",
+    "leaves_qty": "0", "order_id": "00000000-0000-4000-8000-0000000000dd",
+    "order_status": "filled", "price": "737.986", "qty": "0.027087234",
+    "side": "buy", "symbol": "SPY",
+    # No "created_at" -- the real FILL-row shape quirk this test exists
+    # for (see the non_fill_activities() synthetic tests above).
+    "transaction_time": "2026-01-05T14:42:51.412408Z", "type": "fill",
+}
 
 
 # ------------------------------------------------ 1. account() success shapes
 
-def test_account_against_the_real_committed_capture():
-    """REAL CAPTURE: scripts/fixtures/account.json, probed 2026-07-27
-    against PA3XZX944LRR, status 200. 36 top-level fields; this adapter
-    only reads five of them (plus the two absent-vs-present PDT fields
-    covered elsewhere) -- proves the real wire body, unmodified, parses
-    clean through account() end to end."""
-    body = _real_fixture_body("account.json")
+def test_account_against_a_synthetic_realistically_shaped_capture():
+    """Synthetic equivalent of a real `/v2/account` capture -- proves a
+    wire body with the real field breadth (not just this file's own
+    minimal `account_json()` helper) parses clean through account() end
+    to end, without depending on or asserting real captured account
+    data."""
     t = ScriptedTransport()
-    t.enqueue(200, body)
+    t.enqueue(200, _SYNTH_ACCOUNT_BODY)
     snap = adapter(t).account()
     assert snap.equity == Decimal("500.12")
     assert snap.cash == Decimal("480")
@@ -891,12 +1074,10 @@ def test_account_against_the_real_committed_capture():
 
 # ----------------------------------------------- 2. positions() success shapes
 
-def test_positions_against_the_real_committed_capture():
-    """REAL CAPTURE: scripts/fixtures/positions.json -- a real fractional
-    SPY position, status 200."""
-    body = _real_fixture_body("positions.json")
+def test_positions_against_a_synthetic_realistically_shaped_capture():
+    """Synthetic equivalent of a real fractional SPY position capture."""
     t = ScriptedTransport()
-    t.enqueue(200, body)
+    t.enqueue(200, _SYNTH_POSITION_BODY)
     [pos] = adapter(t).positions()
     assert pos.symbol == "SPY"
     assert pos.qty == Decimal("0.027087234")
@@ -912,15 +1093,14 @@ def test_positions_no_position_response_is_an_empty_list_not_an_error():
 
 # ---------------------------------------------- 3. open_orders() success shapes
 
-def test_open_orders_against_the_real_committed_capture():
-    """REAL CAPTURE: scripts/fixtures/orders.json -- a real FILLED,
-    notional-originated order (qty=null, filled_qty populated: exactly the
-    `_to_broker_order` notional fallback path), status 200."""
-    body = _real_fixture_body("orders.json")
+def test_open_orders_against_a_synthetic_realistically_shaped_capture():
+    """Synthetic equivalent of a real FILLED, notional-originated order
+    (qty=null, filled_qty populated: exactly the `_to_broker_order`
+    notional fallback path)."""
     t = ScriptedTransport()
-    t.enqueue(200, body)
+    t.enqueue(200, _SYNTH_ORDER_BODY)
     [order] = adapter(t).open_orders()
-    assert order.client_order_id == "732f0667-fb47-43f6-babd-7c0fe64ece18"
+    assert order.client_order_id == "00000000-0000-4000-8000-0000000000cc"
     assert order.status == "filled"
     assert order.qty == Decimal("0.027087234")
     assert order.avg_fill_price == Decimal("737.986")
@@ -934,25 +1114,20 @@ def test_open_orders_no_open_orders_response_is_an_empty_list_not_an_error():
 
 # -------------------------------------------------- 4. fills() success shapes
 
-def test_fills_against_the_real_committed_activities_capture():
-    """REAL CAPTURE: scripts/fixtures/activities_since.json's own FILL row
-    -- the actual, already-quarantine-admitted execution
-    (20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346, order_id
-    91dcb2f4-315c-4c39-8211-1f71ed7d49a9) this unit's own item 6 is about.
-    Proves fills() parses that exact real row end to end once the order-id
-    lookup resolves."""
-    activities = _json.loads(
-        (_FIXTURES_DIR / "activities_since.json").read_text())["activities"]
-    fill_row = next(a for a in activities if a["activity_type"] == "FILL")
+def test_fills_against_a_synthetic_realistically_shaped_activities_capture():
+    """Synthetic equivalent of a real FILL activity row -- proves fills()
+    parses that exact real ROW SHAPE end to end once the order-id lookup
+    resolves, without asserting against a real, correlatable execution/
+    order id."""
     t = ScriptedTransport()
-    t.enqueue(200, [fill_row])
-    t.enqueue(200, order_json(client_order_id="c-real"))
+    t.enqueue(200, [_SYNTH_FILL_ROW])
+    t.enqueue(200, order_json(client_order_id="c-synthetic"))
     [execution] = adapter(t).fills()
     assert execution.execution_id == (
-        "20260728104251412::37042727-dfba-4cac-a1d7-607636cd4346")
+        "20260105104251412::00000000-0000-4000-8000-0000000000ee")
     assert execution.qty == Decimal("0.027087234")
     assert execution.price == Decimal("737.986")
-    assert execution.client_order_id == "c-real"
+    assert execution.client_order_id == "c-synthetic"
 
 
 # -------------------------------------------- 5. malformed / wrong-type shapes

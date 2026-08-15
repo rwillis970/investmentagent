@@ -79,3 +79,40 @@ this capture's purpose. Noted here as a fixture-fidelity caveat only --
 `scripts/alpaca_probe.py` itself is unchanged; this is not a probe defect,
 just a documented mismatch between the flag's name and Alpaca's own filter
 behavior.
+
+## SYNTHETIC TEST DATA (security-remediation unit, 2026-08-15)
+
+**LOW finding, Codex Security scan**: "real broker captures tracked as
+fixtures" -- these files (`account.json`, `positions.json`, `orders.json`,
+`activities.json`, `activities_since.json`) are a real capture against a
+real (paper) Alpaca account and contain PERSISTENT, correlatable
+identifiers: the account's own immutable `id` (a UUID), its human-readable
+`account_number`, and several real order/execution/activity ids and
+timestamps. **These are not credentials** -- nothing in these files can be
+used to authenticate as the account (the actual API key id and secret are
+redacted at capture time by `scripts/alpaca_probe.py`'s own `_redact`, and
+independently verified never to leak by `scripts/fixture_privacy_scan.py`,
+run automatically as part of the test suite via
+`tests/test_fixture_privacy_scan.py`) -- but they do persistently identify
+a specific real account.
+
+**What changed**: `tests/test_broker_alpaca.py` used to read several of
+these files directly and assert against their real identifiers (a real
+account UUID, a real `account_number`, real order/execution ids). Those
+tests were rewritten to use SYNTHETIC, fabricated data that reproduces the
+exact real wire SHAPE (field names, the notional-order null-qty quirk, the
+FILL-row-has-no-created_at quirk) without depending on or exposing the
+real captured values -- see that file's own "SYNTHETIC TEST DATA" comment
+block, immediately above the tests it applies to.
+
+**What did NOT change**: these fixture files themselves. Per this
+codebase's own "do not delete evidence blindly" posture (this unit's own
+explicit instruction), they remain committed, unmodified, as the original
+probe evidence the rest of this README documents. If broader scrubbing of
+the real account_number/UUID (which are also reused, as plain string
+constants, in several unrelated test files elsewhere in this codebase's
+test suite -- NOT by reading these fixture files, just as realistic-
+looking literal values, the same way `"acct-a"` or any other test
+constant would be) is wanted, that is a separate, deliberately out-of-
+scope decision for a human to make, not something this unit did
+unilaterally.
