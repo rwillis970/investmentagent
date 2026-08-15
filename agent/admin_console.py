@@ -7,10 +7,13 @@ manage exactly two launchd services through an injected ServiceManager.
 from __future__ import annotations
 
 import json
+import html
+import os
 import plistlib
 import re
+import secrets
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +28,7 @@ SERVICE_LABELS = frozenset({
     "com.investmentagent.dashboard",
 })
 STATIC_DIR = Path(__file__).resolve().parent.parent / "admin_console" / "static"
+CSRF_HEADER = "X-InvestmentAgent-CSRF"
 
 
 @dataclass(frozen=True)
@@ -52,7 +56,7 @@ def launchctl_command(label: str, action: str) -> list[str]:
     if action == "stop":
         return ["launchctl", "stop", label]
     if action == "restart":
-        return ["launchctl", "kickstart", "-k", f"gui/{__import__('os').getuid()}/{label}"]
+        return ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"]
     raise ValueError("service action is not allowed")
 
 
@@ -206,6 +210,9 @@ class AdminRuntime:
     backup_dir: Path
     service_manager: ServiceManager
     installed_launchagents_dir: Path | None = None
+    # Generated once per process and never persisted or logged. repr=False
+    # avoids accidental disclosure in diagnostics.
+    csrf_token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
 
 
 def utility_command(runtime: AdminRuntime, name: str) -> list[str] | None:
@@ -214,7 +221,7 @@ def utility_command(runtime: AdminRuntime, name: str) -> list[str] | None:
         "health": ["/usr/bin/python3", str(scripts / "runtime_health.py"), "--data-dir", str(runtime.data_dir)],
         "backup": ["/usr/bin/python3", str(scripts / "backup_snapshot.py"), "--data-dir", str(runtime.data_dir), "--backup-dir", str(runtime.backup_dir)],
         "pre-reboot": ["/usr/bin/python3", str(scripts / "reboot_check.py"), "--mode", "pre", "--repo-root", str(runtime.repo_root), "--data-dir", str(runtime.data_dir), "--backup-dir", str(runtime.backup_dir)],
-        "evidence": ["/usr/bin/python3", str(scripts / "inspect_evidence.py"), "--data-dir", str(runtime.data_dir), "facts-list", "--limit", "50"],
+        "evidence": ["/usr/bin/python3", str(scripts / "inspect_evidence.py"), "--data-dir", str(runtime.data_dir), "facts", "list", "--limit", "50"],
     }
     command = commands.get(name)
     return command if command and Path(command[1]).is_file() else None
@@ -225,15 +232,25 @@ class RouteResult:
     status: int
     content_type: str
     body: bytes
+    headers: tuple[tuple[str, str], ...] = ()
 
 
-def route_request(runtime: AdminRuntime, method: str, path: str) -> RouteResult:
+def _csrf_valid(runtime: AdminRuntime, headers: dict[str, str] | None) -> bool:
+    supplied = next((value for name, value in (headers or {}).items()
+                     if name.lower() == CSRF_HEADER.lower()), "")
+    return secrets.compare_digest(supplied, runtime.csrf_token)
+
+
+def route_request(runtime: AdminRuntime, method: str, path: str,
+                  headers: dict[str, str] | None = None) -> RouteResult:
     if method == "GET" and path == "/api/status":
         body = build_status(repo_root=runtime.repo_root, data_dir=runtime.data_dir,
                             backup_dir=runtime.backup_dir, service_manager=runtime.service_manager,
                             installed_launchagents_dir=runtime.installed_launchagents_dir)
         return RouteResult(200, "application/json", json.dumps(body).encode())
     if method == "POST" and path.startswith("/api/services/"):
+        if not _csrf_valid(runtime, headers):
+            return RouteResult(403, "application/json", b'{"error":"CSRF validation failed"}')
         parts = path.split("/")
         if len(parts) != 5:
             return RouteResult(404, "application/json", b'{"error":"not found"}')
@@ -244,6 +261,8 @@ def route_request(runtime: AdminRuntime, method: str, path: str) -> RouteResult:
             return RouteResult(403, "application/json", json.dumps({"error": str(exc)}).encode())
         return RouteResult(200, "application/json", json.dumps(asdict(result)).encode())
     if method == "POST" and path.startswith("/api/utilities/"):
+        if not _csrf_valid(runtime, headers):
+            return RouteResult(403, "application/json", b'{"error":"CSRF validation failed"}')
         command = utility_command(runtime, path.rsplit("/", 1)[-1])
         if command is None:
             return RouteResult(404, "application/json", b'{"error":"utility unavailable"}')
@@ -261,7 +280,10 @@ def route_request(runtime: AdminRuntime, method: str, path: str) -> RouteResult:
                 payload[name] = file.read_text(errors="replace")[-12000:]
         return RouteResult(200, "application/json", json.dumps(payload).encode())
     if method == "GET" and path in ("/", "/index.html"):
-        return RouteResult(200, "text/html; charset=utf-8", (STATIC_DIR / "index.html").read_bytes())
+        page = (STATIC_DIR / "index.html").read_text()
+        page = page.replace("__CSRF_TOKEN__", html.escape(runtime.csrf_token, quote=True))
+        return RouteResult(200, "text/html; charset=utf-8", page.encode(),
+                           (("Cache-Control", "no-store"),))
     if method == "GET" and path in ("/app.js", "/style.css"):
         kind = "text/javascript" if path.endswith(".js") else "text/css"
         return RouteResult(200, f"{kind}; charset=utf-8", (STATIC_DIR / path[1:]).read_bytes())
@@ -273,8 +295,11 @@ def make_server(runtime: AdminRuntime, host: str = "127.0.0.1", port: int = 8766
         raise ValueError("admin console must bind to loopback")
     class Handler(BaseHTTPRequestHandler):
         def _handle(self):
-            result = route_request(runtime, self.command, self.path)
+            result = route_request(runtime, self.command, self.path,
+                                   headers=dict(self.headers.items()))
             self.send_response(result.status); self.send_header("Content-Type", result.content_type)
+            for name, value in result.headers:
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(result.body))); self.end_headers()
             self.wfile.write(result.body)
         do_GET = _handle
