@@ -67,6 +67,7 @@ from .dashboard_decisions import DecisionConflict, DecisionError, approve, rejec
 from .dashboard_state import build_dashboard_state
 from .daytrade import DayTradeGuard
 from .ledger import Ledger
+from .opportunity_event_store import OpportunityEventStore
 from .opportunity_event_tracker import OpportunityEventTracker
 from .process_lock import ProcessLockError, acquire_process_lock
 from .store import FactStore
@@ -178,6 +179,21 @@ class DashboardRuntime:
     # state` as an honest UNAVAILABLE, never a fabricated 0.
     fact_store: FactStore | None = None
     fact_store_refresh_fn: Callable[[], "FactStore | None"] | None = None
+    # REAL OPPORTUNITY-EVENT-STORE-BACKED MATERIALITY COUNTS (Task 1,
+    # Phase-2/3-live-acceptance follow-up unit, 2026-08-15) -- exact same
+    # per-request-refresh posture as `fact_store`/`fact_store_refresh_fn`
+    # immediately above, for the identical cross-process-staleness reason:
+    # `agent.opportunity_event_store.OpportunityEventStore.__init__` reads
+    # its whole file once and never re-reads it, and this dashboard process
+    # and the real screening `scripts/run_agent.py` (or `--research-once`,
+    # Task 3) process are separate OS processes appending to the same file.
+    # `None` (both fields' own default) means "no --opportunity-event-
+    # store-path wired," rendered by `agent.dashboard_state.build_
+    # dashboard_state` as an honest UNAVAILABLE for scored/suppressed/
+    # triggered_this_session, never a fabricated 0.
+    opportunity_event_store: OpportunityEventStore | None = None
+    opportunity_event_store_refresh_fn: (
+        Callable[[], "OpportunityEventStore | None"] | None) = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +246,12 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         # own field docstring for why a fresh read is needed every request.
         if runtime.fact_store_refresh_fn is not None:
             runtime.fact_store = runtime.fact_store_refresh_fn()
+        # Task 1 (Phase-2/3-live-acceptance follow-up unit, 2026-08-15):
+        # same per-request-refresh posture as fact_store_refresh_fn
+        # immediately above -- see DashboardRuntime.opportunity_event_
+        # store_refresh_fn's own field docstring.
+        if runtime.opportunity_event_store_refresh_fn is not None:
+            runtime.opportunity_event_store = runtime.opportunity_event_store_refresh_fn()
         state = build_dashboard_state(
             now=now, config=runtime.config, cost_ledger=runtime.cost_ledger,
             opportunity_tracker=runtime.opportunity_tracker,
@@ -243,6 +265,7 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
             operational_state=operational_state,
             operational_state_paused_from=operational_state_paused_from,
             fact_store=runtime.fact_store,
+            opportunity_event_store=runtime.opportunity_event_store,
         )
         return _json_result(200, state)
 

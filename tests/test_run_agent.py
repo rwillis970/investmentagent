@@ -3673,6 +3673,242 @@ def test_reconcile_once_never_recovers_the_sentinel_on_a_reconciliation_halt(
     assert not (data_dir / "runtime_status.json").exists()   # never written either
 
 
+# ------------------------------------------------------------ --research-once
+#
+# Task 3, Phase-2/3-live-acceptance follow-up unit (2026-08-15). CLI-level
+# integration tests for `--research-once` -- see agent/research_once.py's
+# own module docstring and tests/test_research_once.py (which exercises
+# `agent.research_once.run_research_once` directly, network-free) for the
+# full behavioral proof; this section proves the SAME command survives
+# being driven through the real CLI/argument-parsing/writer-lock machinery,
+# mirroring the --reconcile-once section above.
+#
+# NETWORK SAFETY NOTE: `_run_research_once` unconditionally constructs a
+# real `agent.edgar.EdgarClient` (EDGAR/news collection have no session
+# gate of their own -- see agent.research_once's own module docstring --
+# so this command always attempts them). `agent.edgar_collector.
+# collect_filings` in turn unconditionally refreshes its ticker/CIK cache
+# on a cold cache (`TickerCikCache.ensure_fresh`) BEFORE it ever looks at
+# `symbols`, even when `symbols` is empty -- so a real, unmocked
+# `EdgarClient` would attempt one real HTTP call to sec.gov on every test
+# in this section, regardless of `config.example.json`'s own empty
+# `symbol_universe`. Every test below therefore monkeypatches
+# `run_agent_module.EdgarClient` to a factory returning a real `EdgarClient`
+# bound to a network-free `agent.broker.transport.ScriptedTransport`
+# (exactly the discipline tests/test_research_once.py and tests/
+# test_edgar_collector.py already establish), never the unmocked class.
+
+from agent.broker.transport import ScriptedTransport
+from agent.edgar import EdgarClient as _RealEdgarClient
+from agent.opportunity_event_store import OpportunityEventStore
+from agent.store import FactStore
+
+_RSO_ACCT = "acct-research-once"
+_RSO_OUT_OF_SESSION = datetime(2026, 7, 18, 15, 0, tzinfo=timezone.utc)   # a real Saturday
+
+
+def _research_once_ticker_map_body():
+    return {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}}
+
+
+def _research_once_edgar_factory(transport):
+    """Returns a callable with the same call shape `_run_research_once`
+    itself uses (`EdgarClient(user_agent=..., http_timeout_seconds=...,
+    http_max_retries=..., min_request_interval_seconds=...)`), but bound to
+    a real, network-free `ScriptedTransport` -- see this section's own
+    NETWORK SAFETY NOTE above."""
+    def factory(**kwargs):
+        return _RealEdgarClient(
+            user_agent=kwargs.get("user_agent", "test-agent"), transport=transport,
+            http_timeout_seconds=kwargs.get("http_timeout_seconds", 1.0),
+            http_max_retries=kwargs.get("http_max_retries", 1),
+            min_request_interval_seconds=0.001, sleep_fn=lambda s: None,
+            monotonic_fn=lambda: 0.0,
+        )
+    return factory
+
+
+def _research_once_argv(*, config_path, data_dir, with_credentials=False):
+    argv = ["--config", str(config_path), "--data-dir", str(data_dir), "--research-once"]
+    if with_credentials:
+        argv += ["--account-id", _RSO_ACCT, "--key-id", "k", "--secret-ref", "ref"]
+    return argv
+
+
+def _research_once_seed_mode(mode_store_path, mode, *, at=_RSO_OUT_OF_SESSION):
+    ModeStore(mode_store_path).write(mode, changed_at=at)
+
+
+def test_research_once_requires_config(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--research-once", "--data-dir", str(tmp_path / "data")])
+    assert exc_info.value.code == 2
+
+
+def test_research_once_requires_all_three_credential_flags_together(tmp_path):
+    """Item: `--account-id`/`--key-id`/`--secret-ref` are optional, but only
+    together -- never a partial subset (agent.research_once's own module
+    docstring: market data collection is skipped entirely, or attempted
+    with real credentials; there is no third, half-configured state)."""
+    import json as json_module
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--research-once", "--config", str(config_path),
+              "--data-dir", str(tmp_path / "data"), "--key-id", "k"])
+    assert exc_info.value.code == 2
+
+
+def test_research_once_runs_with_no_credentials_and_leaves_mode_paused(tmp_path, monkeypatch):
+    """The command's own headline case: an operator with no Alpaca
+    credentials provisioned can still run this, EDGAR/news collection and
+    materiality screening still execute, and the persisted mode is
+    untouched -- still exactly PAUSED before and after."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    mode_path = data_dir / "mode_state.jsonl"
+    _research_once_seed_mode(mode_path, "PAUSED")
+
+    transport = ScriptedTransport()
+    transport.enqueue(200, _research_once_ticker_map_body())
+    monkeypatch.setattr(run_agent_module, "EdgarClient", _research_once_edgar_factory(transport))
+
+    code = main(
+        _research_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RSO_OUT_OF_SESSION,
+    )
+    assert code == 0
+    assert ModeStore(mode_path).current() == "PAUSED"
+
+
+def test_research_once_refuses_when_mode_is_not_paused(tmp_path, monkeypatch, caplog):
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    mode_path = data_dir / "mode_state.jsonl"
+    _research_once_seed_mode(mode_path, "PAPER")
+
+    def _must_not_be_constructed(**kw):
+        raise AssertionError(
+            "--research-once must refuse a non-PAUSED persisted mode before "
+            "ever constructing a collector client")
+    monkeypatch.setattr(run_agent_module, "EdgarClient", _must_not_be_constructed)
+
+    with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+        code = main(
+            _research_once_argv(config_path=config_path, data_dir=data_dir),
+            secrets_provider_factory=_secrets_provider_factory,
+            now_fn=lambda: _RSO_OUT_OF_SESSION,
+        )
+    assert code == 1
+    assert any("research-once" in r.message for r in caplog.records)
+    assert ModeStore(mode_path).current() == "PAPER"   # untouched, never advanced
+
+
+def test_research_once_statically_cannot_reach_an_order_or_approval_machinery(tmp_path):
+    """Mirrors test_reconcile_once_statically_cannot_reach_an_order_or_
+    approval_machinery exactly: grepped against the ACTUAL source of
+    `_run_research_once`, not merely inferred from the absence of a call in
+    the tests above."""
+    import ast
+    import inspect
+    import scripts.run_agent as run_agent_module
+
+    full_source = inspect.getsource(run_agent_module._run_research_once)
+    tree = ast.parse(full_source)
+    func_node = tree.body[0]
+    has_docstring = (
+        func_node.body and isinstance(func_node.body[0], ast.Expr)
+        and isinstance(func_node.body[0].value, ast.Constant)
+        and isinstance(func_node.body[0].value.value, str)
+    )
+    if has_docstring:
+        doc_end_line = func_node.body[0].end_lineno
+        source = "\n".join(full_source.splitlines()[doc_end_line:])
+    else:
+        source = full_source
+    for forbidden in (
+        "execute_approved_request", "approval_execution", "Gatekeeper",
+        "PipelineRuntime", "pipeline_stage", "build_pipeline_runtime",
+        ".submit(", ".cancel(", "mint_approval_token", "pipeline=",
+        "AlpacaPaperAdapter", "AlpacaLiveAdapter",
+    ):
+        assert forbidden not in source, (
+            f"_run_research_once's own source unexpectedly references "
+            f"{forbidden!r} -- this command must not be able to reach "
+            "candidate generation beyond materiality screening, T4 "
+            "analysis, an approval request, or an order submission/"
+            "cancellation, and must never construct a broker adapter at "
+            "all (only a market-data-read-only client, and only when "
+            "credentials are supplied)"
+        )
+    assert "pipeline" not in inspect.signature(run_agent_module._run_research_once).parameters
+
+
+def test_research_once_requires_the_writer_lock(tmp_path, monkeypatch, caplog):
+    """Mirrors test_reconcile_once_paused_requires_the_writer_lock: refuses
+    while a competing process (the scheduled loop, or another one-shot
+    writer) already holds the same data_dir's process lock."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _research_once_seed_mode(data_dir / "mode_state.jsonl", "PAUSED")
+
+    def _must_not_be_constructed(**kw):
+        raise AssertionError(
+            "--research-once must never construct a collector client while "
+            "the process lock could not be acquired")
+    monkeypatch.setattr(run_agent_module, "EdgarClient", _must_not_be_constructed)
+
+    fact_path = data_dir / "facts.jsonl"
+    argv = _research_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--fact-store-path", str(fact_path),
+    ]
+    with acquire_process_lock(data_dir):   # simulates the real scheduled loop already running
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                       now_fn=lambda: _RSO_OUT_OF_SESSION)
+    assert code == 1
+    assert any("research-once" in r.message for r in caplog.records)
+    assert not fact_path.exists()   # refused before any local mutation
+
+
+def test_research_once_succeeds_normally_once_the_competing_lock_is_released(tmp_path, monkeypatch):
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _research_once_seed_mode(data_dir / "mode_state.jsonl", "PAUSED")
+
+    transport = ScriptedTransport()
+    transport.enqueue(200, _research_once_ticker_map_body())
+    monkeypatch.setattr(run_agent_module, "EdgarClient", _research_once_edgar_factory(transport))
+
+    code = main(
+        _research_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RSO_OUT_OF_SESSION,
+    )
+    assert code == 0   # no competing lock this time -- succeeds normally
+
+
 def test_on_cycle_success_recovered_by_is_cycle():
     """Spot-check on the scheduled-loop's OWN recovery producer -- reusing
     the exact real closure scripts/run_agent.py's main() constructs is not

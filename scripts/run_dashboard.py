@@ -97,6 +97,7 @@ from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger import Ledger
 from agent.ledger_store import LedgerStore
 from agent.mode_store import ModeStore
+from agent.opportunity_event_store import OpportunityEventStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.secrets_provider import (SecretNotFoundError, SecretsProvider,
                                     default_keychain_secrets_provider_factory)
@@ -211,6 +212,30 @@ def _refresh_fact_store(fact_store_path: str | Path | None) -> FactStore | None:
         return None
 
 
+def _refresh_opportunity_event_store(
+    opportunity_event_store_path: str | Path | None,
+) -> OpportunityEventStore | None:
+    """Re-opens `agent.opportunity_event_store.OpportunityEventStore` fresh
+    from disk (Task 1, Phase-2/3-live-acceptance follow-up unit,
+    2026-08-15) -- identical reasoning and shape to `_refresh_fact_store`
+    immediately above: this store's own `__init__` reads its whole file
+    once and never re-reads it, and this dashboard process and the real
+    screening `scripts/run_agent.py`/`--research-once` (Task 3) process are
+    separate OS processes. `opportunity_event_store_path=None` (no
+    `--opportunity-event-store-path` given) or any read failure (a corrupt/
+    unreadable file) both degrade to `None`, never raise -- `agent.
+    dashboard_state.build_dashboard_state` already renders `opportunity_
+    event_store=None` as an honest UNAVAILABLE for scored/suppressed/
+    triggered_this_session, never a fabricated 0 or an exception that would
+    take the rest of GET /api/state down with it."""
+    if opportunity_event_store_path is None:
+        return None
+    try:
+        return OpportunityEventStore(opportunity_event_store_path)
+    except Exception:
+        return None
+
+
 def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Path,
                            account_id: str | None, cost_ledger_path: str | Path,
                            approval_request_store_path: str | Path,
@@ -220,6 +245,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
                            quarantine_store_path: str | Path,
                            mode_store_path: str | Path | None = None,
                            fact_store_path: str | Path | None = None,
+                           opportunity_event_store_path: str | Path | None = None,
                            key_id: str | None = None,
                            secret_ref: str | None = None,
                            secrets_provider_factory: Callable[[str], SecretsProvider]
@@ -350,6 +376,12 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
             (lambda: _refresh_fact_store(fact_store_path))
             if fact_store_path is not None else None
         ),
+        opportunity_event_store=_refresh_opportunity_event_store(
+            opportunity_event_store_path),
+        opportunity_event_store_refresh_fn=(
+            (lambda: _refresh_opportunity_event_store(opportunity_event_store_path))
+            if opportunity_event_store_path is not None else None
+        ),
     )
 
 
@@ -395,6 +427,13 @@ _DEFAULT_STORE_FILENAMES = {
     # same directory a running run_agent.py process uses must resolve to
     # the SAME facts.jsonl, not a second, independently-named copy.
     "fact_store_path": "facts.jsonl",
+    # Task 1 (Phase-2/3-live-acceptance follow-up unit, 2026-08-15): SAME
+    # filename scripts/run_agent.py's own _DEFAULT_STORE_FILENAMES uses for
+    # it (added there in the overnight unit, 2026-08-14) -- pointing
+    # --data-dir at the same directory a running run_agent.py/--research-
+    # once process uses must resolve to the SAME materiality_events.jsonl,
+    # not a second, independently-named copy.
+    "opportunity_event_store_path": "materiality_events.jsonl",
 }
 
 
@@ -464,6 +503,16 @@ def _parse_args(argv: list[str] | None):
                              "news_feed fields report real, durable counts instead of "
                              "an unavailable placeholder (Track B dashboard-truth fix, "
                              "2026-08-14)")
+    parser.add_argument("--opportunity-event-store-path",
+                        help="defaults to <data-dir>/materiality_events.jsonl -- point "
+                             "this at the SAME file a running scripts/run_agent.py "
+                             "process's real materiality screen cycle (agent."
+                             "pipeline_stage.run_pipeline_stage) or --research-once "
+                             "(Task 3) writes to, so GET /api/state's "
+                             "scored_this_session/suppressed_this_session/"
+                             "triggered_this_session fields report real, durable "
+                             "counts instead of an unavailable placeholder (Task 1, "
+                             "Phase-2/3-live-acceptance follow-up unit, 2026-08-15)")
     parser.add_argument("--host", default="127.0.0.1",
                         help="must stay a loopback address (see agent.dashboard_server)")
     parser.add_argument("--port", type=int, default=8765)
@@ -569,6 +618,7 @@ def main(argv: list[str] | None = None, *,
         quarantine_store_path=args.quarantine_store_path,
         mode_store_path=args.mode_store_path,
         fact_store_path=args.fact_store_path,
+        opportunity_event_store_path=args.opportunity_event_store_path,
         key_id=args.key_id, secret_ref=args.secret_ref,
         secrets_provider_factory=secrets_provider_factory,
         credential_preflight=credential_preflight,

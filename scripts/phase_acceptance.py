@@ -42,9 +42,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from datetime import datetime, timezone
+
 from agent.accounts import BrokerCredentials
 from agent.diagnostics import FAIL, PASS, UNAVAILABLE, diagnose_account
+from agent.edgar_collector import FIELD as _FILING_FIELD
 from agent.holding import HoldingPolicyRegistry
+from agent.market_data_collector import FIELD as _MARKET_SNAPSHOT_FIELD
+from agent.news_collector import FIELD as _NEWS_FIELD
+from agent.opportunity_event_store import OpportunityEventStore
 from agent.secrets_provider import SecretNotFoundError
 from agent.secrets_provider import \
     default_keychain_secrets_provider_factory as _real_secrets_provider_factory
@@ -52,6 +58,14 @@ from agent.store import FactStore
 from agent import runtime_status as runtime_status_module
 
 NOT_YET_OBSERVED = "NOT YET OBSERVED"
+
+# The three real FIELD literals a durable Fact is written under by each
+# real collector (verified directly against each module's own `FIELD = ...`
+# literal, not assumed -- same constants `agent.dashboard_state`'s own
+# Track B dashboard-truth fix already uses for the identical reason: a
+# fact this codebase's real collectors did not write is not evidence this
+# criterion should ever count).
+_REAL_FACT_FIELDS = {_MARKET_SNAPSHOT_FIELD, _FILING_FIELD, _NEWS_FIELD}
 
 # The reconciliation component names diagnose_account actually produces
 # (verified directly against agent/diagnostics.py's own `name=` literals,
@@ -190,123 +204,353 @@ def _phase1_scheduled_cycle_criterion(*, data_dir):
         return {key: (UNAVAILABLE, f"{type(exc).__name__}: {exc}")}
 
 
+_PHASE2_KEYS = (
+    "fact_store_has_recorded_at_least_one_real_fact",
+    "fact_provenance_present",
+    "fact_point_in_time_fields_valid",
+    "fact_store_reload_succeeds",
+)
+
+
 def _phase2_criteria(*, data_dir):
-    """Phase 2 (§2/§11 Day 4: collectors populate the evidence store).
-    PASS only means "at least one fact has been durably recorded" -- says
-    NOTHING about correctness or usefulness of that fact's content, only
-    that the mechanism has actually run against real evidence at least
-    once, distinct from merely being wired (which the unit-test suite
-    already proves at the code level)."""
+    """Phase 2 (§2/§11 Day 4: collectors populate the evidence store), fully
+    reconstructed to the mission's own explicit four required truthful
+    criteria (Phase-2/3-live-acceptance follow-up unit, 2026-08-15) --
+    REPLACES this criterion's own prior, single-question "does at least one
+    fact exist" version (see git history for that version): a fact existing
+    at all says nothing about whether it is REAL evidence (as opposed to a
+    stray test-fixture row), whether it carries usable provenance, whether
+    its own point-in-time fields are structurally sound, or whether the
+    store that wrote it can be trusted to read itself back. Each of those
+    is now its own separate, independently-failable criterion.
+
+      1. `fact_store_has_recorded_at_least_one_real_fact` -- at least one
+         Fact on disk whose `field` is one of the THREE real collector FIELD
+         literals (`_REAL_FACT_FIELDS`, verified directly against `agent.
+         market_data_collector`/`agent.edgar_collector`/`agent.
+         news_collector`'s own `FIELD = ...` constants -- the identical
+         constants `agent.dashboard_state`'s own Track B dashboard-truth fix
+         already uses). A Fact with any other `field` value is not evidence
+         a real collector ever ran.
+      2. `fact_provenance_present` -- every real fact (from criterion 1)
+         carries a non-empty `source_id`. `agent.store.Fact` has no
+         structural constraint forcing this (unlike `observed_at`/
+         `effective_at`'s own `__post_init__` tz-aware check) -- an empty
+         string would still construct successfully, so this is checked
+         explicitly, not assumed from the dataclass's own type.
+      3. `fact_point_in_time_fields_valid` -- every real fact's own
+         `observed_at`/`effective_at` are timezone-aware (the SAME
+         invariant `Fact.__post_init__` already enforces at construction,
+         re-verified here directly against the actual persisted rows rather
+         than trusted from the constructor having once run) AND
+         `observed_at` is never later than "now" -- the identical no-
+         lookahead invariant `agent.store.AsOfView.get_fact`'s own runtime
+         assertion already enforces for reads; this criterion checks it
+         holds for every real fact currently on disk, not just the one a
+         particular `as_of(t)` call happened to select.
+      4. `fact_store_reload_succeeds` -- a SECOND, independent `FactStore`
+         instance, constructed fresh from the same file, reports the same
+         fact count and no truncated tail. This is the genuine "does replay
+         from disk work" proof Task 2 asked for -- not merely "did the
+         first read succeed" (already implied by getting this far), but
+         "does a cold process starting up against this exact file on disk
+         see the same evidence" -- the real question a restart (or
+         `--research-once`, Task 3) actually needs answered.
+
+    Every criterion fans out to the SAME NOT_YET_OBSERVED/UNAVAILABLE
+    result when the file does not exist, is empty of real facts, has a
+    truncated tail, or the read itself raises -- there is no meaningful way
+    for e.g. `fact_provenance_present` to be individually PASS/FAIL when
+    there is no real fact to check it against at all."""
     results = {}
     fact_store_path = data_dir / "facts.jsonl"
     if not fact_store_path.exists():
-        results["fact_store_has_recorded_at_least_one_fact"] = (
-            NOT_YET_OBSERVED, f"{fact_store_path} does not exist yet")
-        return results
+        reason = f"{fact_store_path} does not exist yet"
+        return {key: (NOT_YET_OBSERVED, reason) for key in _PHASE2_KEYS}
     try:
         store = FactStore(fact_store_path)
         # Unit C reconstruction (2026-08-13): FactStore._load now tolerates
         # a crash-truncated FINAL line rather than raising (agent/store.py
-        # docstring) -- so a corrupt/unreadable-content file no longer
-        # necessarily surfaces as an exception here. `truncated_tail_on_load`
-        # being set means the load itself succeeded but at least one row's
-        # content is UNKNOWN, not zero -- a genuinely different epistemic
-        # state from "loaded cleanly and there are truly no rows yet", and
-        # this criterion must not collapse the two into the same PASS/
-        # NOT_YET_OBSERVED read. Reported UNAVAILABLE (genuine uncertainty),
-        # matching this same file's own alpaca_credentials_present /
-        # broker_state_is_known precedent for "cannot honestly say" rather
-        # than guessing either PASS or NOT_YET_OBSERVED.
+        # docstring) -- see this criterion's own prior version's comment,
+        # unchanged reasoning, now applied uniformly across all four keys.
         if store.truncated_tail_on_load is not None:
-            results["fact_store_has_recorded_at_least_one_fact"] = (
-                UNAVAILABLE,
+            reason = (
                 f"{fact_store_path} has an unparseable final row "
                 f"({len(store.truncated_tail_on_load)} chars) -- cannot "
-                f"tell whether a fact was ever durably recorded"
+                f"tell whether the facts on disk are trustworthy"
             )
-            return results
-        n = len(store)
-        if n > 0:
-            results["fact_store_has_recorded_at_least_one_fact"] = (
-                PASS, f"{n} facts on disk")
+            return {key: (UNAVAILABLE, reason) for key in _PHASE2_KEYS}
+
+        all_facts = store.all_facts()
+        real_facts = [f for f in all_facts if f.field in _REAL_FACT_FIELDS]
+        if not real_facts:
+            reason = (
+                f"{len(all_facts)} fact(s) on disk, none with a real "
+                f"collector field ({sorted(_REAL_FACT_FIELDS)!r})"
+            )
+            return {key: (NOT_YET_OBSERVED, reason) for key in _PHASE2_KEYS}
+
+        results["fact_store_has_recorded_at_least_one_real_fact"] = (
+            PASS,
+            f"{len(real_facts)} real fact(s) on disk (of {len(all_facts)} total)"
+        )
+
+        no_provenance = [f for f in real_facts if not f.source_id]
+        if no_provenance:
+            results["fact_provenance_present"] = (
+                FAIL,
+                f"{len(no_provenance)} of {len(real_facts)} real fact(s) "
+                f"have an empty source_id"
+            )
         else:
-            results["fact_store_has_recorded_at_least_one_fact"] = (
-                NOT_YET_OBSERVED, "fact store file exists but is empty")
+            results["fact_provenance_present"] = (
+                PASS, f"every real fact carries a non-empty source_id")
+
+        now = datetime.now(timezone.utc)
+        bad_pit = [
+            f for f in real_facts
+            if f.observed_at.tzinfo is None or f.effective_at.tzinfo is None
+            or f.observed_at > now
+        ]
+        if bad_pit:
+            results["fact_point_in_time_fields_valid"] = (
+                FAIL,
+                f"{len(bad_pit)} of {len(real_facts)} real fact(s) have a "
+                f"naive or future-dated observed_at/effective_at"
+            )
+        else:
+            results["fact_point_in_time_fields_valid"] = (
+                PASS,
+                "every real fact's observed_at/effective_at is "
+                "timezone-aware and not future-dated"
+            )
+
+        reloaded = FactStore(fact_store_path)
+        if (reloaded.truncated_tail_on_load is None
+                and len(reloaded) == len(store)):
+            results["fact_store_reload_succeeds"] = (
+                PASS,
+                f"a fresh FactStore instance reloaded {len(reloaded)} "
+                f"fact(s) from disk, matching the original read exactly"
+            )
+        else:
+            results["fact_store_reload_succeeds"] = (
+                FAIL,
+                f"reload produced {len(reloaded)} fact(s) vs the original "
+                f"{len(store)}, or a truncated tail appeared on reload"
+            )
     except Exception as exc:   # noqa: BLE001
-        results["fact_store_has_recorded_at_least_one_fact"] = (
-            UNAVAILABLE, f"{type(exc).__name__}: {exc}")
+        reason = f"{type(exc).__name__}: {exc}"
+        return {key: (UNAVAILABLE, reason) for key in _PHASE2_KEYS}
     return results
+
+
+_PHASE3_KEYS = (
+    "opportunity_event_references_real_persisted_facts",
+    "opportunity_event_identity_is_deterministic",
+    "opportunity_event_score_threshold_version_persisted",
+    "opportunity_event_status_persisted",
+    "opportunity_event_survives_reload",
+)
 
 
 def _phase3_criteria(*, data_dir):
     """Phase 3 (§3.1/§3.2: materiality screening produces OpportunityEvents
-    from real collected facts). This audit does NOT recalibrate weights or
-    thresholds -- this criterion only checks whether the mechanism has ever
-    actually fired against real data AND produced a genuinely qualifying,
-    analyzed opportunity.
+    from real collected facts), fully reconstructed to the mission's own
+    explicit required truthful criteria (Phase-2/3-live-acceptance follow-
+    up unit, 2026-08-15) -- REPLACES this criterion's own prior version,
+    which read `agent.opportunity_event_tracker.OpportunityEventTracker`'s
+    file (`opportunity_events.jsonl`) and required an "analyzed" T4 outcome
+    row (see git history for that version's own long comment explaining
+    that defect-avoidance). THAT PROXY IS NOW THE WRONG SOURCE OF TRUTH:
+    `agent.opportunity_event_store.OpportunityEventStore` (`materiality_
+    events.jsonl`, built the overnight prior to this unit) now durably
+    persists EVERY raw screen outcome -- triggered, suppressed, and
+    below-threshold alike -- independent of whether T4 analysis is even
+    enabled. Phase 3 is SCREENING, not analysis; T4 remains its own,
+    separate Phase 4 criterion this function does not touch.
 
-    THE DEFECT A NAIVE VERSION OF THIS CRITERION WOULD HAVE (independently
-    rediscovered this session, not copied from any prior report): the
-    durable file at this path (`agent.opportunity_event_tracker.
-    OpportunityEventTracker`) does NOT store raw materiality-screen
-    triggers -- it stores T4-ANALYSIS TERMINAL OUTCOMES ONLY ("analyzed" /
-    "refused" / "budget_exceeded" / "insufficient_settled_cash"), written
-    by `mark_handled()` and reachable only from `agent/pipeline_stage.py`'s
-    `_analyze_and_request`, itself gated behind `pipeline.
-    t4_analysis_enabled` (default False, verified against agent/config.py).
-    There is no durable store of raw OpportunityEvents anywhere in this
-    codebase (agent/materiality_cycle.py's own docstring says so
-    explicitly). A bare "file exists and has non-empty lines" check would
-    therefore BOTH false-positive (PASS on nothing but "refused"/
-    "budget_exceeded"/"insufficient_settled_cash" rows, none of which is a
-    real qualifying event) AND false-negative (permanently NOT YET OBSERVED
-    whenever T4 analysis is disabled, regardless of whether screening
-    itself is healthy). This criterion instead requires at least one row
-    whose "outcome" field is literally "analyzed" -- the only outcome that
-    means a real, qualifying opportunity was accepted and actually
-    analyzed -- parsed via json.loads per line (a non-JSON line is a
-    corrupt store, UNAVAILABLE, never a silent PASS, matching Phase 2's
-    own posture on the identical failure mode).
+    THE MISSION'S OWN EXPLICIT INSTRUCTION, HONORED STRUCTURALLY: "A
+    suppressed/not-material event is sufficient to prove Phase 3
+    screening. A trigger is NOT required." None of the five checks below
+    filters on `analysis_status`; a store containing nothing but
+    `NOT_MATERIAL` rows passes every one of them just as completely as a
+    store containing a `PENDING_ANALYSIS` trigger would.
 
-    DISCLOSED REMAINING GAP: this still cannot distinguish "the screen
-    never fired" from "the screen fired but T4 analysis is disabled" --
-    both currently read NOT YET OBSERVED, because no durable store of raw
-    screen triggers exists to tell them apart. Closing that gap requires a
-    genuine new OpportunityEvent store, out of scope for this read-only-
-    harness unit (see docs/unit_f_phase_acceptance.md)."""
-    import json as _json
+      1. `opportunity_event_references_real_persisted_facts` -- at least
+         one persisted event can be matched back to a REAL Fact still on
+         disk in `facts.jsonl`, using the SAME provenance `agent.
+         materiality_cycle.run_materiality_cycle` itself actually used to
+         build that event (verified directly against that function's own
+         source, not assumed): a `FILING`-typed event's `source_id`/
+         `observed_at` come verbatim from a real `filing`-field Fact, so
+         this checks for an EXACT match on `(field="filing", source_id,
+         entity_id in symbols, observed_at)`; a `PRICE_MOVE`-typed event's
+         own `observed_at`/`effective_at` are set to `now` (not any single
+         Fact's own timestamp -- see that function's own `observed_at =
+         effective_at = now` line), so this checks for at least one real
+         `market_snapshot`-field Fact for one of the event's symbols,
+         observed AT OR BEFORE the event's own `observed_at` (the
+         screen cannot have used a fact from the future). If no
+         `facts.jsonl` exists at all, this is UNAVAILABLE (cannot verify
+         provenance either way), never a silent PASS or FAIL.
+      2. `opportunity_event_identity_is_deterministic` -- every persisted
+         event's own `event_id` equals the EXACT deterministic formula
+         `agent.materiality_cycle.run_materiality_cycle` itself uses
+         (`f"{source_id}:{symbols[0]}:{observed_at.isoformat()}"`, verified
+         directly against that function's own source) -- proving the
+         identity on disk is reproducible from the event's own other
+         fields, not merely present.
+      3. `opportunity_event_score_threshold_version_persisted` -- every
+         persisted event's `materiality_score` is a real, finite number and
+         `threshold_version` is a non-empty string.
+      4. `opportunity_event_status_persisted` -- every persisted event's
+         `analysis_status` is one of `agent.materiality.screen`'s own three
+         real literals (`PENDING_ANALYSIS`/`SUPPRESSED`/`NOT_MATERIAL`,
+         verified directly against that module's source -- see `agent.
+         opportunity_event_store`'s own module docstring for the same
+         verification).
+      5. `opportunity_event_survives_reload` -- a SECOND, independent
+         `OpportunityEventStore` instance, constructed fresh from the same
+         file, reports the same event count, and the FIRST persisted
+         event's own score/status/threshold_version are byte-identical
+         after the round trip -- the genuine "does replay from disk work"
+         proof, mirroring Phase 2's own `fact_store_reload_succeeds`."""
+    import math as _math
 
     results = {}
-    tracker_path = data_dir / "opportunity_events.jsonl"
-    if not tracker_path.exists():
-        results["materiality_screen_has_produced_at_least_one_event"] = (
-            NOT_YET_OBSERVED, f"{tracker_path} does not exist yet")
-        return results
+    opp_store_path = data_dir / "materiality_events.jsonl"
+    if not opp_store_path.exists():
+        reason = f"{opp_store_path} does not exist yet"
+        return {key: (NOT_YET_OBSERVED, reason) for key in _PHASE3_KEYS}
     try:
-        lines = [ln for ln in tracker_path.read_text(encoding="utf-8").splitlines()
-                if ln.strip()]
-        if not lines:
-            results["materiality_screen_has_produced_at_least_one_event"] = (
-                NOT_YET_OBSERVED, "opportunity tracker file exists but is empty")
-            return results
-        analyzed_count = 0
-        for ln in lines:
-            row = _json.loads(ln)   # a malformed row -> corrupt store, UNAVAILABLE
-            if row.get("outcome") == "analyzed":
-                analyzed_count += 1
-        if analyzed_count > 0:
-            results["materiality_screen_has_produced_at_least_one_event"] = (
-                PASS, f"{analyzed_count} 'analyzed' outcome row(s) on disk "
-                     f"({len(lines)} total tracker rows)")
+        store = OpportunityEventStore(opp_store_path)
+        events = store.all()
+        if not events:
+            reason = "opportunity event store file exists but has recorded no events yet"
+            return {key: (NOT_YET_OBSERVED, reason) for key in _PHASE3_KEYS}
+
+        fact_store_path = data_dir / "facts.jsonl"
+        fact_store_exists = fact_store_path.exists()
+        facts = FactStore(fact_store_path).all_facts() if fact_store_exists else ()
+
+        def _references_real_facts(event) -> bool:
+            if event.type == "FILING":
+                return any(
+                    f.field == _FILING_FIELD and f.source_id == event.source_id
+                    and f.entity_id in event.symbols and f.observed_at == event.observed_at
+                    for f in facts
+                )
+            return any(
+                f.field == _MARKET_SNAPSHOT_FIELD and f.entity_id in event.symbols
+                and f.observed_at <= event.observed_at
+                for f in facts
+            )
+
+        if not fact_store_exists:
+            results["opportunity_event_references_real_persisted_facts"] = (
+                UNAVAILABLE,
+                f"{fact_store_path} does not exist -- cannot verify any "
+                f"persisted event's provenance either way"
+            )
         else:
-            results["materiality_screen_has_produced_at_least_one_event"] = (
-                NOT_YET_OBSERVED,
-                f"{len(lines)} tracker row(s) on disk but none with "
-                f"outcome=='analyzed' -- screen may have fired without "
-                f"ever producing a real qualifying, analyzed event")
+            grounded = [e for e in events if _references_real_facts(e)]
+            if grounded:
+                results["opportunity_event_references_real_persisted_facts"] = (
+                    PASS,
+                    f"{len(grounded)} of {len(events)} persisted event(s) "
+                    f"reference a real, matching Fact still on disk in "
+                    f"{fact_store_path}"
+                )
+            else:
+                results["opportunity_event_references_real_persisted_facts"] = (
+                    FAIL,
+                    f"none of {len(events)} persisted event(s) could be "
+                    f"matched back to a real Fact still on disk in "
+                    f"{fact_store_path}"
+                )
+
+        def _expected_event_id(event) -> str:
+            symbol = event.symbols[0] if event.symbols else ""
+            return f"{event.source_id}:{symbol}:{event.observed_at.isoformat()}"
+
+        non_deterministic = [e for e in events if e.event_id != _expected_event_id(e)]
+        if non_deterministic:
+            results["opportunity_event_identity_is_deterministic"] = (
+                FAIL,
+                f"{len(non_deterministic)} of {len(events)} persisted "
+                f"event(s) have an event_id that does not match the real "
+                f"deterministic formula (source_id:symbol:observed_at)"
+            )
+        else:
+            results["opportunity_event_identity_is_deterministic"] = (
+                PASS,
+                f"every persisted event's event_id matches the real "
+                f"deterministic formula ({len(events)} event(s) checked)"
+            )
+
+        bad_score_or_version = [
+            e for e in events
+            if not isinstance(e.materiality_score, (int, float))
+            or _math.isnan(e.materiality_score) or _math.isinf(e.materiality_score)
+            or not e.threshold_version
+        ]
+        if bad_score_or_version:
+            results["opportunity_event_score_threshold_version_persisted"] = (
+                FAIL,
+                f"{len(bad_score_or_version)} of {len(events)} persisted "
+                f"event(s) have a non-finite materiality_score or an "
+                f"empty threshold_version"
+            )
+        else:
+            results["opportunity_event_score_threshold_version_persisted"] = (
+                PASS,
+                f"every persisted event carries a real, finite "
+                f"materiality_score and a non-empty threshold_version "
+                f"({len(events)} event(s) checked)"
+            )
+
+        real_statuses = {"PENDING_ANALYSIS", "SUPPRESSED", "NOT_MATERIAL"}
+        bad_status = [e for e in events if e.analysis_status not in real_statuses]
+        if bad_status:
+            results["opportunity_event_status_persisted"] = (
+                FAIL,
+                f"{len(bad_status)} of {len(events)} persisted event(s) "
+                f"have an analysis_status outside agent.materiality."
+                f"screen's own three real literals {sorted(real_statuses)!r}"
+            )
+        else:
+            results["opportunity_event_status_persisted"] = (
+                PASS,
+                f"every persisted event's analysis_status is one of "
+                f"screen()'s own three real literals ({len(events)} "
+                f"event(s) checked)"
+            )
+
+        reloaded = OpportunityEventStore(opp_store_path)
+        reloaded_events = reloaded.all()
+        first = events[0]
+        first_reloaded = reloaded.get(first.event_id)
+        if (len(reloaded_events) == len(events) and first_reloaded is not None
+                and first_reloaded.materiality_score == first.materiality_score
+                and first_reloaded.analysis_status == first.analysis_status
+                and first_reloaded.threshold_version == first.threshold_version):
+            results["opportunity_event_survives_reload"] = (
+                PASS,
+                f"a fresh OpportunityEventStore instance reloaded "
+                f"{len(reloaded_events)} event(s) from disk, matching the "
+                f"original read exactly"
+            )
+        else:
+            results["opportunity_event_survives_reload"] = (
+                FAIL,
+                f"reload produced {len(reloaded_events)} event(s) vs the "
+                f"original {len(events)}, or the first event's own score/"
+                f"status/threshold_version changed across the round trip"
+            )
     except Exception as exc:   # noqa: BLE001
-        results["materiality_screen_has_produced_at_least_one_event"] = (
-            UNAVAILABLE, f"{type(exc).__name__}: {exc}")
+        reason = f"{type(exc).__name__}: {exc}"
+        return {key: (UNAVAILABLE, reason) for key in _PHASE3_KEYS}
     return results
 
 

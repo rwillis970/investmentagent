@@ -298,6 +298,7 @@ from agent.money import to_decimal
 from agent.opportunity_event_store import OpportunityEventStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.pipeline import Gatekeeper
+from agent import research_once
 from agent.pipeline_stage import PipelineRuntime
 from agent.run_loop import (AccountRuntime, in_session_now,
                             seconds_until_next_session_open, run_loop as real_run_loop,
@@ -1317,6 +1318,121 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
         return 1
 
 
+def _run_research_once(*, config_path: str, account_id: str | None, key_id: str | None,
+                       secret_ref: str | None, mode_store_path: str | Path,
+                       fact_store_path: str | Path,
+                       opportunity_event_store_path: str | Path,
+                       cost_ledger_path: str | Path,
+                       secrets_provider_factory: Callable[[str], SecretsProvider],
+                       now_fn: Callable[[], datetime], log: logging.Logger) -> int:
+    """`--research-once` (Task 3, Phase-2/3-live-acceptance follow-up unit,
+    2026-08-15): the safe out-of-session command -- see `agent.
+    research_once`'s own module docstring for the full architecture
+    (PAUSED-only precondition, why the session/mode gates are deliberately
+    bypassed at the collector/screen level, why no Ledger is ever
+    constructed, and the structural proof T4/approvals/orders are
+    unreachable). This function is the thin CLI wiring layer only, mirroring
+    `_run_reconcile_once`'s own shape: parses nothing itself (that's
+    `_parse_args`), constructs the real collaborators `agent.research_once.
+    run_research_once` needs, prints a report, and turns every failure mode
+    (a `ResearchOnceRefused`, or any other exception) into a logged message
+    and `return 1` -- never raises, matching every other one-shot dispatch
+    in this script.
+
+    CREDENTIALS ARE OPTIONAL, DELIBERATELY (unlike `--reconcile-once`, which
+    requires them). Market data collection needs a real `AlpacaMarketDataClient`
+    (bound credentials); EDGAR and news collection need none. If `--key-id`/
+    `--secret-ref`/`--account-id` are not all three given, market data
+    collection is skipped entirely -- reported honestly as NOT_YET_OBSERVED
+    with an explicit reason (`agent.research_once._facts_collector_market_
+    data`'s own `client is None` branch) -- and EDGAR/news collection and
+    materiality screening still run. This keeps the command usable for an
+    operator who only wants SEC/news research this weekend and has no
+    Alpaca credentials provisioned at all.
+
+    DOES NOT TOUCH `agent.failure_sentinel` -- same reasoning as every other
+    one-shot operator command in this script (`_run_advance_mode`/`_run_
+    admit_or_reject`/`_run_reconcile_once`): that mechanism exists for the
+    UNATTENDED scheduled loop across launchd relaunches, not a one-shot,
+    interactively-run command."""
+    try:
+        cfg = config_module.load(json.loads(Path(config_path).read_text()))
+
+        market_data_client = None
+        if account_id is not None and key_id is not None and secret_ref is not None:
+            secrets_provider = secrets_provider_factory(cfg.mode)
+            credentials = BrokerCredentials(account_id=account_id, key_id=key_id,
+                                           secret_ref=secret_ref)
+            market_data_client = AlpacaMarketDataClient(
+                credentials=credentials, secrets_provider=secrets_provider,
+                feed=cfg.market_data_feed,
+                http_timeout_seconds=cfg.market_data_http_timeout_seconds,
+                http_max_retries=cfg.market_data_http_max_retries,
+            )
+
+        edgar_client = EdgarClient(
+            user_agent=cfg.edgar_user_agent,
+            http_timeout_seconds=cfg.edgar_http_timeout_seconds,
+            http_max_retries=cfg.edgar_http_max_retries,
+            min_request_interval_seconds=cfg.edgar_min_request_interval_seconds,
+        )
+        news_provider = config_module.build_provider(cfg)
+
+        mode_store = ModeStore(mode_store_path)
+        fact_store = FactStore(fact_store_path)
+        opportunity_event_store = OpportunityEventStore(opportunity_event_store_path)
+        cost_ledger = CostLedger(monthly_budget=cfg.monthly_budget_usd,
+                                warning_at=cfg.budget_warning_usd,
+                                hard_stop_at=cfg.budget_hard_stop_usd, path=cost_ledger_path)
+        now = now_fn()
+
+        result = research_once.run_research_once(
+            mode_store=mode_store, fact_store=fact_store,
+            opportunity_event_store=opportunity_event_store,
+            symbol_universe=cfg.symbol_universe, materiality_policy=cfg.materiality_policy,
+            capability_policy=cfg.capability_policy, cost_ledger=cost_ledger,
+            max_model_analyses_per_day=cfg.max_model_analyses_per_day,
+            max_approval_requests_per_day=cfg.max_approval_requests_per_day,
+            min_peer_group_size=cfg.materiality_min_peer_group_size,
+            market_data_client=market_data_client, edgar_client=edgar_client,
+            ticker_cik_cache=TickerCikCache(),
+            ticker_cik_refresh_max_age=timedelta(
+                hours=cfg.edgar_ticker_cik_refresh_interval_hours),
+            news_provider=news_provider,
+            news_lookback=timedelta(hours=cfg.news_lookback_hours),
+            now=now,
+        )
+    except research_once.ResearchOnceRefused as exc:
+        log.error("refusing --research-once: %s", exc)
+        return 1
+    except Exception as exc:   # noqa: BLE001 -- FAILS CLOSED, same posture
+        # as every other one-shot command in this script.
+        log.error("--research-once failed: %s", exc)
+        return 1
+
+    log.info(
+        "--research-once complete: persisted_mode=%s market_data=%s(collected=%d "
+        "dedup=%d) edgar_filings=%s(collected=%d dedup=%d) news=%s(collected=%d "
+        "dedup=%d) materiality_evaluations=%d triggered=%d suppressed=%d "
+        "not_material=%d events_persisted=%d events_persistence_failed=%d",
+        result.persisted_mode,
+        result.market_data.status, result.market_data.facts_collected,
+        result.market_data.facts_deduplicated,
+        result.edgar_filings.status, result.edgar_filings.facts_collected,
+        result.edgar_filings.facts_deduplicated,
+        result.news.status, result.news.facts_collected, result.news.facts_deduplicated,
+        result.materiality_evaluations, result.triggered, result.suppressed,
+        result.not_material, result.events_persisted, result.events_persistence_failed,
+    )
+    if result.market_data.reason:
+        log.info("market_data reason: %s", result.market_data.reason)
+    if result.edgar_filings.reason:
+        log.info("edgar_filings reason: %s", result.edgar_filings.reason)
+    if result.news.reason:
+        log.info("news reason: %s", result.news.reason)
+    return 0
+
+
 #  ONE-SHOT WRITER-LOCK GAP CLOSED (writer-lock-gap unit, 2026-08-14).
 #
 #  THE DEFECT (disclosed by agent/process_lock.py's own module docstring,
@@ -1756,6 +1872,28 @@ def _parse_args(argv: list[str] | None):
                              "ExecutionQuarantineStore/CashEventQuarantineStore, same as a "
                              "real cycle. Requires --account-id, --config, --key-id and "
                              "--secret-ref; every pipeline/approval flag is ignored.")
+    parser.add_argument("--research-once", action="store_true",
+                        help="the safe out-of-session research command (Task 3, Phase-2/3-"
+                             "live-acceptance follow-up unit, 2026-08-15): collect real EDGAR "
+                             "filings and news (and a real market snapshot, if the market "
+                             "happens to be in session right now) into the durable FactStore, "
+                             "then run ONE real materiality screen over the persisted facts "
+                             "and durably persist every resulting OpportunityEvent -- "
+                             "triggered, suppressed, or below-threshold alike -- then exit. "
+                             "REQUIRES the persisted mode to be exactly PAUSED (refuses "
+                             "outright otherwise) and NEVER writes ModeStore on any path -- "
+                             "the persisted mode is unchanged before and after. Structurally "
+                             "cannot reach adapter.submit/cancel, never constructs a "
+                             "Gatekeeper, StagedOrder, or approval execution, never enables "
+                             "T4/Claude, and never requires the market to be in session (see "
+                             "agent/research_once.py's own module docstring for the full "
+                             "architecture and why the session/mode gates run_pipeline_stage "
+                             "itself uses are deliberately bypassed here, at the collector/"
+                             "screen level only). Requires --config; --account-id/--key-id/"
+                             "--secret-ref are optional TOGETHER (all three or none) -- "
+                             "without them, market data collection is skipped and reported "
+                             "NOT_YET_OBSERVED, but EDGAR/news collection and screening still "
+                             "run.")
     parser.add_argument("--confirmed", action="store_true",
                         help="required for the PAPER/PAUSED -> PRODUCTION_ACTIVE edges (§9.2); "
                              "irrelevant, and harmless, for PAPER")
@@ -1871,6 +2009,30 @@ def _parse_args(argv: list[str] | None):
         args.data_dir_relevant = _default_relevant_paths((
             "ledger_store_path", "quarantine_store_path", "cash_quarantine_store_path",
             "mode_store_path", "audit_log_path", "runtime_status_path",
+        ))
+    elif args.research_once:
+        if args.config is None:
+            parser.error("the following arguments are required for --research-once: --config")
+        # --account-id/--key-id/--secret-ref are optional TOGETHER (all
+        # three or none) -- see this flag's own help text and agent.
+        # research_once's own module docstring for why market data
+        # collection alone may be skipped without refusing the whole
+        # command.
+        given = [v for v in (args.account_id, args.key_id, args.secret_ref) if v is not None]
+        if given and len(given) != 3:
+            parser.error(
+                "--research-once requires --account-id, --key-id and --secret-ref "
+                "together (all three, for market data credentials) or none of them "
+                "(market data collection is then skipped and reported NOT_YET_OBSERVED)"
+            )
+        # Touches four durable stores -- mode (read-only), facts, the
+        # materiality event store, and the cost ledger -- same runtime-
+        # recovery-unit (2026-08-13) data_dir_relevant reasoning as every
+        # other branch here: reflects whether --data-dir actually defaulted
+        # at least one of THESE paths this call.
+        args.data_dir_relevant = _default_relevant_paths((
+            "mode_store_path", "fact_store_path", "opportunity_event_store_path",
+            "cost_ledger_path",
         ))
     else:
         missing = [name for name, val in (
@@ -2028,6 +2190,25 @@ def main(argv: list[str] | None = None, *,
                 cash_quarantine_store_path=args.cash_quarantine_store_path,
                 mode_store_path=args.mode_store_path, audit_log_path=args.audit_log_path,
                 runtime_status_path=args.runtime_status_path,
+                secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
+            ),
+        )
+
+    if args.research_once:
+        # Wrapped in _run_one_shot_locked exactly like the other five
+        # one-shot writers -- see that function's own docstring. This one
+        # writes to FactStore/OpportunityEventStore (never ModeStore), so it
+        # needs the same serialization against a running scheduled loop for
+        # the same reason --reconcile-once does.
+        return _run_one_shot_locked(
+            data_dir=args.data_dir, log=log, action_desc="--research-once",
+            fn=lambda: _run_research_once(
+                config_path=args.config, account_id=args.account_id,
+                key_id=args.key_id, secret_ref=args.secret_ref,
+                mode_store_path=args.mode_store_path,
+                fact_store_path=args.fact_store_path,
+                opportunity_event_store_path=args.opportunity_event_store_path,
+                cost_ledger_path=args.cost_ledger_path,
                 secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
             ),
         )

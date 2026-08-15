@@ -155,6 +155,19 @@ class TickerCikCache:
 class EdgarCollectionResult:
     facts: tuple[Fact, ...]
     skipped: dict[str, str] = field(default_factory=dict)
+    # ADDED (Task 3, Phase-2/3-live-acceptance follow-up unit, 2026-08-15):
+    # how many filings this cycle's own `client.filings_for_cik(cik)` sweep
+    # returned that were ALREADY known (by accession_number, per module
+    # docstring's DEDUPLICATION section) and therefore never became a new
+    # Fact -- previously silently discarded by the `if ... in known:
+    # continue` line below with no count anywhere a caller could observe.
+    # `scripts/run_agent.py --research-once` (Task 3) reports this
+    # honestly, rather than only ever being able to say "0 new facts" with
+    # no way to distinguish "collector saw nothing" from "collector saw
+    # plenty, all of it already known." Additive, backward compatible:
+    # every existing caller/test constructing this dataclass without this
+    # field still gets the same default (0) it implicitly had before.
+    duplicate_count: int = 0
 
 
 def _observed_at(filing: dict) -> datetime:
@@ -187,6 +200,7 @@ def collect_filings(client: EdgarClient, store: FactStore, cache: TickerCikCache
 
     facts: list[Fact] = []
     skipped: dict[str, str] = {}
+    duplicate_count = 0
     view = store.now_view()
     for symbol in symbols:
         cik = cache.get(symbol)
@@ -196,6 +210,7 @@ def collect_filings(client: EdgarClient, store: FactStore, cache: TickerCikCache
         known = frozenset(f.value["accession_number"] for f in view.history(symbol, FIELD))
         for filing in client.filings_for_cik(cik):
             if filing["accession_number"] in known:
+                duplicate_count += 1
                 continue
             fact = Fact(
                 entity_id=symbol, field=FIELD,
@@ -212,7 +227,8 @@ def collect_filings(client: EdgarClient, store: FactStore, cache: TickerCikCache
             )
             store.append(fact)
             facts.append(fact)
-    return EdgarCollectionResult(facts=tuple(facts), skipped=skipped)
+    return EdgarCollectionResult(facts=tuple(facts), skipped=skipped,
+                                 duplicate_count=duplicate_count)
 
 
 def collect_filing_document(client: EdgarClient, store: FactStore, symbol: str, *,

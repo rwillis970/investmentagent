@@ -77,6 +77,13 @@ class NewsCollectionResult:
     partial failure needs somewhere honest to report)."""
     facts: tuple[Fact, ...]
     skipped: dict[str, str] = field(default_factory=dict)
+    # ADDED (Task 3, Phase-2/3-live-acceptance follow-up unit, 2026-08-15) --
+    # same additive, backward-compatible field and same reasoning as
+    # `agent.edgar_collector.EdgarCollectionResult.duplicate_count`: how many
+    # items this cycle's `provider.fetch_since` call returned that were
+    # already known (by `url`, per module docstring's DEDUPLICATION
+    # section), previously silently discarded with no observable count.
+    duplicate_count: int = 0
 
 
 def collect_news_events(provider: NewsProvider, store: FactStore, symbols: list[str], *,
@@ -107,6 +114,7 @@ def collect_news_events(provider: NewsProvider, store: FactStore, symbols: list[
 
     facts: list[Fact] = []
     skipped: dict[str, str] = {}
+    duplicate_count = 0
     for event in raw_events:
         symbol = event.symbol.upper()
         if symbol not in wanted:
@@ -117,6 +125,7 @@ def collect_news_events(provider: NewsProvider, store: FactStore, symbols: list[
             known_by_symbol[symbol] = frozenset(
                 f.value["url"] for f in view.history(symbol, FIELD))
         if event.url in known_by_symbol[symbol]:
+            duplicate_count += 1
             continue   # already known -- safe, expected no-op (module docstring)
 
         fact = Fact(
@@ -141,7 +150,8 @@ def collect_news_events(provider: NewsProvider, store: FactStore, symbols: list[
         # here across a whole batch instead.
         known_by_symbol[symbol] = known_by_symbol[symbol] | {event.url}
 
-    return NewsCollectionResult(facts=tuple(facts), skipped=skipped)
+    return NewsCollectionResult(facts=tuple(facts), skipped=skipped,
+                                duplicate_count=duplicate_count)
 
 
 def read_news_events(view, symbol: str) -> tuple[Fact, ...]:

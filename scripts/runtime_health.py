@@ -29,12 +29,21 @@ WHAT THIS CHECKS (mission's own explicit list, mapped to a field below):
                                      own most recent observed_at, as a
                                      durable proxy -- see that field's own
                                      docstring for the disclosed limitation)
-  last materiality evaluation    -> last_materiality_evaluation (the SAME
-                                     disclosed T4-outcome-only proxy
-                                     scripts/phase_acceptance.py's own Phase
-                                     3 criterion already uses -- no raw
-                                     OpportunityEvent store exists yet; see
-                                     that module's own docstring)
+  last materiality evaluation    -> last_materiality_evaluation (Task 2,
+                                     Phase-2/3-live-acceptance follow-up
+                                     unit, 2026-08-15: now reads `agent.
+                                     opportunity_event_store.
+                                     OpportunityEventStore` directly --
+                                     `materiality_events.jsonl`'s own
+                                     `evaluated_at` across every persisted
+                                     screen outcome, PENDING_ANALYSIS/
+                                     SUPPRESSED/NOT_MATERIAL alike. REPLACES
+                                     the prior T4-outcome-only proxy this
+                                     field used to share with scripts/
+                                     phase_acceptance.py's own pre-rewrite
+                                     Phase 3 criterion; see that module's own
+                                     current docstring for the identical
+                                     switch)
   current broker snapshot age    -> broker_snapshot_age (runtime_status.
                                      broker_snapshot_at + agent.runtime_
                                      status.is_stale)
@@ -46,8 +55,10 @@ WHAT THIS CHECKS (mission's own explicit list, mapped to a field below):
                                      QuarantineStore.pending())
   audit chain validity           -> audit_chain_valid (AuditLog.verify())
   FactStore counts                -> fact_store_counts (len(FactStore))
-  opportunity-event counts        -> opportunity_event_counts (same disclosed
-                                     proxy as last_materiality_evaluation)
+  opportunity-event counts        -> not currently a separate report field;
+                                     see last_materiality_evaluation's own
+                                     total_events/by_status for the same
+                                     durable counts
   active failure sentinel         -> failure_sentinel_state
   Keychain availability (no
     value exposed)                -> keychain_availability (presence-only
@@ -87,6 +98,7 @@ from agent.audit import AuditLog
 from agent.cash_event_quarantine import CashEventQuarantineStore
 from agent.execution_quarantine import ExecutionQuarantineStore
 from agent.mode_store import ModeStore
+from agent.opportunity_event_store import OpportunityEventStore
 from agent.secrets_provider import SecretNotFoundError, SecretsProvider
 from agent.store import FactStore
 
@@ -190,37 +202,40 @@ def _last_successful_collection(fact_store: FactStore | None) -> dict[str, Any]:
 
 
 def _last_materiality_evaluation(data_dir: Path) -> dict[str, Any]:
-    """SAME DISCLOSED PROXY AS scripts/phase_acceptance.py's OWN PHASE 3
-    CRITERION (verbatim reuse of that module's own reasoning, not a second,
-    independently-invented one): `agent.opportunity_event_tracker.
-    OpportunityEventTracker`'s durable file stores T4-ANALYSIS TERMINAL
-    OUTCOMES ONLY, not raw materiality-screen triggers -- there is no
-    durable store of raw OpportunityEvents anywhere in this codebase yet
-    (see agent/materiality_cycle.py's own docstring). A row with
-    outcome=="analyzed" is the closest available durable evidence that a
-    real, qualifying opportunity was screened and evaluated; this cannot
-    distinguish "the screen never fired" from "the screen fired but T4
-    analysis is disabled" -- both currently read NOT_YET_OBSERVED here, the
-    identical disclosed gap phase_acceptance.py's own Phase 3 section
-    names."""
-    path = data_dir / "opportunity_events.jsonl"
+    """Task 2 (Phase-2/3-live-acceptance follow-up unit, 2026-08-15) --
+    REPLACES this field's own prior T4-outcome-only proxy (`agent.
+    opportunity_event_tracker.OpportunityEventTracker`'s file, which only
+    ever recorded a row once T4 analysis handled an event -- silent for
+    every SUPPRESSED/NOT_MATERIAL outcome and for any period where T4
+    analysis is disabled, which it is today). `agent.opportunity_event_
+    store.OpportunityEventStore` (`materiality_events.jsonl`) durably
+    persists EVERY raw screen outcome, so this now reports the MOST RECENT
+    `evaluated_at` across every persisted event (the store's own
+    first-recorded timestamp for that event_id, not the event's own
+    `observed_at`/`effective_at`, which describe the underlying fact --
+    same `evaluated_at`-is-the-session-boundary convention `agent.
+    dashboard_state`'s own materiality-screen counts already use), plus a
+    real breakdown of how many of those persisted events are PENDING_
+    ANALYSIS/SUPPRESSED/NOT_MATERIAL."""
+    path = data_dir / "materiality_events.jsonl"
     if not path.exists():
         return {"status": NOT_YET_OBSERVED, "reason": f"{path} does not exist yet"}
     try:
-        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        if not lines:
-            return {"status": NOT_YET_OBSERVED, "reason": "tracker file exists but is empty"}
-        analyzed_at = []
-        for ln in lines:
-            row = json.loads(ln)
-            if row.get("outcome") == "analyzed":
-                analyzed_at.append(row.get("handled_at") or row.get("event_id"))
-        if not analyzed_at:
+        store = OpportunityEventStore(path)
+        events = store.all()
+        if not events:
             return {"status": NOT_YET_OBSERVED,
-                   "reason": f"{len(lines)} tracker row(s) but none with "
-                            "outcome=='analyzed' -- see this function's own "
-                            "docstring for the disclosed screen-vs-T4 gap"}
-        return {"status": PASS, "analyzed_count": len(analyzed_at), "total_rows": len(lines)}
+                   "reason": "opportunity event store exists but has recorded no events yet"}
+        evaluated_ats = [store.evaluated_at(e.event_id) for e in events]
+        evaluated_ats = [a for a in evaluated_ats if a is not None]
+        most_recent = max(evaluated_ats) if evaluated_ats else None
+        by_status = {
+            "PENDING_ANALYSIS": sum(1 for e in events if e.analysis_status == "PENDING_ANALYSIS"),
+            "SUPPRESSED": sum(1 for e in events if e.analysis_status == "SUPPRESSED"),
+            "NOT_MATERIAL": sum(1 for e in events if e.analysis_status == "NOT_MATERIAL"),
+        }
+        return {"status": PASS, "most_recent_evaluated_at": most_recent,
+               "total_events": len(events), "by_status": by_status}
     except Exception as exc:   # noqa: BLE001
         return {"status": UNAVAILABLE, "reason": f"{type(exc).__name__}: {exc}"}
 

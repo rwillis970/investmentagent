@@ -157,8 +157,21 @@ def test_unbuilt_fields_are_null_with_a_sibling_reason(tmp_path):
     assert state["data_collection"]["news_feed"] is None
     assert "no fact_store was supplied" in state["data_collection"]["news_feed_unavailable_reason"]
     assert "agent.news_collector" in state["data_collection"]["news_feed_unavailable_reason"]
+    # Task 1 (Phase-2/3-live-acceptance follow-up unit, 2026-08-15): a real
+    # durable agent.opportunity_event_store.OpportunityEventStore DOES
+    # exist -- with none wired to this process, these three fields are an
+    # honest "not supplied" UNAVAILABLE, never the old, permanently-null
+    # _NO_SESSION_HISTORY claim. See test_dashboard_state_opportunity_
+    # events.py for the real-count path.
     assert state["materiality_screen"]["scored_this_session"] is None
-    assert state["materiality_screen"]["scored_this_session_unavailable_reason"]
+    assert "no opportunity_event_store was supplied" in \
+        state["materiality_screen"]["scored_this_session_unavailable_reason"]
+    assert state["materiality_screen"]["suppressed_this_session"] is None
+    assert "no opportunity_event_store was supplied" in \
+        state["materiality_screen"]["suppressed_this_session_unavailable_reason"]
+    assert state["materiality_screen"]["triggered_this_session"] is None
+    assert "no opportunity_event_store was supplied" in \
+        state["materiality_screen"]["triggered_this_session_unavailable_reason"]
     assert state["reconciliation"]["last_result"] is None
     assert state["reconciliation"]["last_result_unavailable_reason"]
     assert state["improvement_loop"]["class_a_reading_quality_labels"] is None

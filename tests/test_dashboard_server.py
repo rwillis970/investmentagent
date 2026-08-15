@@ -991,3 +991,91 @@ def test_get_api_state_with_no_fact_store_at_all_is_honestly_unavailable(tmp_pat
     payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
     assert payload["data_collection"]["bars_ingested_today"] is None
     assert payload["data_collection"]["bars_ingested_today_unavailable_reason"] is not None
+
+
+# ---------------------------------- opportunity_event_store_refresh_fn (Task 1,
+# Phase-2/3-live-acceptance follow-up unit, 2026-08-15). Mirrors fact_store_
+# refresh_fn's own per-request-refresh tests exactly, same reasoning: this
+# dashboard process and the real screening scripts/run_agent.py/--research-
+# once process are separate OS processes, so an OpportunityEventStore built
+# once at dashboard startup would never see an event screened after this
+# process's own start.
+
+def test_get_api_state_calls_opportunity_event_store_refresh_fn_when_set(tmp_path):
+    from agent.entities import OpportunityEvent
+    from agent.opportunity_event_store import OpportunityEventStore
+
+    runtime, _ = make_runtime(tmp_path)
+    opp_store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    opp_store.record(OpportunityEvent(
+        event_id="e1", type="FILING", source_id="EDGAR:test",
+        observed_at=T0, effective_at=T0, symbols=("AAPL",), materiality_score=3.0,
+        score_components={}, threshold_version="v1", analysis_status="PENDING_ANALYSIS",
+    ), evaluated_at=T0)
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        return opp_store
+
+    runtime.opportunity_event_store_refresh_fn = refresh
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert len(calls) == 1
+    assert payload["materiality_screen"]["scored_this_session"] == 1
+    assert payload["materiality_screen"]["triggered_this_session"] == 1
+
+
+def test_get_api_state_calls_opportunity_event_store_refresh_fn_again_on_a_second_request(
+    tmp_path,
+):
+    """A second, separate process appending a new event between two
+    dashboard polls must be visible on the very next poll -- proves this is
+    a per-request re-open, not a one-shot cache."""
+    from agent.entities import OpportunityEvent
+    from agent.opportunity_event_store import OpportunityEventStore
+
+    runtime, _ = make_runtime(tmp_path)
+    path = tmp_path / "materiality_events.jsonl"
+
+    def refresh():
+        return OpportunityEventStore(path) if path.exists() else None
+
+    runtime.opportunity_event_store_refresh_fn = refresh
+    first = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert first["materiality_screen"]["scored_this_session_unavailable_reason"] is not None
+
+    store = OpportunityEventStore(path)
+    store.record(OpportunityEvent(
+        event_id="e1", type="FILING", source_id="EDGAR:test",
+        observed_at=T0, effective_at=T0, symbols=("AAPL",), materiality_score=3.0,
+        score_components={}, threshold_version="v1", analysis_status="SUPPRESSED",
+    ), evaluated_at=T0)
+    second = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert second["materiality_screen"]["scored_this_session"] == 1
+    assert second["materiality_screen"]["suppressed_this_session"] == 1
+
+
+def test_get_api_state_with_no_opportunity_event_store_refresh_fn_keeps_static_store(tmp_path):
+    from agent.entities import OpportunityEvent
+    from agent.opportunity_event_store import OpportunityEventStore
+
+    runtime, _ = make_runtime(tmp_path)
+    opp_store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    opp_store.record(OpportunityEvent(
+        event_id="e1", type="FILING", source_id="EDGAR:test",
+        observed_at=T0, effective_at=T0, symbols=("AAPL",), materiality_score=1.0,
+        score_components={}, threshold_version="v1", analysis_status="NOT_MATERIAL",
+    ), evaluated_at=T0)
+    runtime.opportunity_event_store = opp_store
+    assert runtime.opportunity_event_store_refresh_fn is None
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["materiality_screen"]["scored_this_session"] == 1
+
+
+def test_get_api_state_with_no_opportunity_event_store_at_all_is_honestly_unavailable(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    assert runtime.opportunity_event_store is None
+    assert runtime.opportunity_event_store_refresh_fn is None
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["materiality_screen"]["scored_this_session"] is None
+    assert payload["materiality_screen"]["scored_this_session_unavailable_reason"] is not None

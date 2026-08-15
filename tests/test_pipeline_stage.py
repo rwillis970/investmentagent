@@ -794,3 +794,89 @@ def test_a_persistence_defect_never_aborts_the_screen_cycle(tmp_path, monkeypatc
 
     assert result.screening is not None   # cycle completed, not aborted
     assert len(store) == 0   # the malformed row was never durably written
+
+
+# ---------------- durable-before-T4 invariant (Task 4, Phase-2/3-live-
+# acceptance follow-up unit, 2026-08-15). NO MATERIALITY EVENT MAY PROCEED TO
+# T4 ANALYSIS UNLESS ITS OpportunityEvent HAS BEEN SUCCESSFULLY PERSISTED.
+# T4 itself is exercised via the SAME `t4_runtime`/`patch_screening`/
+# `patch_analyze` harness every T4 wiring test above already uses -- no new
+# fixtures invented here.
+
+import math as _math   # noqa: E402
+
+
+def test_persistence_success_lets_an_eligible_event_reach_t4(tmp_path, monkeypatch):
+    store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    good = event(event_id="good", status="PENDING_ANALYSIS", score=5.0)
+    patch_screening(monkeypatch, [good])
+    calls: list[str] = []
+    patch_analyze(monkeypatch, {"good": analysis_result("good")}, calls)
+    rt = t4_runtime(tmp_path)
+    rt = _replace(rt, opportunity_event_store=store)
+    run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                       last_collected_at=None, last_screened_at=None)
+    assert calls == ["good"]
+    assert store.get("good") is not None
+
+
+def test_persistence_failure_keeps_the_event_out_of_the_t4_candidate_list(tmp_path, monkeypatch):
+    store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    bad = pipeline_stage.OpportunityEvent(
+        event_id="bad", type="FILING", source_id=EDGAR_SOURCE_ID,
+        observed_at=T0, effective_at=T0, symbols=("AAPL",),
+        materiality_score=_math.nan, score_components={}, threshold_version="mat-v1",
+        analysis_status="PENDING_ANALYSIS",
+    )
+    patch_screening(monkeypatch, [bad])
+    calls: list[str] = []
+    # No outcome registered for "bad" -- a real call would KeyError, proving
+    # `analyze_opportunity_event` was never reached for this event at all.
+    patch_analyze(monkeypatch, {}, calls)
+    rt = t4_runtime(tmp_path)
+    rt = _replace(rt, opportunity_event_store=store)
+    run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                       last_collected_at=None, last_screened_at=None)
+    assert calls == []   # never reached T4
+    assert len(store) == 0   # never durably persisted either
+
+
+def test_a_persistence_failure_does_not_block_unrelated_events_in_the_same_cycle(
+        tmp_path, monkeypatch):
+    store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    bad = pipeline_stage.OpportunityEvent(
+        event_id="bad", type="FILING", source_id=EDGAR_SOURCE_ID,
+        observed_at=T0, effective_at=T0, symbols=("AAPL",),
+        materiality_score=_math.nan, score_components={}, threshold_version="mat-v1",
+        analysis_status="PENDING_ANALYSIS",
+    )
+    good = event(event_id="good", event_type="FILING", symbol="MSFT",
+                status="PENDING_ANALYSIS", score=5.0)
+    patch_screening(monkeypatch, [bad, good])
+    calls: list[str] = []
+    patch_analyze(monkeypatch, {"good": analysis_result("good")}, calls)
+    rt = t4_runtime(tmp_path)
+    rt = _replace(rt, opportunity_event_store=store)
+    run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                       last_collected_at=None, last_screened_at=None)
+    assert calls == ["good"]   # the good sibling event still reaches T4
+    assert len(store) == 1
+    assert store.get("good") is not None
+    assert store.get("bad") is None
+
+
+def test_no_store_wired_at_all_leaves_t4_eligibility_unaffected(tmp_path, monkeypatch):
+    """Pre-existing, disclosed, SEPARATE gap (`agent.opportunity_event_store`
+    not wired into this process at all) -- Task 4 does not change this
+    case's behaviour: with no store to persist to, `triggered` is built
+    exactly as it was before this invariant existed (see this task's own
+    `_durably_persisted` docstring in agent/pipeline_stage.py for why)."""
+    good = event(event_id="good", status="PENDING_ANALYSIS", score=5.0)
+    patch_screening(monkeypatch, [good])
+    calls: list[str] = []
+    patch_analyze(monkeypatch, {"good": analysis_result("good")}, calls)
+    rt = t4_runtime(tmp_path)
+    assert rt.opportunity_event_store is None
+    run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                       last_collected_at=None, last_screened_at=None)
+    assert calls == ["good"]

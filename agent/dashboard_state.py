@@ -4,8 +4,7 @@ stores this codebase already has -- never a fabricated number.
 
 HONESTY, NOT COMPLETENESS. The uploaded design (`Agent Command Center.dc.html`)
 renders far more panels than this codebase has real, queryable state behind:
-per-session collector counts, materiality-screen scored/suppressed/triggered
-counts, a persisted reconciliation-result history, an improvement loop, a
+a persisted reconciliation-result history, an improvement loop, a
 performance-attribution layer. None of those exist as a durable, queryable
 store anywhere in this codebase (checked directly, not assumed -- see this
 unit's own report for the full list). Rather than inventing a plausible
@@ -14,6 +13,15 @@ number, every such field is returned as an explicit `null`, with a sibling
 already renders "NOT BUILT"/"NO LABELS"/"ABSENT" states for exactly this
 reason, and this endpoint must keep telling the truth, not paper over the
 gap with a fake number the moment a real backend exists to ask.
+
+Per-session COLLECTOR counts (`data_collection`) and materiality-screen
+scored/suppressed/triggered counts (`materiality_screen`) ARE now real,
+durable, queryable figures (Track B, 2026-08-14; Task 1 of the Phase-2/3-
+live-acceptance follow-up unit, 2026-08-15) -- see `_facts_ingested_today`/
+`_materiality_counts_this_session` below. Both still degrade to an honest
+UNAVAILABLE, not a fabricated 0, when the relevant store was never wired
+into this process (`fact_store`/`opportunity_event_store` both default to
+`None`) or a read genuinely fails.
 
 NO BROKER CALL, NO CREDENTIAL. This module never constructs a `BrokerAdapter`
 or touches `agent.secrets_provider` -- `broker_account`/`broker_positions`/
@@ -39,6 +47,7 @@ from .config import Config
 from .cost import CostLedger
 from .daytrade import DayTradeGuard
 from .ledger import Ledger
+from .opportunity_event_store import OpportunityEventStore
 from .opportunity_event_tracker import OpportunityEventTracker
 from .risk import PortfolioState, investable_cash, required_reserve
 from .store import FactStore
@@ -73,6 +82,14 @@ _NOT_BUILT = (
 _NO_SESSION_HISTORY = (
     "not available: this figure is computed in-memory for a single "
     "pipeline cycle and is never persisted anywhere queryable afterward"
+)
+_NO_OPPORTUNITY_EVENT_STORE = (
+    "unavailable: no opportunity_event_store was supplied to this dashboard "
+    "process -- see scripts/run_dashboard.py's own --opportunity-event-"
+    "store-path flag. agent.opportunity_event_store.OpportunityEventStore "
+    "already exists and is written by every real materiality screen cycle "
+    "(agent.pipeline_stage.run_pipeline_stage); this is a wiring gap, not a "
+    "missing feature"
 )
 _NO_RECONCILE_HISTORY = (
     "not available: agent.reconciliation exposes pure comparison functions "
@@ -133,6 +150,100 @@ def _facts_ingested_today(fact_store: FactStore | None, *, field: str,
         return _null(f"unavailable: {type(exc).__name__} reading fact_store: {exc}")
 
 
+def _materiality_counts_this_session(
+    store: OpportunityEventStore | None, *, session,
+) -> dict[str, dict]:
+    """Real, durable scored/suppressed/triggered counts (Task 1,
+    Phase-2/3-live-acceptance follow-up unit, 2026-08-15) -- read fresh from
+    `agent.opportunity_event_store.OpportunityEventStore` on every call
+    (this function does no caching of its own; the caller re-opens `store`
+    on every request -- see `agent.dashboard_server.DashboardRuntime.
+    opportunity_event_store_refresh_fn`'s own docstring, mirroring `fact_
+    store_refresh_fn`'s cross-process-staleness reasoning exactly). NEVER an
+    in-memory per-cycle counter, NEVER a timer-generated value -- every
+    number here is a `len()` over rows this store actually has on disk.
+
+    SESSION BOUNDARY, EXPLICIT. `session` is a `date` -- the SAME trading-
+    session identifier `agent.market_calendar.session_for_instant` already
+    produces, and the SAME kind of value `agent.approval_request_store.
+    ApprovalRequestStore.count_decided_on`/`agent.daytrade.DayTradeGuard.
+    count` already key their own "this session" counts by (see this
+    module's own `reconciliation`/`approvals` sections, unchanged). A
+    persisted `OpportunityEvent` counts toward THIS call's session if and
+    only if `agent.market_calendar.session_for_instant(evaluated_at) ==
+    session`, where `evaluated_at` is the store's OWN recorded "when did
+    the screen cycle that produced this row actually run" field (`agent.
+    opportunity_event_store.OpportunityEventStore.evaluated_at`) -- NOT the
+    event's own `observed_at`/`effective_at`, which describe the underlying
+    fact, not when it was screened. A trading-session boundary, not a
+    calendar-day one, for the identical reason every other "this session"
+    figure in this dashboard already uses one: a screen that ran during a
+    weekend/holiday close (this mission's own `--research-once` command,
+    Task 3) still belongs to a real, well-defined trading session under
+    `agent.market_calendar`'s own calendar, the same way an out-of-hours
+    `--reconcile-once` run already does for `day_trade_count` elsewhere in
+    this module.
+
+    THE THREE-WAY DOMAIN MODEL, MADE EXPLICIT (not re-invented here --
+    see `agent.materiality.screen`'s own three real `analysis_status`
+    literals, verified directly against that module's source):
+      - `scored`: every event this session, regardless of status. ALL
+        THREE of `screen()`'s real outcomes ("PENDING_ANALYSIS"/
+        "SUPPRESSED"/"NOT_MATERIAL") were genuinely scored against the
+        real materiality policy -- "scored" is the superset, not a fourth,
+        separate outcome.
+      - `suppressed`: `analysis_status == "SUPPRESSED"` only -- a REAL
+        score at or above threshold that was blocked from going forward
+        (capability/cooldown/budget -- see `agent.materiality.screen`'s
+        own `suppressed_reason`). Deliberately NOT counting
+        `"NOT_MATERIAL"` here: "scored below threshold, never eligible in
+        the first place" is a materially different real-world outcome
+        from "eligible, and blocked anyway" -- conflating the two would
+        make `suppressed` answer a different question than what an
+        operator actually wants to know (capability/cooldown/budget
+        friction vs. simply-quiet markets).
+      - `triggered`: `analysis_status == "PENDING_ANALYSIS"` -- the events
+        that were, or would be (T4 may be disabled -- see `agent.config.
+        Config.t4_analysis_enabled`'s own default-False posture, unchanged
+        by this dashboard read), eligible for T4 analysis.
+
+    `store=None` (no `--opportunity-event-store-path` wired) is an honest
+    UNAVAILABLE for all three fields, never a silent 0. A read failure
+    (corrupt file, anything else `OpportunityEventStore(...)` or `.all()`
+    could raise) is likewise UNAVAILABLE, with the real exception type/
+    message surfaced -- never silently downgraded to 0, which would be
+    indistinguishable from "checked, and genuinely zero landed this
+    session," a materially different, and strictly stronger, claim. A
+    genuinely empty durable store (constructed, present, zero rows) DOES
+    correctly report 0 for all three -- that is real, positive knowledge
+    ("checked; nothing has been screened yet"), not the same as
+    UNAVAILABLE."""
+    if store is None:
+        reason = _NO_OPPORTUNITY_EVENT_STORE
+        return {"scored": _null(reason), "suppressed": _null(reason),
+               "triggered": _null(reason)}
+    try:
+        events = store.all()
+        this_session = []
+        for e in events:
+            evaluated_at_str = store.evaluated_at(e.event_id)
+            if evaluated_at_str is None:
+                continue   # defensive only -- every row this store's own
+                          # record() persists always sets this alongside it
+            evaluated_at = datetime.fromisoformat(evaluated_at_str)
+            if market_calendar.session_for_instant(evaluated_at) == session:
+                this_session.append(e)
+        scored = len(this_session)
+        suppressed = sum(1 for e in this_session if e.analysis_status == "SUPPRESSED")
+        triggered = sum(1 for e in this_session if e.analysis_status == "PENDING_ANALYSIS")
+        return {"scored": _present(scored), "suppressed": _present(suppressed),
+               "triggered": _present(triggered)}
+    except Exception as exc:   # noqa: BLE001 -- never take GET /api/state down
+        reason = f"unavailable: {type(exc).__name__} reading opportunity_event_store: {exc}"
+        return {"scored": _null(reason), "suppressed": _null(reason),
+               "triggered": _null(reason)}
+
+
 def build_dashboard_state(
     *, now: datetime, config: Config, cost_ledger: CostLedger,
     opportunity_tracker: OpportunityEventTracker,
@@ -146,6 +257,7 @@ def build_dashboard_state(
     operational_state: str | None = None,
     operational_state_paused_from: str | None = None,
     fact_store: FactStore | None = None,
+    opportunity_event_store: OpportunityEventStore | None = None,
 ) -> dict:
     """Assemble the single JSON document the dashboard's GET /api/state
     returns. Every store this function reads is passed in by the caller
@@ -205,14 +317,16 @@ def build_dashboard_state(
             fact_store, field=_NEWS_FACT_FIELD, today=today)),
     }
 
+    _materiality_counts = _materiality_counts_this_session(
+        opportunity_event_store, session=session)
     materiality_screen = {
         "enabled": config.materiality_screen_enabled,
         "threshold": config.materiality_threshold,
         "threshold_version": config.threshold_version,
         "interval_seconds": config.opportunity_screen_interval_minutes * 60,
-        **_prefixed("scored_this_session", _null(_NO_SESSION_HISTORY)),
-        **_prefixed("suppressed_this_session", _null(_NO_SESSION_HISTORY)),
-        **_prefixed("triggered_this_session", _null(_NO_SESSION_HISTORY)),
+        **_prefixed("scored_this_session", _materiality_counts["scored"]),
+        **_prefixed("suppressed_this_session", _materiality_counts["suppressed"]),
+        **_prefixed("triggered_this_session", _materiality_counts["triggered"]),
     }
 
     analysis = {

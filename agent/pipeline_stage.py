@@ -336,10 +336,39 @@ def run_pipeline_stage(pipeline: PipelineRuntime, *, now: datetime, mode: str,
         # mark_handled` calls below are likewise never allowed to abort the
         # cycle). Silently skipped (not silently "succeeded") when no store
         # is wired -- exactly like every other optional collaborator here.
+        #
+        # DURABLE-BEFORE-T4 INVARIANT (Task 4, Phase-2/3-live-acceptance
+        # follow-up unit, 2026-08-15). NO MATERIALITY EVENT MAY PROCEED TO
+        # T4 ANALYSIS UNLESS ITS OpportunityEvent HAS BEEN SUCCESSFULLY
+        # PERSISTED. Before this unit, a persistence failure here (an
+        # `OpportunityEventStoreError` -- a malformed, non-finite score) was
+        # swallowed with no consequence at all: the SAME event could still
+        # end up in `triggered` below and reach `_analyze_and_request` ->
+        # a real, paid Anthropic call -- an event this codebase's own
+        # durable evidence store refused to write would then have spent
+        # money and produced an `AnalysisResult` with no corresponding
+        # `OpportunityEvent` on disk to audit it against. `record()` itself
+        # is FIRST-WRITE-WINS (see agent.opportunity_event_store's own
+        # module docstring): it returns `True`/`False`, never raises, for
+        # BOTH "wrote a fresh row" and "already on disk from a prior cycle"
+        # -- both are genuine successful-persistence outcomes for this
+        # invariant's purposes, so `persisted_event_ids` is built from every
+        # `record()` call that returns without raising, not merely the
+        # `True` ones. When `pipeline.opportunity_event_store` is `None`
+        # (not wired into this process at all -- a separate, pre-existing,
+        # disclosed gap this task does not close), NO persistence is ever
+        # attempted for ANY event, so this invariant has nothing to gate on
+        # and `triggered` below is built exactly as before this unit --
+        # changing that would silently halt T4 everywhere this store simply
+        # isn't configured yet, a much larger behavioural change than this
+        # task's own narrow scope ("establish this invariant now," not
+        # "require the store be wired").
+        persisted_event_ids: set[str] = set()
         if pipeline.opportunity_event_store is not None:
             for event in screening.events:
                 try:
                     pipeline.opportunity_event_store.record(event, evaluated_at=now)
+                    persisted_event_ids.add(event.event_id)
                 except OpportunityEventStoreError:
                     # A malformed event (e.g. non-finite score) is a real
                     # defect worth surfacing -- but not by taking down the
@@ -348,13 +377,25 @@ def run_pipeline_stage(pipeline: PipelineRuntime, *, now: datetime, mode: str,
                     # wire this into `agent.diagnostics`/the failure
                     # sentinel the same way other soft-failure paths in this
                     # codebase already do. Disclosed gap, not a silent one.
+                    # NOT added to `persisted_event_ids` -- see this block's
+                    # own DURABLE-BEFORE-T4 INVARIANT comment: this is
+                    # exactly the case that invariant exists to catch. The
+                    # loop continues to the next event; one malformed event
+                    # never aborts the rest of the cycle's persistence or
+                    # screening.
                     pass
+
+        def _durably_persisted(e: OpportunityEvent) -> bool:
+            if pipeline.opportunity_event_store is None:
+                return True
+            return e.event_id in persisted_event_ids
 
         triggered = sorted(
             (e for e in screening.events
              if e.analysis_status == "PENDING_ANALYSIS"
              and e.type == "FILING"   # see FILING-ONLY note above
-             and not pipeline.opportunity_tracker.is_handled(e.event_id, now)),
+             and not pipeline.opportunity_tracker.is_handled(e.event_id, now)
+             and _durably_persisted(e)),
             key=lambda e: e.materiality_score, reverse=True,
         )
 

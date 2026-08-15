@@ -10,8 +10,10 @@ from agent import failure_sentinel
 from agent import runtime_status as runtime_status_module
 from agent.audit import AuditLog
 from agent.cash_event_quarantine import CashEventQuarantineStore
+from agent.entities import OpportunityEvent
 from agent.execution_quarantine import ExecutionQuarantineStore
 from agent.mode_store import ModeStore
+from agent.opportunity_event_store import OpportunityEventStore
 from agent.secrets_provider import InMemorySecretsProvider
 from agent.store import Fact, FactStore
 from scripts.runtime_health import (FAIL, NOT_YET_OBSERVED, PASS,
@@ -131,16 +133,42 @@ def test_last_materiality_evaluation_not_yet_observed_when_no_tracker_file(tmp_p
     assert report["last_materiality_evaluation"]["status"] == NOT_YET_OBSERVED
 
 
-def test_last_materiality_evaluation_passes_with_a_real_analyzed_row(tmp_path):
+def test_last_materiality_evaluation_passes_with_a_real_persisted_event(tmp_path):
+    """Task 2 (Phase-2/3-live-acceptance follow-up unit, 2026-08-15): this
+    field now reads OpportunityEventStore directly, and a SUPPRESSED (or
+    NOT_MATERIAL) event is sufficient real evidence -- a PENDING_ANALYSIS
+    trigger is not required."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    tracker_path = data_dir / "opportunity_events.jsonl"
-    tracker_path.write_text(json.dumps({
-        "event_id": "e1", "outcome": "analyzed", "handled_at": NOW.isoformat(),
-    }) + "\n")
+    opp_store = OpportunityEventStore(data_dir / "materiality_events.jsonl")
+    event = OpportunityEvent(
+        event_id="alpaca_market_data:AAPL:" + NOW.isoformat(), type="PRICE_MOVE",
+        source_id="alpaca_market_data", observed_at=NOW, effective_at=NOW,
+        symbols=("AAPL",), materiality_score=1.5, score_components={},
+        threshold_version="v1", analysis_status="SUPPRESSED",
+    )
+    opp_store.record(event, evaluated_at=NOW)
     report = build_report(data_dir=data_dir, now=NOW)
     assert report["last_materiality_evaluation"]["status"] == PASS
-    assert report["last_materiality_evaluation"]["analyzed_count"] == 1
+    assert report["last_materiality_evaluation"]["total_events"] == 1
+    assert report["last_materiality_evaluation"]["by_status"]["SUPPRESSED"] == 1
+    assert report["last_materiality_evaluation"]["most_recent_evaluated_at"] == NOW.isoformat()
+
+
+def test_last_materiality_evaluation_empty_store_is_not_yet_observed(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    OpportunityEventStore(data_dir / "materiality_events.jsonl")   # touches nothing on disk
+    report = build_report(data_dir=data_dir, now=NOW)
+    assert report["last_materiality_evaluation"]["status"] == NOT_YET_OBSERVED
+
+
+def test_last_materiality_evaluation_corrupt_store_is_unavailable(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "materiality_events.jsonl").write_text("{not valid json\n")
+    report = build_report(data_dir=data_dir, now=NOW)
+    assert report["last_materiality_evaluation"]["status"] == UNAVAILABLE
 
 
 def test_broker_snapshot_age_fails_when_stale(tmp_path):

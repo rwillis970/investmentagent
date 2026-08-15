@@ -68,6 +68,10 @@ def test_data_dir_defaults_all_five_store_paths_to_named_files_inside_it(tmp_pat
     # Track B dashboard-truth fix (2026-08-14): fact_store_path joins the
     # same defaulting group, matching scripts/run_agent.py's own filename.
     assert args.fact_store_path == str(data_dir / "facts.jsonl")
+    # Task 1 (Phase-2/3-live-acceptance follow-up unit, 2026-08-15):
+    # opportunity_event_store_path joins the same defaulting group,
+    # matching scripts/run_agent.py's own filename.
+    assert args.opportunity_event_store_path == str(data_dir / "materiality_events.jsonl")
     assert data_dir.is_dir()
 
 
@@ -121,6 +125,7 @@ def test_data_dir_is_never_created_when_every_store_path_is_explicit(tmp_path, m
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--mode-store-path", str(tmp_path / "m.jsonl"),
         "--fact-store-path", str(tmp_path / "f.jsonl"),
+        "--opportunity-event-store-path", str(tmp_path / "oe.jsonl"),
     ])
     assert not (tmp_path / "data").exists()
 
