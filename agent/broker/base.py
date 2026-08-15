@@ -507,13 +507,52 @@ class BrokerAdapter(ABC):
         return []
 
     # -- write --------------------------------------------------------------
+    def _verify_broker_identity_or_raise(self) -> None:
+        """CENTRALIZED BROKER-IDENTITY GUARD (security-remediation unit,
+        round 2, 2026-08-15). No-op by default -- most adapters
+        (`SimulatorBroker`, any test double built directly on
+        `BrokerAdapter`) have no broker-reported identity concept
+        separate from the local `account_id` label at all. A concrete
+        adapter whose broker DOES expose one (see `AlpacaPaperAdapter`'s
+        own "BROKER ACCOUNT IDENTITY BINDING" docstring section)
+        overrides this to verify it, raising on any mismatch/absent-id/
+        unverifiable-lookup condition.
+
+        CALLED FROM `submit()`/`cancel()` THEMSELVES, AS THE FIRST THING
+        EITHER DOES -- not from `_submit_impl`/`_cancel_impl`, and not
+        left to a caller's own incidental call ordering. THE DEFECT THIS
+        CLOSES: before this unit, `AlpacaPaperAdapter`'s identity check
+        lived ONLY inside `account()` -- it only ever ran when SOMETHING
+        happened to call `.account()` before `.submit()`/`.cancel()`. This
+        codebase's one real caller
+        (`agent.approval_execution.execute_approved_request`) does call
+        `account()` first today, for its own drift-check purposes, so the
+        check happened to run before mutation in practice -- but nothing
+        in this class's own contract enforced that ordering, and a future
+        caller (a direct cancel command, a different execution path) that
+        reached `submit()`/`cancel()` without ever calling `account()`
+        first would mutate with the pin never checked at all. Because
+        `submit()`/`cancel()` are defined ONCE here and cannot be
+        overridden by any subclass (`__init_subclass__`, above), a hook
+        called from inside them is structurally impossible for a future
+        mutation path to accidentally bypass -- there is no second
+        `submit`/`cancel` implementation anywhere in this codebase for a
+        future adapter to add without this same guard already running
+        first."""
+        return
+
     def submit(self, staged: StagedOrder, *,
                approval_token: ApprovalToken | None = None,
                reference_price: float | None = None) -> BrokerOrder:
         """The only way to submit a new order or a close. Takes a
         `StagedOrder` — the output of `Gatekeeper.stage` — and nothing else.
         Do not override this in an adapter; implement `_submit_impl` instead
-        (enforced at class-definition time — see `__init_subclass__`)."""
+        (enforced at class-definition time — see `__init_subclass__`).
+
+        `_verify_broker_identity_or_raise()` runs FIRST, before even the
+        CANCEL-side-order check immediately below -- see that method's own
+        docstring (security-remediation unit, round 2, 2026-08-15)."""
+        self._verify_broker_identity_or_raise()
         if staged.side == "CANCEL":
             raise AdapterError(
                 "submit() cannot take a CANCEL StagedOrder -- use cancel() "
@@ -599,7 +638,14 @@ class BrokerAdapter(ABC):
 
         Do not override this in an adapter; implement `_cancel_impl` instead
         (enforced at class-definition time — see `__init_subclass__`).
+
+        `_verify_broker_identity_or_raise()` runs FIRST, before even the
+        StagedOrder-shape check immediately below -- see that method's own
+        docstring on `submit()` above (security-remediation unit, round 2,
+        2026-08-15) -- identical placement/reasoning, applied to the other
+        mutating entrypoint.
         """
+        self._verify_broker_identity_or_raise()
         if not isinstance(staged, StagedOrder) or staged.side != "CANCEL":
             raise AdapterError(
                 "cancel() takes a StagedOrder staged with side=CANCEL from "

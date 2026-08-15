@@ -122,6 +122,91 @@ def test_posture_is_detected_not_declared():
 
 # ------------------------------------------------------- order path basics
 
+# ------------------------------- CENTRALIZED BROKER-IDENTITY GUARD (new)
+# (security-remediation unit, round 2, 2026-08-15). Proves the property at
+# the BASE-CLASS level, independent of Alpaca specifics: `BrokerAdapter.
+# submit()`/`cancel()` call `_verify_broker_identity_or_raise()` FIRST,
+# before `_submit_impl`/`_cancel_impl` (or anything else) ever runs. Since
+# `submit`/`cancel` cannot be overridden by any adapter subclass
+# (`__init_subclass__`), this is the guarantee that "future mutation paths
+# cannot accidentally bypass it" -- proven here against a plain
+# `SimulatorBroker` subclass, not the Alpaca adapter, specifically to show
+# this is a base-class contract, not something only Alpaca happens to get
+# right.
+
+class _IdentityGuardRaises(RuntimeError):
+    """Distinct exception type -- so a test can tell "the identity guard
+    itself refused" apart from any other exception submit()/cancel() might
+    raise for an unrelated reason."""
+
+
+class _IdentityCheckingBroker(SimulatorBroker):
+    """Records every call to the centralized hook and, when armed, raises
+    instead of allowing it to return -- everything else is inherited from
+    SimulatorBroker unchanged."""
+    def _verify_broker_identity_or_raise(self) -> None:
+        self._identity_check_calls = getattr(self, "_identity_check_calls", 0) + 1
+        if getattr(self, "_identity_should_raise", False):
+            raise _IdentityGuardRaises("simulated identity failure")
+
+
+def test_submit_calls_the_identity_guard_first_and_never_mutates_when_it_raises():
+    b = _IdentityCheckingBroker(account_id=ACCT, cash=500.0, now=T0)
+    b.set_price("SPY", 500.0)
+    gk = gatekeeper()
+    b.attach_staging_key(gk.signing_key)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    b._identity_should_raise = True
+    with pytest.raises(_IdentityGuardRaises):
+        b.submit(staged(gk), approval_token=approved_token(svc))
+    assert b._identity_check_calls == 1
+    assert b._orders == {}          # _submit_impl never ran -- nothing created
+    assert b.positions() == []      # no side effect leaked through either
+
+
+def test_cancel_calls_the_identity_guard_first_and_never_mutates_when_it_raises():
+    b = _IdentityCheckingBroker(account_id=ACCT, cash=500.0, now=T0)
+    b.set_price("SPY", 500.0)
+    gk = gatekeeper()
+    b.attach_staging_key(gk.signing_key)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    # A real open order exists first (identity guard disarmed for this one
+    # submit), so there is something a wrongly-unguarded cancel COULD have
+    # mutated.
+    b.submit(staged(gk), approval_token=approved_token(svc))
+    orders_before = dict(b._orders)
+
+    cancel_order = gk.stage(client_order_id="c1", symbol="SPY", side="CANCEL",
+                            order_type="LIMIT", time_in_force="DAY",
+                            portfolio=portfolio(), now=T0, posture="CASH",
+                            limit_price=500.0)
+    b._identity_should_raise = True
+    b._identity_check_calls = 0
+    with pytest.raises(_IdentityGuardRaises):
+        b.cancel(cancel_order)
+    assert b._identity_check_calls == 1
+    assert b._orders == orders_before   # byte-for-byte unchanged -- no cancel applied
+
+
+def test_submit_still_succeeds_normally_when_the_identity_guard_is_a_pass_through():
+    """Positive control: the base hook itself (a no-op by default, as
+    proven by every OTHER test in this file, none of which override it)
+    does not interfere with a normal, legitimate submit -- and this
+    subclass's recording override, when not armed to raise, is called
+    exactly once and does not itself change the outcome."""
+    b = _IdentityCheckingBroker(account_id=ACCT, cash=500.0, now=T0)
+    b.set_price("SPY", 500.0)
+    gk = gatekeeper()
+    b.attach_staging_key(gk.signing_key)
+    svc = ApprovalService(expiration=timedelta(minutes=30),
+                          min_display=timedelta(seconds=10), max_per_day=4)
+    order = b.submit(staged(gk), approval_token=approved_token(svc))
+    assert order.status == "filled"
+    assert b._identity_check_calls == 1
+
+
 def test_submit_is_idempotent_on_client_order_id():
     b, gk = broker()
     svc = ApprovalService(expiration=timedelta(minutes=30),

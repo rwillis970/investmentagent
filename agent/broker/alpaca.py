@@ -289,14 +289,35 @@ scheduled loop's reads, and `_run_submit_approved`, the one path that
 calls `adapter.submit`) -- see that module's own docstring for the exact
 wiring.
 
-WHY `account()` ONLY, NOT EVERY ENDPOINT: `/v2/account` is the one Alpaca
-response that reports the account's own identity at all -- `/v2/positions`,
-`/v2/orders`, `/v2/account/activities/FILL` describe HOLDINGS reached via
-the same authenticated credentials, not a fresh identity claim, so there is
-nothing additional to bind on those endpoints; every real caller in this
-codebase already calls `account()` at least once per cycle (reconciliation)
-or once per submit (`_run_submit_approved`), so gating there is equivalent
-to gating all four."""
+WHY THE CHECK ITSELF LIVES IN `account()` ONLY, NOT EVERY ENDPOINT:
+`/v2/account` is the one Alpaca response that reports the account's own
+identity at all -- `/v2/positions`, `/v2/orders`,
+`/v2/account/activities/FILL` describe HOLDINGS reached via the same
+authenticated credentials, not a fresh identity claim, so there is nothing
+additional to bind on those endpoints.
+
+BUT VERIFICATION MUST HAPPEN BEFORE MUTATION, NOT WHENEVER A CALLER
+HAPPENS TO CALL `account()` (security-remediation unit, ROUND 2,
+2026-08-15; independent final security validation flagged round 1 above
+as insufficient). Round 1's closing paragraph here used to claim "every
+real caller in this codebase already calls account() at least once per
+cycle or once per submit, so gating there is equivalent to gating all
+four" -- TRUE of this codebase's one real caller
+(`agent.approval_execution.execute_approved_request`, which calls
+`adapter.account()` for its own drift-check purposes before ever calling
+`adapter.submit()`) but never actually ENFORCED by this class's own
+contract: nothing stopped a future caller -- a direct cancel command, a
+different execution path -- from calling `submit()`/`cancel()` without
+ever calling `account()` first, in which case a mismatch would never be
+checked at all before the mutating HTTP call fired. `_verify_broker_
+identity_or_raise` (overriding `BrokerAdapter`'s new hook of the same
+name) closes this by calling `self.account()` -- reusing the exact same
+check above, not a second implementation -- from INSIDE `submit()`/
+`cancel()` themselves (see `agent.broker.base.BrokerAdapter.submit`'s own
+docstring), which cannot be overridden by any adapter subclass. Identity
+is now verified before mutation BY CONSTRUCTION, independent of whether
+or in what order a caller happens to call `account()` for its own
+purposes."""
 from __future__ import annotations
 
 import json
@@ -629,6 +650,47 @@ class AlpacaPaperAdapter(BrokerAdapter):
             return status, data
         assert last_exc is not None
         raise last_exc
+
+    # -- write (identity guard) -----------------------------------------
+    def _verify_broker_identity_or_raise(self) -> None:
+        """Overrides `BrokerAdapter`'s no-op hook (security-remediation
+        unit, round 2, 2026-08-15) -- see `agent.broker.base.BrokerAdapter.
+        submit`'s own docstring for why this hook exists and why it is
+        called from `submit()`/`cancel()` themselves, before either does
+        anything else. THE DEFECT THIS CLOSES: round 1 (this module's own
+        "BROKER ACCOUNT IDENTITY BINDING" docstring section, immediately
+        below) only checked `_expected_broker_account_id` inside
+        `account()` -- so a caller that reached `submit()`/`cancel()`
+        without having called `.account()` first would mutate against
+        this account with the pin never verified at all. This codebase's
+        one real caller (`agent.approval_execution.
+        execute_approved_request`) happens to call `.account()` first
+        today (for its own drift-check purposes), so the check happened to
+        run before mutation in practice -- but nothing enforced that
+        ordering, and this hook is what now enforces it structurally
+        instead of by caller convention.
+
+        No-op when `_expected_broker_account_id is None` (unpinned --
+        preserves the exact existing compatibility behavior: only the
+        construction-time warning applies, mutation is never blocked on
+        identity when no pin is configured). When a pin IS configured,
+        calls `self.account()` -- REUSING the exact same identity check
+        `account()` itself already performs (not a second, independently
+        -drifting implementation) -- which raises
+        `AlpacaAccountIdentityMismatch` on any mismatch, a missing/absent
+        reported id, or any failure to complete the lookup at all (any
+        exception from `self._request`/`self.account()` propagates
+        uncaught, exactly like every other fail-closed check in this
+        module: an unverifiable identity is treated as a verification
+        failure, never as "skip the check"). This costs one extra
+        `GET /v2/account` round-trip on every mutating call made by a
+        caller that (like `execute_approved_request`) ALSO separately
+        calls `account()` for its own purposes -- accepted deliberately,
+        since a lighter-weight identity-only endpoint does not exist, and
+        correctness here matters more than saving one read-only,
+        already-cheap HTTP call per order."""
+        if self._expected_broker_account_id is not None:
+            self.account()
 
     # -- read ---------------------------------------------------------------
     def account(self) -> AccountSnapshot:

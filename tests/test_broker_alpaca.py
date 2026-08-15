@@ -643,6 +643,156 @@ def test_submit_genuine_422_with_no_resolvable_order_raises():
         a.submit(staged, approval_token=approved_token(staged))
 
 
+# --------------------------------- BROKER IDENTITY GUARD, CENTRALIZED (new)
+# (security-remediation unit, round 2, 2026-08-15) -- independent final
+# security validation flagged round 1's BROKER ACCOUNT IDENTITY BINDING
+# tests (above, "the reported id matches/does not match the pinned
+# expectation") as insufficient: they only proved `account()` itself
+# checks identity, never that `submit()`/`cancel()` verify it BEFORE
+# mutating. Every test below proves the mutating HTTP call (`POST
+# /v2/orders` / `DELETE /v2/orders/...`) is NEVER attempted when identity
+# verification fails -- directly against `t.calls`, not merely against the
+# raised exception type.
+
+def test_submit_never_posts_when_the_broker_identity_pin_mismatches():
+    """The load-bearing case: a pinned adapter whose FIRST transport call
+    (the identity-verification GET /v2/account, now made from inside
+    submit() itself before anything else) reports a DIFFERENT account id
+    than the pin. No idempotency GET, no POST -- t.calls has exactly the
+    one identity-check call, nothing more."""
+    from agent.broker.alpaca import AlpacaAccountIdentityMismatch
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(id="a-completely-different-account-uuid"))
+    gk = gatekeeper()
+    a = adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID)
+    a.attach_staging_key(gk.signing_key)
+    staged = staged_order(gk)
+    with pytest.raises(AlpacaAccountIdentityMismatch):
+        a.submit(staged, approval_token=approved_token(staged))
+    assert len(t.calls) == 1
+    assert t.calls[0]["method"] == "GET"
+    assert t.calls[0]["path"] == "https://paper-api.alpaca.markets/v2/account"
+
+
+def test_cancel_never_deletes_when_the_broker_identity_pin_mismatches():
+    from agent.broker.alpaca import AlpacaAccountIdentityMismatch
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(id="a-completely-different-account-uuid"))
+    gk = gatekeeper()
+    a = adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID)
+    a.attach_staging_key(gk.signing_key)
+    cancel_order = cancel_staged_order(gk)
+    with pytest.raises(AlpacaAccountIdentityMismatch):
+        a.cancel(cancel_order)
+    assert len(t.calls) == 1
+    assert t.calls[0]["method"] == "GET"
+    assert t.calls[0]["path"] == "https://paper-api.alpaca.markets/v2/account"
+
+
+def test_submit_never_posts_when_the_broker_identity_lookup_itself_fails():
+    """Not merely a mismatch -- the identity lookup ITSELF cannot be
+    completed at all (a transport-level failure on the identity GET).
+    `_verify_broker_identity_or_raise` does not swallow this; it
+    propagates uncaught, exactly like every other fail-closed check in
+    this module, and the mutating call is never reached."""
+    t = ScriptedTransport()
+    t.enqueue_error(TransportTimeout("slow"))
+    gk = gatekeeper()
+    a = adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID, max_retries=0)
+    a.attach_staging_key(gk.signing_key)
+    staged = staged_order(gk)
+    with pytest.raises(TransportError):
+        a.submit(staged, approval_token=approved_token(staged))
+    assert len(t.calls) == 1   # the one identity-GET attempt (recorded even
+    # though it errored) -- no retry (max_retries=0), and -- the actual
+    # point of this test -- no POST is ever attempted either.
+
+
+def test_submit_never_posts_when_the_broker_identity_response_is_malformed():
+    """The identity GET returns a non-2xx / unparseable response -- also
+    propagates uncaught from account(), also refuses before any mutation."""
+    t = ScriptedTransport()
+    t.enqueue(500, {"message": "internal error"})
+    gk = gatekeeper()
+    a = adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID, max_retries=0)
+    a.attach_staging_key(gk.signing_key)
+    staged = staged_order(gk)
+    with pytest.raises(AlpacaError):
+        a.submit(staged, approval_token=approved_token(staged))
+    assert len(t.calls) == 1
+
+
+def test_submit_succeeds_when_the_broker_identity_pin_matches():
+    """Positive control: identity verified first (one extra GET
+    /v2/account, matching the pin), THEN the existing idempotency-check
+    GET, THEN the POST -- three calls total, in that exact order, proving
+    the new guard composes with the pre-existing submit() flow rather than
+    replacing or reordering it."""
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(id=REAL_ACCOUNT_UUID))       # identity check
+    t.enqueue(404, {"message": "not found"})                 # idempotency GET
+    t.enqueue(200, order_json(client_order_id="c1", status="filled"))  # POST
+    gk = gatekeeper()
+    a = adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID)
+    a.attach_staging_key(gk.signing_key)
+    staged = staged_order(gk)
+    order = a.submit(staged, approval_token=approved_token(staged))
+    assert order.status == "filled"
+    assert len(t.calls) == 3
+    assert t.calls[0]["path"] == "https://paper-api.alpaca.markets/v2/account"
+    assert t.calls[1]["method"] == "GET"
+    assert t.calls[2]["method"] == "POST"
+
+
+def test_cancel_succeeds_when_the_broker_identity_pin_matches():
+    t = ScriptedTransport()
+    t.enqueue(200, account_json(id=REAL_ACCOUNT_UUID))                  # identity check
+    t.enqueue(200, order_json(client_order_id="c1", status="new"))      # lookup
+    t.enqueue(204, {})                                                   # DELETE
+    t.enqueue(200, order_json(client_order_id="c1", status="canceled")) # re-fetch
+    gk = gatekeeper()
+    a = adapter(t, expected_broker_account_id=REAL_ACCOUNT_UUID)
+    a.attach_staging_key(gk.signing_key)
+    cancel_order = cancel_staged_order(gk)
+    result = a.cancel(cancel_order)
+    assert result.status == "canceled"
+    assert len(t.calls) == 4
+    assert t.calls[0]["path"] == "https://paper-api.alpaca.markets/v2/account"
+
+
+def test_submit_with_no_pin_configured_makes_no_extra_identity_call():
+    """Preserves the CURRENT unpinned compatibility behavior exactly
+    (explicit requirement): with no `expected_broker_account_id` set, the
+    new hook is a no-op -- call count/order is IDENTICAL to before this
+    fix (idempotency GET, then POST; no identity GET at all)."""
+    t = ScriptedTransport()
+    t.enqueue(404, {"message": "not found"})
+    t.enqueue(200, order_json(client_order_id="c1", status="filled"))
+    gk = gatekeeper()
+    a = adapter(t)   # expected_broker_account_id defaults to None
+    a.attach_staging_key(gk.signing_key)
+    staged = staged_order(gk)
+    order = a.submit(staged, approval_token=approved_token(staged))
+    assert order.status == "filled"
+    assert len(t.calls) == 2
+    assert t.calls[0]["method"] == "GET"
+    assert t.calls[1]["method"] == "POST"
+
+
+def test_cancel_with_no_pin_configured_makes_no_extra_identity_call():
+    t = ScriptedTransport()
+    t.enqueue(200, order_json(client_order_id="c1", status="new"))
+    t.enqueue(204, {})
+    t.enqueue(200, order_json(client_order_id="c1", status="canceled"))
+    gk = gatekeeper()
+    a = adapter(t)   # expected_broker_account_id defaults to None
+    a.attach_staging_key(gk.signing_key)
+    cancel_order = cancel_staged_order(gk)
+    result = a.cancel(cancel_order)
+    assert result.status == "canceled"
+    assert len(t.calls) == 3   # unchanged from test_cancel_looks_up_broker_order_id_then_deletes_by_it
+
+
 # ------------------------------------------------------------------ cancel()
 
 def cancel_staged_order(gk, *, client_order_id="c1", symbol="SPY", order_type="LIMIT",
