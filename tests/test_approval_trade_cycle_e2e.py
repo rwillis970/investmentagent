@@ -265,7 +265,12 @@ def test_full_paper_approval_and_trade_cycle(tmp_path):
     approve_result = route_request(
         runtime, method="POST", path=f"/api/approval/{request_id}/approve",
         body=json.dumps({"actor": "operator"}).encode("utf-8"),
-        headers={"Cookie": f"{CSRF_COOKIE_NAME}={runtime.csrf_token}"},
+        headers={
+                "Cookie": f"{CSRF_COOKIE_NAME}={runtime.csrf_token}",
+                # EXACT-ORIGIN ALLOWLIST, ROUND 2 -- see the identical
+                # comment on this file's other inline csrf headers dict.
+                "Origin": "http://127.0.0.1:8765",
+            },
     )
     assert approve_result.status == 200
     approve_body = json.loads(approve_result.body)
@@ -460,7 +465,16 @@ def test_a_second_approve_after_execution_is_a_replay_not_a_re_execution(tmp_pat
         audit_log=audit_log, account_id=ACCT,
         now_fn=lambda: NOW + timedelta(seconds=15),
     )
-    csrf = {"Cookie": f"{CSRF_COOKIE_NAME}={runtime.csrf_token}"}
+    csrf = {
+        "Cookie": f"{CSRF_COOKIE_NAME}={runtime.csrf_token}",
+        # EXACT-ORIGIN ALLOWLIST, ROUND 2 (security-remediation unit,
+        # 2026-08-15) -- Origin is now mandatory on a state-changing
+        # dashboard request, matching DashboardRuntime.allowed_origins'
+        # own default (agent.dashboard_server._dashboard_allowed_origins /
+        # _DASHBOARD_DEFAULT_PORT); this runtime was built directly
+        # (not via make_server), so it still carries that default set.
+        "Origin": "http://127.0.0.1:8765",
+    }
     first = route_request(runtime, method="POST", path=f"/api/approval/{request_id}/approve",
                           body=json.dumps({"actor": "operator"}).encode("utf-8"), headers=csrf)
     second = route_request(runtime, method="POST", path=f"/api/approval/{request_id}/approve",

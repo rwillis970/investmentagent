@@ -201,19 +201,40 @@ def mode_store_path(tmp_path, *, mode="PAPER", changed_at=NOW - timedelta(days=1
 
 
 def runtime_status_path(tmp_path, *, now, reconciliation_status="PASS",
-                        generated_at=None, filename="runtime_status.json"):
+                        generated_at=None, filename="runtime_status.json",
+                        account_id=ACCT, source="cycle",
+                        positions_reconciled=True, cash_reconciled=True,
+                        open_orders_reconciled=True, reconciliation_at=None,
+                        omit_reconciliation_at=False):
     """`generated_at` defaults to `now` itself -- i.e. maximally fresh, so
     the ONLY way a test's snapshot reads as stale is if it deliberately
     passes a `generated_at` far enough in the past (see the new staleness
-    test below)."""
+    test below).
+
+    ROUND-2 PARAMS (security-remediation unit, 2026-08-15) -- `account_id`,
+    `source`, `positions_reconciled`/`cash_reconciled`/`open_orders_
+    reconciled`, and `reconciliation_at` all default to exactly what a REAL
+    `"cycle"`/`"reconcile_once"` producer would write for a genuinely
+    healthy, complete, account-matched reconciliation (see agent/
+    runtime_status.py's own two real writers in scripts/run_agent.py) --
+    every EXISTING call site in this file that does not override these new
+    params keeps testing exactly what it always tested, unaffected by the
+    round-2 completeness checks. The new adversarial tests below override
+    exactly one of these at a time to prove each new check independently
+    refuses. `omit_reconciliation_at=True` writes `reconciliation_at=None`
+    while still claiming `reconciliation_status="PASS"` -- the "internally
+    incomplete" case."""
     p = tmp_path / filename
     gen = generated_at if generated_at is not None else now
+    recon_at = None if omit_reconciliation_at else (
+        reconciliation_at if reconciliation_at is not None else gen)
     status = runtime_status_module.RuntimeStatus(
-        generated_at=gen, account_id=ACCT, mode="PAPER", process_status="running",
-        source="cycle", market_session_state="OPEN", next_session_open=None,
+        generated_at=gen, account_id=account_id, mode="PAPER", process_status="running",
+        source=source, market_session_state="OPEN", next_session_open=None,
         broker_snapshot_status="PASS", broker_snapshot_at=gen,
-        reconciliation_status=reconciliation_status, reconciliation_at=gen,
-        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        reconciliation_status=reconciliation_status, reconciliation_at=recon_at,
+        positions_reconciled=positions_reconciled, cash_reconciled=cash_reconciled,
+        open_orders_reconciled=open_orders_reconciled,
         last_successful_cycle_at=gen, last_failure_at=None, last_failure_type=None,
         recovered_at=None, collection_last_success_at=None, screen_last_success_at=None,
         unavailable_reasons={},
@@ -223,18 +244,28 @@ def runtime_status_path(tmp_path, *, now, reconciliation_status="PASS",
 
 
 def gate_kwargs(tmp_path, *, now=DECIDE_AT + timedelta(seconds=10), mode="PAPER",
-                reconciliation_status="PASS", generated_at=None):
+                reconciliation_status="PASS", generated_at=None,
+                account_id=ACCT, source="cycle", positions_reconciled=True,
+                cash_reconciled=True, open_orders_reconciled=True,
+                reconciliation_at=None, omit_reconciliation_at=False):
     """The passing pair, splatted into every existing call site below --
     `**gate_kwargs(tmp_path)` for the common default-broker-clock case,
     `**gate_kwargs(tmp_path, now=OUTSIDE_SESSION)` etc. when a test uses a
     non-default broker `now`, so the new gate reads as fresh relative to
     THAT instant rather than going stale purely as an artifact of adding
-    it, unrelated to what the test itself is proving."""
+    it, unrelated to what the test itself is proving. The round-2 kwargs
+    all default to the same "genuinely healthy" values `runtime_status_
+    path` itself defaults to -- see that function's own docstring."""
     return {
         "mode_store_path": mode_store_path(tmp_path, mode=mode),
         "runtime_status_path": runtime_status_path(
             tmp_path, now=now, reconciliation_status=reconciliation_status,
-            generated_at=generated_at,
+            generated_at=generated_at, account_id=account_id, source=source,
+            positions_reconciled=positions_reconciled,
+            cash_reconciled=cash_reconciled,
+            open_orders_reconciled=open_orders_reconciled,
+            reconciliation_at=reconciliation_at,
+            omit_reconciliation_at=omit_reconciliation_at,
         ),
     }
 
@@ -828,6 +859,178 @@ def test_a_fully_valid_approval_cannot_submit_when_reconciliation_snapshot_is_st
             result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
             quote_provider=lambda symbol: 100.0,
             **gate_kwargs(tmp_path, now=stale_now, generated_at=stale_generated_at),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+# --------------------------------------- RECONCILIATION GATE, ROUND 2 (new)
+# (security-remediation unit, 2026-08-15) -- independent final security
+# validation flagged round 1's `_reconciliation_is_fresh` as an INCOMPLETE
+# authoritative authorization check: it trusted a single rolled-up
+# `reconciliation_status == "PASS"` string with no account binding, no
+# distinction between which producer wrote it, and no cross-check against
+# the granular per-component flags. Every test below is otherwise a FULLY
+# VALID PAPER-mode approval (the exact `_no_trade_setup`/`gate_kwargs`
+# positive-control shape) with exactly ONE round-2 field perturbed --
+# proving each new check independently refuses, directly against the
+# adapter.submit call count, not merely against the exception type.
+
+def test_a_fully_valid_approval_cannot_submit_when_runtime_status_belongs_to_a_different_account(tmp_path):
+    """The literal named gap: round 1 accepted ANY parseable, PASSing
+    runtime_status.json regardless of which account it actually describes.
+    `_no_trade_setup`'s adapter/broker is `account_id=ACCT`; this snapshot
+    claims to be for a different account entirely."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="does not match"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, account_id="acct-some-other-account"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_reconciliation_source_is_diagnostic_only(tmp_path):
+    """A `source="diagnostic"` snapshot never calls sync_fills/run_startup
+    (see agent/runtime_status.py's own module docstring) -- real evidence
+    the system is not currently broken, but not sufficient authorization
+    for a BRAND NEW submission. Only "cycle"/"reconcile_once" authorize."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="not an authoritative"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, source="diagnostic"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_submits_normally_with_reconcile_once_source(tmp_path):
+    """Positive control for the source allowlist: "reconcile_once" IS
+    authoritative (it genuinely polls the broker and reconciles, per
+    agent/runtime_status.py's own module docstring) -- proves the
+    allowlist is {cycle, reconcile_once}, not "cycle" alone."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    order = execute_approved_request(
+        result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+        quote_provider=lambda symbol: 100.0,
+        **gate_kwargs(tmp_path, source="reconcile_once"),
+    )
+    assert order.status == "filled"
+    spy.assert_called_once()
+
+
+def test_a_fully_valid_approval_cannot_submit_when_positions_reconciled_flag_is_false(tmp_path):
+    """The rolled-up reconciliation_status string still says "PASS", but
+    one granular component flag disagrees -- an internally inconsistent,
+    incomplete snapshot, refused even though round 1's single-string check
+    alone would have accepted it."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="not all explicitly True"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, positions_reconciled=False),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_cash_reconciled_flag_is_none(tmp_path):
+    """`None` (never actually determined) is refused exactly like `False`
+    -- "is not True" catches both, not just an explicit False."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="not all explicitly True"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, cash_reconciled=None),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_open_orders_reconciled_flag_is_false(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="not all explicitly True"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, open_orders_reconciled=False),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_reconciliation_at_is_missing_despite_pass(tmp_path):
+    """reconciliation_status="PASS" with no recorded reconciliation_at at
+    all -- an internally incomplete snapshot, refused before the staleness
+    checks even run (there is nothing to check staleness against)."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="reconciliation_at is unset"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, omit_reconciliation_at=True),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_reconciliation_at_is_stale_but_generated_at_is_fresh(tmp_path):
+    """The distinction round 1 could not draw at all: `generated_at` is
+    maximally fresh (the document was just (re)written), but
+    `reconciliation_at` -- the instant the reconciliation ITSELF actually
+    completed -- is over a day old. Simulates a hypothetical future
+    producer that re-stamps this file on some other cadence without
+    re-running reconciliation; round 1's `generated_at`-only staleness
+    check would have accepted this."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    now = DECIDE_AT + timedelta(seconds=10)
+    stale_reconciliation_at = now - timedelta(days=2)
+    with pytest.raises(ReconciliationNotFresh, match="reconciliation_at.*stale"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, now=now, generated_at=now,
+                          reconciliation_at=stale_reconciliation_at),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_reconciliation_status_is_an_unrecognized_string(tmp_path):
+    """Neither PASS, WARN, FAIL, nor UNAVAILABLE -- a hypothetical future
+    enum value (e.g. an in-progress marker) this function predates. The
+    allowlist shape (`== "PASS"`, not a WARN/FAIL/UNAVAILABLE blocklist)
+    means this refuses automatically, with no code change needed to stay
+    fail-closed against a value that does not exist yet today."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="IN_PROGRESS"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, reconciliation_status="IN_PROGRESS"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_runtime_status_json_is_malformed(tmp_path):
+    """Genuinely corrupt JSON on disk -- not merely a recognized-but-wrong
+    value -- must refuse via the same generic `except Exception` path as
+    an unreadable ModeStore does, not crash `execute_approved_request`
+    itself with an uncaught JSONDecodeError."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    paths = gate_kwargs(tmp_path)
+    Path(paths["runtime_status_path"]).write_text("{not valid json")
+    with pytest.raises(ReconciliationNotFresh, match="could not read"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0, **paths,
         )
     spy.assert_not_called()
     assert token.consumed_at is None

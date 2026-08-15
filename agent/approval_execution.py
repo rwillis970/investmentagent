@@ -136,6 +136,63 @@ every case, `adapter.submit` is asserted NEVER called (a scripted adapter
 records calls; the assertion is on that record, not merely the raised
 exception type) and the token remains unconsumed.
 
+MODE + RECONCILIATION GATE, ROUND 2 (security-remediation unit, 2026-08-15;
+independent final security validation flagged round 1 above as
+INCOMPLETE). THE GAP ROUND 1 LEFT: `_reconciliation_is_fresh` trusted a
+SINGLE rolled-up `reconciliation_status == "PASS"` string plus a single
+`generated_at`-based staleness check, and nothing else -- it never verified
+the snapshot actually belonged to the account being submitted for, never
+distinguished which of `agent.runtime_status`'s THREE PRODUCERS wrote it
+(a `"diagnostic"` run -- which never calls `sync_fills`/`run_startup` and
+by that module's own docstring "never confirms a genuinely NEW execution
+would be picked up and reconciled correctly" -- was accepted exactly the
+same as a real `"cycle"`/`"reconcile_once"` pass), never cross-checked the
+granular `positions_reconciled`/`cash_reconciled`/`open_orders_reconciled`
+flags against the top-level string they are supposed to summarize, and
+staleness was judged only by "was this document touched recently"
+(`generated_at`), never "was the reconciliation ITSELF recent"
+(`reconciliation_at`). Four closed, independent gaps, all inside
+`_reconciliation_is_fresh` (see that function's own docstring for the
+complete, itemized list of every check it now performs, in order):
+
+  1. ACCOUNT BINDING -- `status.account_id` must equal `adapter.
+     account_id`. Round 1 would accept ANY parseable, PASSing file at
+     `runtime_status_path`, including one belonging to a different
+     account in a multi-account deployment, or a caller-controlled/
+     fabricated file with no real connection to this submission's own
+     account at all.
+  2. AUTHORITATIVE SOURCE ONLY -- `status.source` must be `"cycle"` or
+     `"reconcile_once"` (`_RECONCILIATION_AUTHORITATIVE_SOURCES`), never
+     `"diagnostic"`. A read-only diagnostic pass is real evidence the
+     system is not currently broken, but -- per `agent.runtime_status`'s
+     own module docstring -- it is not the same claim as evidence that a
+     BRAND NEW submission's resulting fill would be correctly picked up;
+     it is no longer sufficient to authorize one.
+  3. GRANULAR COMPLETENESS -- `positions_reconciled`, `cash_reconciled`,
+     AND `open_orders_reconciled` must all be identically `True`
+     (`is not True` also catches `None`), not merely "the top-level
+     string happens to say PASS." A document where these disagree is
+     exactly the "incomplete... reconciliation state" this fix's own
+     requirement names, and is refused even though round 1's single-
+     string check would have passed it.
+  4. RECONCILIATION-INSTANT STALENESS, SEPARATELY FROM DOCUMENT
+     STALENESS -- `reconciliation_at` is now checked against `agent.
+     runtime_status.DEFAULT_STALE_AFTER` on its own, in addition to the
+     existing `generated_at`-based `is_stale` check. Every producer in
+     this codebase sets both fields identically today, so this changes
+     nothing for a real snapshot -- but "the file was touched recently"
+     and "the reconciliation itself is recent" are not structurally
+     guaranteed to be the same claim, and this closes that gap rather
+     than assuming the convention holds forever.
+
+NO NEW PARAMETER ON `execute_approved_request` ITSELF. `account_id` is
+derived from `adapter.account_id` (a required attribute on every concrete
+`BrokerAdapter`, set in `BrokerAdapter.__init__` and independently relied
+on by `_verify_staged_or_raise`'s own cross-account check) at the one call
+site inside this function, not accepted as a new caller-suppliable
+argument -- there is no new surface for a caller to get this wrong or
+override it.
+
 NEVER RESUBMIT TO FIND OUT -- NOW DEFENSE-IN-DEPTH, NOT THE MECHANISM
 (`agent.broker.base.BrokerAdapter.get_by_client_id`'s own docstring;
 demoted by the durable-consumption unit, 2026-08-09, item 3 of that unit's
@@ -390,12 +447,18 @@ class ModeNotPermitted(ExecutionError):
 class ReconciliationNotFresh(ExecutionError):
     """`execute_approved_request` refused to submit because `agent.
     runtime_status`, read fresh at the instant of submission, is missing,
-    not `reconciliation_status == "PASS"`, or stale per `agent.
-    runtime_status.is_stale`. See module docstring's "MODE + RECONCILIATION
-    GATE" section (security-remediation unit, 2026-08-15). No override
-    exists; an operator who believes reconciliation is actually healthy
-    must run `--reconcile-once` (or wait for the next scheduled cycle) to
-    produce a fresh, PASSing snapshot -- never bypass this check."""
+    bound to a different account, sourced from a non-authoritative
+    producer (`"diagnostic"`), not `reconciliation_status == "PASS"`,
+    internally incomplete (a granular positions_reconciled/cash_reconciled/
+    open_orders_reconciled flag is not explicitly True even though the
+    top-level string says PASS), or stale -- checked against BOTH
+    `reconciliation_at` and `generated_at` independently. See module
+    docstring's "MODE + RECONCILIATION GATE" and "..., ROUND 2" sections
+    (security-remediation unit, 2026-08-15). No override exists; an
+    operator who believes reconciliation is actually healthy must run
+    `--reconcile-once` (or wait for the next scheduled cycle) to produce a
+    fresh, complete, PASSing, account-matched snapshot -- never bypass
+    this check."""
 
 
 class QuoteUnavailable(ExecutionError):
@@ -453,16 +516,83 @@ def _mode_permits_submission(mode_store_path: str | Path) -> tuple[bool, str]:
     return True, ""
 
 
+# ROUND 2 (security-remediation unit, 2026-08-15) -- see module docstring's
+# "MODE + RECONCILIATION GATE, ROUND 2" section for the full defect/fix
+# writeup this closes against round 1 above. Only these two `RuntimeStatus.
+# source` values ever perform a REAL broker read plus exact reconciliation
+# (`agent.runtime_status`'s own module docstring, "THREE PRODUCERS, ONE
+# SHAPE" -- verbatim: "diagnostic" "never confirms a genuinely NEW
+# execution would be picked up and reconciled correctly, only that
+# everything already on record still agrees"). A `"diagnostic"` snapshot is
+# real, valuable evidence for a human reading the dashboard, but it is not
+# sufficient AUTHORIZATION for a brand-new broker submission this function
+# is about to make -- it never calls `sync_fills`, so it cannot actually
+# confirm the fill this submission produces would be correctly picked up.
+_RECONCILIATION_AUTHORITATIVE_SOURCES = frozenset({"cycle", "reconcile_once"})
+
+
 def _reconciliation_is_fresh(runtime_status_path: str | Path, *,
-                             now: datetime) -> tuple[bool, str]:
+                             now: datetime, account_id: str) -> tuple[bool, str]:
     """Reads `agent.runtime_status` FRESH from `runtime_status_path` at
-    `now` -- see module docstring's "MODE + RECONCILIATION GATE" section.
-    Refuses on: an unreadable/corrupt file (any exception), a file that
-    has never been written (`read()` returns `None`), a recorded
-    `reconciliation_status` that is not exactly `"PASS"`, or a PASSing
-    snapshot that is nonetheless stale per `runtime_status_module.
-    is_stale` (the SAME shared staleness definition the dashboard already
-    uses -- not a new threshold invented here)."""
+    `now` -- see module docstring's "MODE + RECONCILIATION GATE" section
+    for round 1, and "MODE + RECONCILIATION GATE, ROUND 2" for the
+    completeness gaps closed here. Refuses (fail closed) on every one of:
+
+      - an unreadable/malformed file (any exception -- corrupt JSON, a
+        missing required key, an undecodable timestamp)
+      - a file that has never been written (`read()` returns `None`)
+      - `account_id` MISMATCH -- `status.account_id != account_id`. Round 1
+        never checked this: a caller-supplied `runtime_status_path`
+        pointing at ANY file that happens to parse and say PASS -- another
+        account's genuinely-fresh snapshot, or a fabricated one -- was
+        accepted as authorization for THIS account's submission. This
+        function is always called with `account_id=adapter.account_id`
+        (the same identity `BrokerAdapter._verify_staged_or_raise`
+        independently enforces `staged.account_id` against before ever
+        touching the broker), so this closes the same cross-account
+        confusion class that check already guards against, applied to
+        reconciliation evidence instead of order fields.
+      - `source` not in `_RECONCILIATION_AUTHORITATIVE_SOURCES` -- a
+        `"diagnostic"` (or any future, unrecognized) source never performs
+        a real broker read plus reconciliation and is not treated as
+        sufficient authorization for a NEW submission; see this function's
+        own module-level constant comment immediately above.
+      - `reconciliation_status` not exactly `"PASS"` -- WARN/FAIL/
+        UNAVAILABLE/an in-progress marker/any unrecognized string all
+        refuse identically; this is an ALLOWLIST-shaped comparison (`==
+        "PASS"`), not a blocklist, so a semantically unrecognized future
+        value fails closed automatically, the same shape already used for
+        `_SUBMISSION_PERMITTED_MODES`.
+      - `reconciliation_at is None` -- `reconciliation_status == "PASS"`
+        with no recorded instant the reconciliation itself completed is an
+        internally INCOMPLETE snapshot, never trusted regardless of what
+        the top-level string claims.
+      - `positions_reconciled`, `cash_reconciled`, or `open_orders_
+        reconciled` not identically `True` (`is not True` -- catches both
+        `False` and `None`) -- round 1 trusted the single rolled-up
+        `reconciliation_status` string alone; nothing enforced that it
+        actually agreed with the three granular per-component flags this
+        same document also carries. A file where the top-level string says
+        PASS but a component flag is `False`/`None`/missing is exactly the
+        "incomplete... reconciliation state" this fix's own requirement
+        names -- refused here even though `reconciliation_status` alone
+        would have passed round 1's check.
+      - `reconciliation_at` itself is stale (more than `runtime_status_
+        module.DEFAULT_STALE_AFTER` old) -- checked SEPARATELY from
+        `generated_at` staleness below. Every producer in this codebase
+        today sets both fields to the identical instant, so this costs
+        nothing for real snapshots -- but nothing enforces that as a
+        structural invariant, and "the document was touched recently" is
+        not the same claim as "the reconciliation itself is recent." A
+        future producer that re-writes/re-stamps this file on some other
+        cadence without re-running reconciliation would have `generated_at`
+        look artificially fresh while the reconciliation evidence itself
+        silently rots -- this is the literal "not merely a present or
+        recent status file" distinction the round-2 requirement names.
+      - `generated_at` staleness (`runtime_status_module.is_stale`, the
+        SAME shared definition the dashboard already uses) -- kept,
+        unchanged from round 1, as the existing outer check.
+    """
     try:
         status = runtime_status_module.read(runtime_status_path)
     except Exception as exc:   # noqa: BLE001 -- fail closed on ANY read failure
@@ -472,10 +602,49 @@ def _reconciliation_is_fresh(runtime_status_path: str | Path, *,
             "no runtime_status.json has ever been written -- reconciliation "
             "health cannot be confirmed"
         )
+    if status.account_id != account_id:
+        return False, (
+            f"runtime_status.json's account_id ({status.account_id!r}) does "
+            f"not match this submission's account ({account_id!r}) -- "
+            "refusing to accept another account's (or a fabricated) "
+            "reconciliation snapshot as authorization for this submission"
+        )
+    if status.source not in _RECONCILIATION_AUTHORITATIVE_SOURCES:
+        return False, (
+            f"runtime_status.json source={status.source!r} is not an "
+            f"authoritative reconciliation-performing producer (only "
+            f"{sorted(_RECONCILIATION_AUTHORITATIVE_SOURCES)} actually poll "
+            "the broker and perform exact reconciliation -- see agent."
+            "runtime_status's own module docstring); not sufficient "
+            "authorization for a new submission"
+        )
     if status.reconciliation_status != "PASS":
         return False, (
             f"last recorded reconciliation_status is "
             f"{status.reconciliation_status!r}, not PASS"
+        )
+    if status.reconciliation_at is None:
+        return False, (
+            "reconciliation_status reports PASS but reconciliation_at is "
+            "unset -- an incomplete/inconsistent snapshot, never trusted"
+        )
+    if (status.positions_reconciled is not True
+            or status.cash_reconciled is not True
+            or status.open_orders_reconciled is not True):
+        return False, (
+            "reconciliation_status reports PASS but the individual "
+            f"components are not all explicitly True (positions_reconciled="
+            f"{status.positions_reconciled!r}, cash_reconciled="
+            f"{status.cash_reconciled!r}, open_orders_reconciled="
+            f"{status.open_orders_reconciled!r}) -- an incomplete/"
+            "inconsistent snapshot, never trusted regardless of the "
+            "top-level status string"
+        )
+    if (now - status.reconciliation_at) > runtime_status_module.DEFAULT_STALE_AFTER:
+        return False, (
+            f"reconciliation_at ({status.reconciliation_at.isoformat()}) is "
+            f"stale (now={now.isoformat()}) -- checked independently of "
+            "generated_at staleness below"
         )
     if runtime_status_module.is_stale(status, now=now):
         return False, (
@@ -670,7 +839,8 @@ def execute_approved_request(
             "value all refuse, fail-closed, by design. No override exists."
         )
 
-    fresh_ok, fresh_reason = _reconciliation_is_fresh(runtime_status_path, now=now)
+    fresh_ok, fresh_reason = _reconciliation_is_fresh(
+        runtime_status_path, now=now, account_id=adapter.account_id)
     if not fresh_ok:
         raise ReconciliationNotFresh(
             f"request {request_id}: refusing to submit -- {fresh_reason}. "
