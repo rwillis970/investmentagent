@@ -386,3 +386,68 @@ def test_save_is_atomic_no_tmp_file_left_behind(tmp_path):
     save(path, record_failure(None, exc_type="RuntimeError", message="x", now=T0))
     leftovers = [p for p in tmp_path.iterdir() if p.name != "failure_sentinel.json"]
     assert leftovers == []
+
+
+# ---------------------------------------------- recovered_by (PAUSED-reconcile-follow-up runtime-status unit, 2026-08-14)
+
+def test_a_fresh_failure_record_has_no_recovered_by():
+    rec = record_failure(None, exc_type="RuntimeError", message="boom", now=T0)
+    assert rec.recovered_by is None
+
+
+def test_mark_recovered_records_which_producer_recovered_it(tmp_path):
+    """Three real producers exist (agent/runtime_status.py's own THREE
+    PRODUCERS section): a scheduled cycle, a read-only diagnostic run, and
+    --reconcile-once. Each passes its own `recovered_by` value through to
+    the durable record, so an operator reading failure_sentinel.json can
+    tell which one actually cleared a given incident."""
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    save(path, record_failure(None, exc_type="TypeError", message="x", now=T0))
+    result = mark_recovered(path, now=T0 + timedelta(hours=1), recovered_by="reconcile_once")
+    assert result.recovered_by == "reconcile_once"
+    assert load(path).recovered_by == "reconcile_once"
+
+
+def test_mark_recovered_without_recovered_by_defaults_to_none(tmp_path):
+    """The parameter is optional -- an existing caller that never passes it
+    (or a future one that genuinely doesn't know) still works exactly as
+    before this field existed."""
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    save(path, record_failure(None, exc_type="RuntimeError", message="x", now=T0))
+    result = mark_recovered(path, now=T0 + timedelta(hours=1))
+    assert result.recovered_by is None
+
+
+def test_mark_recovered_idempotent_call_does_not_overwrite_recovered_by(tmp_path):
+    """Mirrors test_mark_recovered_is_idempotent_and_preserves_the_original_
+    recovered_at above: a SECOND mark_recovered call (e.g. a diagnostic run
+    re-checking an already-recovered incident) must not silently relabel
+    which producer originally recovered it."""
+    from agent.failure_sentinel import mark_recovered
+    path = tmp_path / "failure_sentinel.json"
+    save(path, record_failure(None, exc_type="RuntimeError", message="x", now=T0))
+    first = mark_recovered(path, now=T0 + timedelta(hours=1), recovered_by="reconcile_once")
+    second = mark_recovered(path, now=T0 + timedelta(hours=5), recovered_by="diagnostic")
+    assert first.recovered_by == "reconcile_once"
+    assert second.recovered_by == "reconcile_once"   # NOT overwritten to "diagnostic"
+    assert load(path).recovered_by == "reconcile_once"
+
+
+def test_load_of_an_old_format_file_with_no_recovered_by_key_defaults_to_none(tmp_path):
+    """BACKWARD COMPATIBLE, same convention as status/recovered_at: a
+    sentinel already RECOVERED before this field existed reads back with
+    recovered_by=None, never a fabricated guess at which producer did it."""
+    import json
+    path = tmp_path / "failure_sentinel.json"
+    old_format = {
+        "exc_type": "TypeError", "message": "string indices must be integers",
+        "first_at": T0.isoformat(), "last_at": T0.isoformat(),
+        "consecutive_count": 386, "status": "recovered",
+        "recovered_at": (T0 + timedelta(hours=2)).isoformat(),
+    }
+    path.write_text(json.dumps(old_format))
+    loaded = load(path)
+    assert loaded.status == "recovered"
+    assert loaded.recovered_by is None

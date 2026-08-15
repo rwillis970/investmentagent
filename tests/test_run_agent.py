@@ -100,6 +100,7 @@ def test_main_returns_nonzero_and_logs_when_the_loop_raises(tmp_path, caplog):
         "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
         "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
+        "--opportunity-event-store-path", str(tmp_path / "materiality_events.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -135,6 +136,7 @@ def test_main_calls_run_loop_with_the_configured_cadence_and_mode(tmp_path):
         "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
         "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
+        "--opportunity-event-store-path", str(tmp_path / "materiality_events.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
     ]
@@ -406,6 +408,7 @@ def test_main_wires_a_durable_audit_log_bound_to_the_given_path(tmp_path):
         "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
         "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
+        "--opportunity-event-store-path", str(tmp_path / "materiality_events.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]
@@ -443,6 +446,7 @@ def _argv(tmp_path, config_path):
         "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
         "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
+        "--opportunity-event-store-path", str(tmp_path / "materiality_events.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
         "--runtime-status-path", str(tmp_path / "runtime_status.json"),
@@ -563,6 +567,7 @@ def test_sentinel_path_is_derived_from_audit_log_path(tmp_path):
         "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
         "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
+        "--opportunity-event-store-path", str(tmp_path / "materiality_events.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.json"),
         "--audit-log-path", str(audit_path),
     ]
@@ -1534,6 +1539,7 @@ def test_data_dir_is_never_created_when_every_store_path_is_given_explicitly(tmp
         "--analysis-result-store-path", str(tmp_path / "analysis_results.jsonl"),
         "--approval-request-store-path", str(tmp_path / "approval_requests.jsonl"),
         "--opportunity-tracker-path", str(tmp_path / "opportunity_tracker.jsonl"),
+        "--opportunity-event-store-path", str(tmp_path / "materiality_events.jsonl"),
         "--mode-store-path", str(tmp_path / "mode.jsonl"),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
         "--runtime-status-path", str(tmp_path / "runtime_status.json"),
@@ -3437,3 +3443,246 @@ def test_reconcile_once_introduces_no_settled_cash_tolerance_while_paused(tmp_pa
     code = main(argv, secrets_provider_factory=_secrets_provider_factory,
                now_fn=lambda: _RO_OUT_OF_SESSION)
     assert code == 1   # a real cent of drift is still a halt, not a pass
+
+
+# --------------------------------- runtime_status/failure_sentinel provenance (Track A, 2026-08-14)
+#
+# --reconcile-once now writes a durable data/runtime_status.json snapshot
+# (source="reconcile_once", NEVER "cycle") on success, and -- reusing the
+# SAME agent.failure_sentinel.mark_recovered mechanism the scheduled loop
+# and the read-only diagnostic already use -- may recover an active
+# failure sentinel, recorded with recovered_by="reconcile_once". See
+# scripts/run_agent.py's own _run_reconcile_once docstring and agent/
+# runtime_status.py's own THREE PRODUCERS section for the full reasoning.
+
+def test_reconcile_once_writes_a_runtime_status_snapshot_sourced_reconcile_once(
+    tmp_path, monkeypatch,
+):
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+
+    status = runtime_status_module.read(data_dir / "runtime_status.json")
+    assert status is not None
+    assert status.source == "reconcile_once"
+    assert status.source != "cycle"   # never conflated with a real scheduled cycle
+    assert status.account_id == _RO_ACCT
+    assert status.mode == "PAUSED"
+    assert status.reconciliation_status == "PASS"
+    assert status.positions_reconciled is True
+    assert status.cash_reconciled is True
+    assert status.open_orders_reconciled is True
+    # Never runs collection/screen -- both explicitly unavailable, never guessed.
+    assert status.collection_last_success_at is None
+    assert status.screen_last_success_at is None
+    assert "collection_last_success_at" in status.unavailable_reasons
+    assert "screen_last_success_at" in status.unavailable_reasons
+
+
+def test_reconcile_once_never_fabricates_last_successful_cycle_at_when_never_set(
+    tmp_path, monkeypatch,
+):
+    """No prior runtime_status.json at all -- last_successful_cycle_at must
+    stay null, with an explicit reason, never invented from this run's own
+    success."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+    status = runtime_status_module.read(data_dir / "runtime_status.json")
+    assert status.last_successful_cycle_at is None
+    assert "last_successful_cycle_at" in status.unavailable_reasons
+
+
+def test_reconcile_once_carries_forward_a_real_prior_last_successful_cycle_at(
+    tmp_path, monkeypatch,
+):
+    """A prior REAL scheduled cycle already set last_successful_cycle_at --
+    --reconcile-once must preserve that true fact, not overwrite it with
+    null just because THIS run cannot itself confirm a scheduled cycle."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    real_cycle_at = _RO_OUT_OF_SESSION - timedelta(days=2)
+    prior_status = runtime_status_module.RuntimeStatus(
+        generated_at=real_cycle_at, account_id=_RO_ACCT, mode="PAPER",
+        process_status="running", source="cycle",
+        market_session_state="OPEN", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=real_cycle_at,
+        reconciliation_status="PASS", reconciliation_at=real_cycle_at,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=real_cycle_at,
+        last_failure_at=None, last_failure_type=None, recovered_at=None,
+        collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    )
+    runtime_status_module.write_atomic(data_dir / "runtime_status.json", prior_status)
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+    status = runtime_status_module.read(data_dir / "runtime_status.json")
+    assert status.source == "reconcile_once"          # this run's own source
+    assert status.last_successful_cycle_at == real_cycle_at   # carried forward, unchanged
+
+
+def test_reconcile_once_recovers_an_active_failure_sentinel_with_provenance(
+    tmp_path, monkeypatch,
+):
+    """The real incident this exists for: an active TypeError sentinel from
+    a since-fixed broker-response-shape bug, exercised by the SAME broker-
+    read code a clean --reconcile-once run just proved works. Recovered
+    with recovered_by="reconcile_once" -- never silently relabeled as a
+    real scheduled cycle's own recovery."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    sentinel_path = data_dir / "failure_sentinel.json"
+    rec = failure_sentinel.record_failure(
+        None, exc_type="TypeError", message="string indices must be integers",
+        now=_RO_OUT_OF_SESSION - timedelta(hours=6))
+    for i in range(1, 4):
+        rec = failure_sentinel.record_failure(
+            rec, exc_type="TypeError", message="string indices must be integers",
+            now=_RO_OUT_OF_SESSION - timedelta(hours=6) + timedelta(minutes=i))
+    failure_sentinel.save(sentinel_path, rec)
+    assert failure_sentinel.load(sentinel_path).status == "active"
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+
+    recovered = failure_sentinel.load(sentinel_path)
+    assert recovered.status == "recovered"
+    assert recovered.recovered_by == "reconcile_once"
+    assert recovered.exc_type == "TypeError"            # history preserved, not erased
+    assert recovered.consecutive_count == 4
+
+
+def test_reconcile_once_with_no_active_sentinel_writes_nothing_new(tmp_path, monkeypatch):
+    """No failure_sentinel.json at all -- mark_recovered's own documented
+    no-op-if-missing behavior applies; --reconcile-once must not fabricate
+    one out of thin air."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+    assert not (data_dir / "failure_sentinel.json").exists()
+
+
+def test_reconcile_once_never_recovers_the_sentinel_on_a_reconciliation_halt(
+    tmp_path, monkeypatch,
+):
+    """A --reconcile-once run that itself FAILS must never mark any
+    sentinel recovered -- the runtime_status/failure_sentinel write block
+    only runs after a genuine success, never inside the except branch."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paused_mode(data_dir / "mode_state.jsonl")
+
+    sentinel_path = data_dir / "failure_sentinel.json"
+    rec = failure_sentinel.record_failure(
+        None, exc_type="TypeError", message="x", now=_RO_OUT_OF_SESSION - timedelta(hours=1))
+    failure_sentinel.save(sentinel_path, rec)
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+
+    def _boom(**kw):
+        raise ConnectionError("simulated broker read failure")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _boom)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 1
+    assert failure_sentinel.load(sentinel_path).status == "active"   # never recovered
+    assert not (data_dir / "runtime_status.json").exists()   # never written either
+
+
+def test_on_cycle_success_recovered_by_is_cycle():
+    """Spot-check on the scheduled-loop's OWN recovery producer -- reusing
+    the exact real closure scripts/run_agent.py's main() constructs is not
+    practical from a black-box test, so this checks the shared underlying
+    contract directly: the module's own source (grepped, not merely
+    assumed) literally contains agent.failure_sentinel.mark_recovered(...,
+    recovered_by="cycle") in its `_on_cycle_success` hook, matching what
+    agent/runtime_status.py's own THREE PRODUCERS section documents for the
+    scheduled loop."""
+    import inspect
+    import scripts.run_agent as run_agent_module
+    source = inspect.getsource(run_agent_module)
+    assert 'recovered_by="cycle"' in source

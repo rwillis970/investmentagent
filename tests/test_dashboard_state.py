@@ -145,8 +145,18 @@ def test_unbuilt_fields_are_null_with_a_sibling_reason(tmp_path):
         now=T0, config=cfg, cost_ledger=cost_ledger, opportunity_tracker=tracker,
         approval_request_store=store, audit_log=audit,
     )
+    # Track B dashboard-truth fix (2026-08-14): a real news collector DOES
+    # exist (agent.news_collector) -- with no fact_store wired at all,
+    # these three fields are an honest "not supplied to this process"
+    # UNAVAILABLE, never the old, FALSE "not built"/"no collector exists"
+    # claim. See test_dashboard_state_fact_store.py for the real-count path.
+    assert state["data_collection"]["bars_ingested_today"] is None
+    assert "no fact_store was supplied" in state["data_collection"]["bars_ingested_today_unavailable_reason"]
+    assert state["data_collection"]["filings_ingested_today"] is None
+    assert "no fact_store was supplied" in state["data_collection"]["filings_ingested_today_unavailable_reason"]
     assert state["data_collection"]["news_feed"] is None
-    assert "not built" in state["data_collection"]["news_feed_unavailable_reason"]
+    assert "no fact_store was supplied" in state["data_collection"]["news_feed_unavailable_reason"]
+    assert "agent.news_collector" in state["data_collection"]["news_feed_unavailable_reason"]
     assert state["materiality_screen"]["scored_this_session"] is None
     assert state["materiality_screen"]["scored_this_session_unavailable_reason"]
     assert state["reconciliation"]["last_result"] is None

@@ -16,13 +16,33 @@ already public within this deployment (account_id), a status enum, a
 timestamp, or a boolean -- never a key id, a keychain reference resolved to
 its actual value, or anything from `SecretsProvider.resolve`.
 
-TWO PRODUCERS, ONE SHAPE. `RuntimeStatus.source` distinguishes which:
+THREE PRODUCERS, ONE SHAPE (extended PAUSED-reconcile-follow-up runtime-
+status unit, 2026-08-14). `RuntimeStatus.source` distinguishes which:
 
   * `"cycle"` -- written by `scripts/run_agent.py`'s own `on_cycle_success`
     hook after a REAL `agent.run_loop.run_cycle` completes: `sync_fills`
     actually polled the broker, `agent.startup.run_startup`'s own
     reconciliation actually ran and passed. This is the strongest possible
-    evidence -- a live trading-session cycle, not a snapshot read.
+    evidence -- a live trading-session cycle, not a snapshot read. This is
+    the ONLY producer that ever sets `last_successful_cycle_at` to a NEW
+    value.
+  * `"reconcile_once"` -- written by `scripts/run_agent.py`'s own
+    `_run_reconcile_once` (`--reconcile-once`) after a REAL `agent.
+    run_loop.sync_and_build_reconciliations` + `agent.startup.
+    reconcile_accounts_or_raise` complete: this ALSO actually polls the
+    broker and ALSO actually performs exact reconciliation -- genuinely
+    stronger evidence than `"diagnostic"`, below, which never calls either.
+    It is still NOT `"cycle"`: no pipeline is ever attached (no candidate
+    generation, no materiality screen, no T4 analysis, no approval
+    request), and `run_startup`'s own audit-chain-verification/approval-
+    expiry-sweep/mode-transition machinery never runs. A `"reconcile_once"`
+    snapshot proves reconciliation health -- broker reads succeed, and
+    positions/settled-cash/open-orders/day-trades all genuinely agree -- it
+    must NEVER be read as proof a real scheduled market-session cycle
+    occurred. `last_successful_cycle_at` is CARRIED FORWARD unchanged from
+    whatever it already was (see `_run_reconcile_once`'s own docstring) --
+    this producer never sets it to a new value, and never fabricates a
+    value where none existed.
   * `"diagnostic"` -- written by `agent.diagnostics.diagnose_account`
     (`scripts/diagnose_runtime.py`), which can run OUTSIDE a trading
     session (see that module's own docstring for why) but never calls
@@ -35,9 +55,11 @@ TWO PRODUCERS, ONE SHAPE. `RuntimeStatus.source` distinguishes which:
     picked up and reconciled correctly, only that everything already on
     record still agrees.
 
-Do not label a `"diagnostic"` snapshot as proof of a live trading cycle
-anywhere this is displayed -- that conflation is exactly the kind of
-truthfulness gap this whole unit exists to close.
+Do not label a `"diagnostic"` OR a `"reconcile_once"` snapshot as proof of
+a live trading cycle anywhere this is displayed -- that conflation is
+exactly the kind of truthfulness gap this whole unit exists to close.
+`source` is always ONE of these three exact strings; nothing in this
+codebase writes a fourth value.
 
 FIELDS WHOSE SEMANTICS THIS CODE CANNOT SUPPORT ARE NEVER INVENTED. A field
 this run had no way to determine (e.g. `collection_last_success_at` from a

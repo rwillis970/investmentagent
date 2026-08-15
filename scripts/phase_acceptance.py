@@ -49,6 +49,7 @@ from agent.secrets_provider import SecretNotFoundError
 from agent.secrets_provider import \
     default_keychain_secrets_provider_factory as _real_secrets_provider_factory
 from agent.store import FactStore
+from agent import runtime_status as runtime_status_module
 
 NOT_YET_OBSERVED = "NOT YET OBSERVED"
 
@@ -127,6 +128,66 @@ def _phase1_criteria(*, account_id, key_id, secret_ref, mode, data_dir,
             results[criterion_name] = (UNAVAILABLE, f"{type(exc).__name__}: {exc}")
 
     return results
+
+
+def _phase1_scheduled_cycle_criterion(*, data_dir):
+    """Out-of-session-recovery follow-up unit (2026-08-14). THE DISTINCTION
+    THE MISSION SPECIFICALLY REQUIRED: "ACCOUNT RECONCILIATION: PASS" (the
+    `_RECONCILIATION_COMPONENTS` criteria above, satisfied by ANY of
+    `agent.runtime_status.RuntimeStatus.source`'s three producers --
+    "cycle", "reconcile_once", or "diagnostic", via `diagnose_account`)
+    must NEVER be conflated with "a real scheduled market-session trading
+    cycle has actually completed at least once." Those are genuinely
+    different claims -- see agent/runtime_status.py's own THREE PRODUCERS
+    section. This is a SEPARATE criterion, checked against
+    `data_dir/runtime_status.json`'s own `last_successful_cycle_at` field,
+    which is written a new value ONLY by `source="cycle"` (a real
+    `agent.run_loop.run_cycle` completing) -- `"reconcile_once"` and
+    `"diagnostic"` snapshots always carry it forward unchanged, NEVER set
+    it themselves (see scripts/run_agent.py's own `_run_reconcile_once` and
+    `agent.diagnostics.diagnose_account`).
+
+    A clean `--reconcile-once` run (or a clean diagnostic) can legitimately
+    make every `_RECONCILIATION_COMPONENTS` criterion PASS above while this
+    criterion stays NOT YET OBSERVED -- that is not a bug in either
+    criterion, it is the entire point of keeping them separate. This
+    criterion must never be silently promoted to PASS by evidence that only
+    proves reconciliation health."""
+    runtime_status_path = data_dir / "runtime_status.json"
+    key = "scheduled_market_session_cycle_has_completed"
+    if not runtime_status_path.exists():
+        return {key: (
+            NOT_YET_OBSERVED,
+            f"{runtime_status_path} does not exist yet -- no cycle, "
+            f"--reconcile-once run, or diagnostic has ever written a "
+            f"runtime status snapshot"
+        )}
+    try:
+        status = runtime_status_module.read(runtime_status_path)
+        if status is None:
+            return {key: (
+                NOT_YET_OBSERVED,
+                f"{runtime_status_path} exists but read() returned nothing")}
+        if status.last_successful_cycle_at is not None:
+            return {key: (
+                PASS,
+                f"a real scheduled market-session cycle last completed at "
+                f"{status.last_successful_cycle_at.isoformat()} (most recent "
+                f"runtime_status.json snapshot itself has source={status.source!r}, "
+                f"generated_at={status.generated_at.isoformat()})"
+            )}
+        return {key: (
+            NOT_YET_OBSERVED,
+            f"runtime_status.json's most recent snapshot has "
+            f"source={status.source!r} and last_successful_cycle_at=null -- "
+            f"{'a clean --reconcile-once run' if status.source == 'reconcile_once' else 'a clean diagnostic run' if status.source == 'diagnostic' else 'this snapshot'} "
+            f"proves reconciliation health (see the ACCOUNT-RECONCILIATION "
+            f"criteria above), not that a real scheduled market-session "
+            f"cycle has ever completed; see agent/runtime_status.py's own "
+            f"THREE PRODUCERS section"
+        )}
+    except Exception as exc:   # noqa: BLE001 -- never raise out of this script
+        return {key: (UNAVAILABLE, f"{type(exc).__name__}: {exc}")}
 
 
 def _phase2_criteria(*, data_dir):
@@ -274,6 +335,7 @@ def run_acceptance(*, account_id, key_id, secret_ref, mode, data_dir,
         secrets_provider_factory=secrets_provider_factory,
         adapter_factory=adapter_factory, now_fn=now_fn,
     ))
+    results.update(_phase1_scheduled_cycle_criterion(data_dir=data_dir))
     results.update(_phase2_criteria(data_dir=data_dir))
     results.update(_phase3_criteria(data_dir=data_dir))
     return results

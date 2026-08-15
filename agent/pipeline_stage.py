@@ -139,6 +139,7 @@ from .ledger import Ledger
 from .market_data_collector import collect_market_data, read_market_snapshot
 from .news_collector import collect_news_events
 from .materiality_cycle import MaterialityCycleResult, run_materiality_cycle
+from .opportunity_event_store import OpportunityEventStore, OpportunityEventStoreError
 from .opportunity_event_tracker import OpportunityEventTracker
 from .pipeline import Gatekeeper
 from .store import FactStore
@@ -196,6 +197,16 @@ class PipelineRuntime:
     min_peer_group_size: int = 3
     opportunity_tracker: OpportunityEventTracker | None = None
     live: bool = False
+    # Durable raw-screen persistence (Track C, 2026-08-14) -- deliberately a
+    # SEPARATE optional collaborator from `opportunity_tracker` immediately
+    # above: that one records only T4-ANALYSIS TERMINAL OUTCOMES, this one
+    # records EVERY `OpportunityEvent` a screen cycle produces, regardless of
+    # `analysis_status` (see `agent.opportunity_event_store`'s own module
+    # docstring for the full distinction). `None` by default, same posture
+    # as every other optional collaborator in this dataclass: a caller not
+    # supplying one gets a screen cycle that runs exactly as before, with no
+    # persistence side effect at all.
+    opportunity_event_store: OpportunityEventStore | None = None
 
     # -- Unit 3: T4 analysis (THE MONEY GUARDRAIL FLAG) ---------------------
     t4_analysis_enabled: bool = False
@@ -314,6 +325,30 @@ def run_pipeline_stage(pipeline: PipelineRuntime, *, now: datetime, mode: str,
             min_peer_group_size=pipeline.min_peer_group_size, held_symbols=held_symbols,
         )
         new_last_screened_at = now
+
+        # Track C, 2026-08-14: persist EVERY event this cycle's screen just
+        # produced -- PENDING_ANALYSIS (triggered), SUPPRESSED, and
+        # NOT_MATERIAL alike -- BEFORE the `triggered` filter below narrows
+        # to only the FILING-typed, not-yet-handled subset T4 will see. Best
+        # -effort and fail-safe: a persistence defect here must never turn a
+        # working screen cycle into a halted one (this mirrors every other
+        # bookkeeping block in this stage -- e.g. `opportunity_tracker.
+        # mark_handled` calls below are likewise never allowed to abort the
+        # cycle). Silently skipped (not silently "succeeded") when no store
+        # is wired -- exactly like every other optional collaborator here.
+        if pipeline.opportunity_event_store is not None:
+            for event in screening.events:
+                try:
+                    pipeline.opportunity_event_store.record(event, evaluated_at=now)
+                except OpportunityEventStoreError:
+                    # A malformed event (e.g. non-finite score) is a real
+                    # defect worth surfacing -- but not by taking down the
+                    # whole cycle. `agent.materiality.screen` has no other
+                    # channel to report this on today; a future unit could
+                    # wire this into `agent.diagnostics`/the failure
+                    # sentinel the same way other soft-failure paths in this
+                    # codebase already do. Disclosed gap, not a silent one.
+                    pass
 
         triggered = sorted(
             (e for e in screening.events

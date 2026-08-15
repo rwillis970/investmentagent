@@ -69,6 +69,7 @@ from .daytrade import DayTradeGuard
 from .ledger import Ledger
 from .opportunity_event_tracker import OpportunityEventTracker
 from .process_lock import ProcessLockError, acquire_process_lock
+from .store import FactStore
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "static"
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -158,6 +159,25 @@ class DashboardRuntime:
     # lock contention. `GET /api/state` and every other read-only route
     # never consults this field at all -- see route_request's own comment.
     process_lock_data_dir: str | Path | None = None
+    # REAL FACT-STORE-BACKED COLLECTION COUNTS (out-of-session-recovery
+    # follow-up unit, 2026-08-14; Track B dashboard-truth fix). `fact_store`
+    # is served as-is on every GET /api/state that has no refresh_fn wired
+    # (matching `ledger`'s own "static unless refreshed" default posture);
+    # `fact_store_refresh_fn`, when set, is called BEFORE every real GET
+    # /api/state, exactly like `broker_state_refresh_fn`/`operational_
+    # state_refresh_fn` above -- `agent.store.FactStore.__init__` reads its
+    # whole file once and never re-reads it, and this dashboard process and
+    # the real collector-writing `scripts/run_agent.py` process are
+    # separate OS processes appending to the same file, so a `FactStore`
+    # built once at dashboard startup would go stale (never see a single
+    # fact collected after this process's own start) for the entire life of
+    # a long-running dashboard -- the exact staleness gap those two other
+    # refresh_fn fields already exist to close, applied here to the same
+    # problem. `None` (both fields' own default) means "no --fact-store-
+    # path wired," rendered by `agent.dashboard_state.build_dashboard_
+    # state` as an honest UNAVAILABLE, never a fabricated 0.
+    fact_store: FactStore | None = None
+    fact_store_refresh_fn: Callable[[], "FactStore | None"] | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +224,12 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         if runtime.operational_state_refresh_fn is not None:
             operational_state, operational_state_paused_from = \
                 runtime.operational_state_refresh_fn()
+        # Track B dashboard-truth fix (2026-08-14): same per-request-refresh
+        # posture as broker_state_refresh_fn/operational_state_refresh_fn
+        # immediately above -- see DashboardRuntime.fact_store_refresh_fn's
+        # own field docstring for why a fresh read is needed every request.
+        if runtime.fact_store_refresh_fn is not None:
+            runtime.fact_store = runtime.fact_store_refresh_fn()
         state = build_dashboard_state(
             now=now, config=runtime.config, cost_ledger=runtime.cost_ledger,
             opportunity_tracker=runtime.opportunity_tracker,
@@ -216,6 +242,7 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
             ledger=runtime.ledger,
             operational_state=operational_state,
             operational_state_paused_from=operational_state_paused_from,
+            fact_store=runtime.fact_store,
         )
         return _json_result(200, state)
 

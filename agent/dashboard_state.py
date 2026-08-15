@@ -41,6 +41,30 @@ from .daytrade import DayTradeGuard
 from .ledger import Ledger
 from .opportunity_event_tracker import OpportunityEventTracker
 from .risk import PortfolioState, investable_cash, required_reserve
+from .store import FactStore
+
+# Real field literals a durable Fact is written under by each real
+# collector (out-of-session-recovery follow-up unit, 2026-08-14) -- copied
+# here rather than importing the collector modules themselves (which pull
+# in each collector's own real network client class definitions purely for
+# one string constant apiece; this module deliberately constructs no
+# adapter/client of its own -- see this file's own "NO BROKER CALL, NO
+# CREDENTIAL" section above). Verified directly against each module's own
+# `FIELD = ...` literal, not assumed:
+#   agent.market_data_collector.FIELD == "market_snapshot"
+#   agent.edgar_collector.FIELD == "filing"
+#   agent.news_collector.FIELD == "news_event"
+_BARS_FACT_FIELD = "market_snapshot"
+_FILINGS_FACT_FIELD = "filing"
+_NEWS_FACT_FIELD = "news_event"
+
+_NO_FACT_STORE = (
+    "unavailable: no fact_store was supplied to this dashboard process -- "
+    "see scripts/run_dashboard.py's own --fact-store-path flag. Real "
+    "collectors that write this kind of fact DO exist in this codebase "
+    "(agent.market_data_collector/agent.edgar_collector/agent.news_collector); "
+    "this is a wiring gap, not a missing feature"
+)
 
 _NOT_BUILT = (
     "not built: no code path or durable store exists for this figure in "
@@ -86,6 +110,29 @@ def _present(value: Any) -> dict:
     return {"value": value, "unavailable_reason": None}
 
 
+def _facts_ingested_today(fact_store: FactStore | None, *, field: str,
+                          today: Any) -> dict:
+    """A REAL, durable count -- never an in-memory per-process counter (the
+    mission's own explicit requirement) -- of facts with this exact `field`
+    literal whose `observed_at.date()` is `today`, read fresh from
+    `fact_store.all_facts()` on every call (this function does no caching
+    of its own; `fact_store` itself is re-opened by the caller on every
+    request -- see agent.dashboard_server.DashboardRuntime.fact_store_
+    refresh_fn's own docstring for why a fresh read is needed at all: this
+    dashboard process and the real collector-writing process are separate
+    OS processes). `fact_store=None` (no --fact-store-path wired) is an
+    honest UNAVAILABLE, never a silent 0 -- a 0 must mean "checked, and
+    genuinely zero landed today," never "didn't check." """
+    if fact_store is None:
+        return _null(_NO_FACT_STORE)
+    try:
+        n = sum(1 for f in fact_store.all_facts()
+               if f.field == field and f.observed_at.date() == today)
+        return _present(n)
+    except Exception as exc:   # noqa: BLE001 -- never take GET /api/state down
+        return _null(f"unavailable: {type(exc).__name__} reading fact_store: {exc}")
+
+
 def build_dashboard_state(
     *, now: datetime, config: Config, cost_ledger: CostLedger,
     opportunity_tracker: OpportunityEventTracker,
@@ -98,6 +145,7 @@ def build_dashboard_state(
     audit_recent_limit: int = 20,
     operational_state: str | None = None,
     operational_state_paused_from: str | None = None,
+    fact_store: FactStore | None = None,
 ) -> dict:
     """Assemble the single JSON document the dashboard's GET /api/state
     returns. Every store this function reads is passed in by the caller
@@ -149,11 +197,12 @@ def build_dashboard_state(
     data_collection = {
         "enabled": config.data_collection_enabled,
         "interval_seconds": config.data_collection_interval_seconds,
-        **_prefixed("bars_ingested_today", _null(_NOT_BUILT)),
-        **_prefixed("filings_ingested_today", _null(_NOT_BUILT)),
-        **_prefixed("news_feed", _null(
-            "not built: no news collector exists anywhere in this codebase"
-        )),
+        **_prefixed("bars_ingested_today", _facts_ingested_today(
+            fact_store, field=_BARS_FACT_FIELD, today=today)),
+        **_prefixed("filings_ingested_today", _facts_ingested_today(
+            fact_store, field=_FILINGS_FACT_FIELD, today=today)),
+        **_prefixed("news_feed", _facts_ingested_today(
+            fact_store, field=_NEWS_FACT_FIELD, today=today)),
     }
 
     materiality_screen = {

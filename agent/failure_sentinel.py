@@ -99,6 +99,22 @@ class FailureRecord:
     # FailureRecord before these fields existed.
     status: str = ACTIVE
     recovered_at: datetime | None = None
+    # PAUSED-reconcile-follow-up runtime-status unit, 2026-08-14. WHICH of
+    # this codebase's three recovery producers actually cleared this
+    # incident -- "cycle" (agent.run_loop.run_cycle succeeded inside a real
+    # scheduled market-session cycle -- the strongest possible evidence),
+    # "diagnostic" (agent.diagnostics.diagnose_account's own read-only,
+    # after-hours-safe check found every component PASS/WARN), or
+    # "reconcile_once" (scripts.run_agent._run_reconcile_once actually
+    # exercised the SAME broker-read-plus-exact-reconciliation code path a
+    # real cycle does -- see that function's own docstring for why this is
+    # legitimate evidence, distinct from but not weaker than "diagnostic").
+    # `None` for an active record, or for a record recovered before this
+    # field existed (backward compatible, same convention as `status`/
+    # `recovered_at` above -- an old-format recovered record simply doesn't
+    # say which producer did it, which is exactly what `None` already meant
+    # for those two fields before they existed at all).
+    recovered_by: str | None = None
 
 
 def record_failure(prior: FailureRecord | None, *, exc_type: str, message: str,
@@ -175,26 +191,37 @@ def load(path: str | Path) -> FailureRecord | None:
         consecutive_count=d["consecutive_count"],
         status=d.get("status", ACTIVE),
         recovered_at=datetime.fromisoformat(recovered_at) if recovered_at else None,
+        recovered_by=d.get("recovered_by"),
     )
 
 
-def mark_recovered(path: str | Path, *, now: datetime) -> FailureRecord | None:
+def mark_recovered(path: str | Path, *, now: datetime,
+                   recovered_by: str | None = None) -> FailureRecord | None:
     """The RECOVERY half (overnight-hardening unit, 2026-08-13; see module
-    docstring's ACTIVE VS. RECOVERED section) -- replaces `clear()` at both
-    of this codebase's real call sites (`scripts/run_agent.py`'s cycle-
-    success hook, `agent/diagnostics.py`'s own all-PASS path). Returns
-    `None`, and writes nothing, if there is no sentinel to recover FROM (a
-    process that has never failed) -- a safe no-op, matching `clear()`'s own
+    docstring's ACTIVE VS. RECOVERED section) -- replaces `clear()` at all
+    three of this codebase's real call sites (`scripts/run_agent.py`'s
+    cycle-success hook, `agent/diagnostics.py`'s own all-PASS path, and
+    `scripts/run_agent.py`'s `--reconcile-once` success path -- PAUSED-
+    reconcile-follow-up runtime-status unit, 2026-08-14). Returns `None`,
+    and writes nothing, if there is no sentinel to recover FROM (a process
+    that has never failed) -- a safe no-op, matching `clear()`'s own
     no-op-if-missing behaviour. If the loaded record is already RECOVERED,
-    this is idempotent: `recovered_at` is NOT bumped to `now` a second time,
-    preserving the actual moment recovery happened rather than the moment
-    it was last re-observed."""
+    this is idempotent: `recovered_at`/`recovered_by` are NOT overwritten a
+    second time, preserving the actual moment (and producer) recovery
+    happened rather than whichever producer last re-observed it.
+
+    `recovered_by` (PAUSED-reconcile-follow-up runtime-status unit,
+    2026-08-14): which producer is recovering this incident -- see
+    `FailureRecord.recovered_by`'s own docstring for the three real values.
+    `None` (the default) is still accepted for a caller that genuinely
+    doesn't know or doesn't care -- no existing call site is broken by this
+    parameter's addition."""
     prior = load(path)
     if prior is None:
         return None
     if prior.status == RECOVERED:
         return prior
-    record = replace(prior, status=RECOVERED, recovered_at=now)
+    record = replace(prior, status=RECOVERED, recovered_at=now, recovered_by=recovered_by)
     save(path, record)
     return record
 

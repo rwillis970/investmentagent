@@ -65,6 +65,9 @@ def test_data_dir_defaults_all_five_store_paths_to_named_files_inside_it(tmp_pat
     assert args.audit_log_path == str(data_dir / "audit.jsonl")
     assert args.ledger_store_path == str(data_dir / "ledger.jsonl")
     assert args.quarantine_store_path == str(data_dir / "quarantine.jsonl")
+    # Track B dashboard-truth fix (2026-08-14): fact_store_path joins the
+    # same defaulting group, matching scripts/run_agent.py's own filename.
+    assert args.fact_store_path == str(data_dir / "facts.jsonl")
     assert data_dir.is_dir()
 
 
@@ -117,6 +120,7 @@ def test_data_dir_is_never_created_when_every_store_path_is_explicit(tmp_path, m
         "--ledger-store-path", str(tmp_path / "l.jsonl"),
         "--quarantine-store-path", str(tmp_path / "q.jsonl"),
         "--mode-store-path", str(tmp_path / "m.jsonl"),
+        "--fact-store-path", str(tmp_path / "f.jsonl"),
     ])
     assert not (tmp_path / "data").exists()
 

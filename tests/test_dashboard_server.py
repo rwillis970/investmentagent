@@ -915,3 +915,79 @@ def test_get_api_state_operational_state_paper_broker_environment_does_not_imply
     assert payload["mode"] == runtime.config.mode
     assert payload["broker_environment"] == runtime.config.mode
     assert payload["operational_state"] == "PAUSED"
+
+
+# ------------------------------------------ fact_store_refresh_fn (Track B
+# dashboard-truth fix, out-of-session-recovery follow-up unit, 2026-08-14).
+# Mirrors broker_state_refresh_fn/operational_state_refresh_fn's own per-
+# request-refresh tests exactly, same reasoning: this dashboard process and
+# the real collector-writing scripts/run_agent.py process are separate OS
+# processes, so a FactStore built once at dashboard startup would never see
+# a fact collected after this process's own start.
+
+def test_get_api_state_calls_fact_store_refresh_fn_when_set(tmp_path):
+    from agent.store import Fact, FactStore
+
+    runtime, _ = make_runtime(tmp_path)
+    fact_store = FactStore(tmp_path / "facts.jsonl")
+    fact_store.append(Fact(entity_id="SPY", field="market_snapshot", value="x",
+                           observed_at=T0, effective_at=T0, source_id="test"))
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        return fact_store
+
+    runtime.fact_store_refresh_fn = refresh
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert len(calls) == 1
+    assert payload["data_collection"]["bars_ingested_today"] == 1
+
+
+def test_get_api_state_calls_fact_store_refresh_fn_again_on_a_second_request(tmp_path):
+    """A second, separate process (the real run_agent.py) appending a new
+    fact between two dashboard polls must be visible on the very next
+    poll -- proves this is a per-request re-open, not a one-shot cache."""
+    from agent.store import Fact, FactStore
+
+    runtime, _ = make_runtime(tmp_path)
+    path = tmp_path / "facts.jsonl"
+
+    def refresh():
+        return FactStore(path) if path.exists() else None
+
+    runtime.fact_store_refresh_fn = refresh
+    first = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert first["data_collection"]["bars_ingested_today_unavailable_reason"] is not None
+
+    store = FactStore(path)
+    store.append(Fact(entity_id="SPY", field="market_snapshot", value="x",
+                      observed_at=T0, effective_at=T0, source_id="test"))
+    second = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert second["data_collection"]["bars_ingested_today"] == 1
+
+
+def test_get_api_state_with_no_fact_store_refresh_fn_keeps_static_fact_store(tmp_path):
+    """`fact_store_refresh_fn=None` (the field's own default): whatever was
+    set on `runtime.fact_store` at construction is what /api/state reports,
+    unchanged by any request -- mirrors `ledger`'s own "static unless
+    refreshed" default posture."""
+    from agent.store import Fact, FactStore
+
+    runtime, _ = make_runtime(tmp_path)
+    fact_store = FactStore(tmp_path / "facts.jsonl")
+    fact_store.append(Fact(entity_id="SPY", field="filing", value="x",
+                           observed_at=T0, effective_at=T0, source_id="test"))
+    runtime.fact_store = fact_store
+    assert runtime.fact_store_refresh_fn is None
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["data_collection"]["filings_ingested_today"] == 1
+
+
+def test_get_api_state_with_no_fact_store_at_all_is_honestly_unavailable(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    assert runtime.fact_store is None
+    assert runtime.fact_store_refresh_fn is None
+    payload = json.loads(route_request(runtime, method="GET", path="/api/state").body)
+    assert payload["data_collection"]["bars_ingested_today"] is None
+    assert payload["data_collection"]["bars_ingested_today_unavailable_reason"] is not None

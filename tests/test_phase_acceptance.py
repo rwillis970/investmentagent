@@ -240,3 +240,161 @@ def test_phase1_reconciliation_criteria_are_unavailable_with_no_adapter(tmp_path
     for name in ("reconciles_settled_cash", "reconciles_positions",
                 "reconciles_open_orders", "reconciles_day_trade_count"):
         assert results[name][0] == UNAVAILABLE, f"{name} was {results[name]}"
+
+
+# ------------------------ scheduled_market_session_cycle_has_completed (Track A, 2026-08-14)
+#
+# THE MISSION'S OWN REQUIREMENT: "ACCOUNT RECONCILIATION: PASS" must never
+# be conflated with "SCHEDULED MARKET-SESSION CYCLE: NOT_YET_OBSERVED."
+# This criterion is checked directly against data_dir/runtime_status.json,
+# independent of the _RECONCILIATION_COMPONENTS criteria above.
+
+def test_no_runtime_status_file_is_not_yet_observed(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    results = run_acceptance(
+        account_id="acct-taxable", key_id=None, secret_ref=None, mode="PAPER",
+        data_dir=data_dir, max_day_trades_per_5_sessions=3,
+        secrets_provider_factory=_provider_factory(), now_fn=lambda: NOW,
+    )
+    assert results["scheduled_market_session_cycle_has_completed"][0] == NOT_YET_OBSERVED
+
+
+def test_a_reconcile_once_snapshot_alone_is_not_yet_observed_for_the_cycle_criterion(tmp_path):
+    """The exact conflation the mission called out by name: a clean
+    --reconcile-once run (source="reconcile_once", last_successful_cycle_at
+    still null) must leave this criterion NOT YET OBSERVED even though
+    every ACCOUNT-RECONCILIATION criterion may independently read PASS."""
+    from agent import runtime_status as runtime_status_module
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    status = runtime_status_module.RuntimeStatus(
+        generated_at=NOW, account_id="acct-taxable", mode="PAUSED",
+        process_status="reconcile-once-run", source="reconcile_once",
+        market_session_state="CLOSED", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=NOW,
+        reconciliation_status="PASS", reconciliation_at=NOW,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=None,
+        last_failure_at=None, last_failure_type=None, recovered_at=None,
+        collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    )
+    runtime_status_module.write_atomic(data_dir / "runtime_status.json", status)
+
+    results = run_acceptance(
+        account_id="acct-taxable", key_id=None, secret_ref=None, mode="PAPER",
+        data_dir=data_dir, max_day_trades_per_5_sessions=3,
+        secrets_provider_factory=_provider_factory(), now_fn=lambda: NOW,
+    )
+    status_, detail = results["scheduled_market_session_cycle_has_completed"]
+    assert status_ == NOT_YET_OBSERVED
+    assert "reconcile_once" in detail
+    assert "reconciliation health" in detail
+
+
+def test_a_diagnostic_snapshot_alone_is_also_not_yet_observed(tmp_path):
+    from agent import runtime_status as runtime_status_module
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    status = runtime_status_module.RuntimeStatus(
+        generated_at=NOW, account_id="acct-taxable", mode="PAUSED",
+        process_status="diagnostic-run", source="diagnostic",
+        market_session_state="CLOSED", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=NOW,
+        reconciliation_status="PASS", reconciliation_at=NOW,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=None,
+        last_failure_at=None, last_failure_type=None, recovered_at=None,
+        collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    )
+    runtime_status_module.write_atomic(data_dir / "runtime_status.json", status)
+
+    results = run_acceptance(
+        account_id="acct-taxable", key_id=None, secret_ref=None, mode="PAPER",
+        data_dir=data_dir, max_day_trades_per_5_sessions=3,
+        secrets_provider_factory=_provider_factory(), now_fn=lambda: NOW,
+    )
+    assert results["scheduled_market_session_cycle_has_completed"][0] == NOT_YET_OBSERVED
+
+
+def test_a_real_scheduled_cycle_is_a_genuine_pass(tmp_path):
+    """The one and only way this criterion may read PASS: source="cycle"
+    (or last_successful_cycle_at carried forward from one) actually set on
+    the most recent snapshot."""
+    from agent import runtime_status as runtime_status_module
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    status = runtime_status_module.RuntimeStatus(
+        generated_at=NOW, account_id="acct-taxable", mode="PAPER",
+        process_status="running", source="cycle",
+        market_session_state="OPEN", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=NOW,
+        reconciliation_status="PASS", reconciliation_at=NOW,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=NOW,
+        last_failure_at=None, last_failure_type=None, recovered_at=None,
+        collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    )
+    runtime_status_module.write_atomic(data_dir / "runtime_status.json", status)
+
+    results = run_acceptance(
+        account_id="acct-taxable", key_id=None, secret_ref=None, mode="PAPER",
+        data_dir=data_dir, max_day_trades_per_5_sessions=3,
+        secrets_provider_factory=_provider_factory(), now_fn=lambda: NOW,
+    )
+    status_, detail = results["scheduled_market_session_cycle_has_completed"]
+    assert status_ == PASS
+    assert NOW.isoformat() in detail
+
+
+def test_a_subsequent_reconcile_once_after_a_real_cycle_still_passes_via_carry_forward(tmp_path):
+    """A cycle happened once, then a LATER --reconcile-once run carried
+    last_successful_cycle_at forward unchanged (see agent/run_agent.py's
+    own carry-forward logic) -- this criterion must still read PASS off
+    that carried-forward true fact, sourced from the LATEST snapshot on
+    disk (source="reconcile_once"), not require the latest snapshot's own
+    source to literally be "cycle"."""
+    from agent import runtime_status as runtime_status_module
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    real_cycle_at = NOW
+    status = runtime_status_module.RuntimeStatus(
+        generated_at=NOW, account_id="acct-taxable", mode="PAUSED",
+        process_status="reconcile-once-run", source="reconcile_once",
+        market_session_state="CLOSED", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=NOW,
+        reconciliation_status="PASS", reconciliation_at=NOW,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=real_cycle_at,   # carried forward, not fabricated
+        last_failure_at=None, last_failure_type=None, recovered_at=None,
+        collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    )
+    runtime_status_module.write_atomic(data_dir / "runtime_status.json", status)
+
+    results = run_acceptance(
+        account_id="acct-taxable", key_id=None, secret_ref=None, mode="PAPER",
+        data_dir=data_dir, max_day_trades_per_5_sessions=3,
+        secrets_provider_factory=_provider_factory(), now_fn=lambda: NOW,
+    )
+    assert results["scheduled_market_session_cycle_has_completed"][0] == PASS
+
+
+def test_a_malformed_runtime_status_file_is_unavailable_never_a_silent_pass(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "runtime_status.json").write_text("{not valid json")
+
+    results = run_acceptance(
+        account_id="acct-taxable", key_id=None, secret_ref=None, mode="PAPER",
+        data_dir=data_dir, max_day_trades_per_5_sessions=3,
+        secrets_provider_factory=_provider_factory(), now_fn=lambda: NOW,
+    )
+    assert results["scheduled_market_session_cycle_has_completed"][0] == UNAVAILABLE

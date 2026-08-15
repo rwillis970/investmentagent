@@ -131,6 +131,22 @@ class FactStore:
     def __len__(self) -> int:
         return len(self._facts)
 
+    def all_facts(self) -> tuple[Fact, ...]:
+        """Read-only snapshot of every fact ever appended, in append order
+        (out-of-session-recovery follow-up unit, 2026-08-14). This store has
+        no built-in query/index beyond the one per-`(entity_id, field)`
+        series `as_of`/`history`/`get` already read from (see module
+        docstring: "generic log", "no built-in dedup" -- the same posture
+        extends to "no built-in cross-series aggregation"). A caller that
+        needs to count/filter across the WHOLE store -- e.g. the dashboard's
+        "how many market_snapshot facts landed today," or a read-only CLI
+        inspection tool -- works from this tuple itself rather than this
+        module growing a second, narrower query method per caller. Returns a
+        `tuple`, not the live internal list, so a caller cannot mutate this
+        store's own state through the return value (the store is append-
+        only via `append`/`extend` alone; see `update`/`delete` above)."""
+        return tuple(self._facts)
+
     # -- explicitly unsupported -------------------------------------------
     def update(self, *a, **k):
         raise StoreError("the evidence store is append-only; write a new fact")

@@ -520,5 +520,5 @@ def maybe_mark_recovered(report: DiagnosticReport, *, sentinel_path: str | Path,
         return False
     prior = failure_sentinel.load(sentinel_path)
     already_recovered = prior is not None and prior.status == failure_sentinel.RECOVERED
-    result = failure_sentinel.mark_recovered(sentinel_path, now=now)
+    result = failure_sentinel.mark_recovered(sentinel_path, now=now, recovered_by="diagnostic")
     return result is not None and not already_recovered

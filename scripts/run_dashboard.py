@@ -100,6 +100,7 @@ from agent.mode_store import ModeStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.secrets_provider import (SecretNotFoundError, SecretsProvider,
                                     default_keychain_secrets_provider_factory)
+from agent.store import FactStore
 
 
 def _build_broker_state(
@@ -187,6 +188,29 @@ def _build_broker_state(
         return None, (), None, None
 
 
+def _refresh_fact_store(fact_store_path: str | Path | None) -> FactStore | None:
+    """Re-opens `agent.store.FactStore` fresh from disk (out-of-session-
+    recovery follow-up unit, 2026-08-14; Track B dashboard-truth fix) --
+    `FactStore.__init__` reads its whole file once at construction and
+    never re-reads it, and this dashboard process and the real collector-
+    writing `scripts/run_agent.py` process are separate OS processes, so a
+    `FactStore` built once at dashboard startup would never see a fact
+    collected after this process's own start (the identical staleness
+    reasoning `_build_broker_state`'s own `_refresh` closure in `build_
+    dashboard_runtime` already documents for broker state). `fact_store_
+    path=None` (no `--fact-store-path` given) or any read failure (a
+    corrupt/unreadable file) both degrade to `None`, never raise -- `agent.
+    dashboard_state.build_dashboard_state` already renders `fact_store=
+    None` as an honest UNAVAILABLE, never a fabricated 0 or an exception
+    that would take the rest of GET /api/state down with it."""
+    if fact_store_path is None:
+        return None
+    try:
+        return FactStore(fact_store_path)
+    except Exception:
+        return None
+
+
 def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Path,
                            account_id: str | None, cost_ledger_path: str | Path,
                            approval_request_store_path: str | Path,
@@ -195,6 +219,7 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
                            ledger_store_path: str | Path,
                            quarantine_store_path: str | Path,
                            mode_store_path: str | Path | None = None,
+                           fact_store_path: str | Path | None = None,
                            key_id: str | None = None,
                            secret_ref: str | None = None,
                            secrets_provider_factory: Callable[[str], SecretsProvider]
@@ -320,6 +345,11 @@ def build_dashboard_runtime(cfg: config_module.Config, *, config_path: str | Pat
         broker_state_refresh_fn=_refresh,
         operational_state_refresh_fn=_refresh_operational_state,
         process_lock_data_dir=data_dir,
+        fact_store=_refresh_fact_store(fact_store_path),
+        fact_store_refresh_fn=(
+            (lambda: _refresh_fact_store(fact_store_path))
+            if fact_store_path is not None else None
+        ),
     )
 
 
@@ -359,6 +389,12 @@ _DEFAULT_STORE_FILENAMES = {
     # same directory a running run_agent.py process uses must resolve to the
     # SAME mode_state.jsonl, not a second, independently-named copy.
     "mode_store_path": "mode_state.jsonl",
+    # Track B dashboard-truth fix (out-of-session-recovery follow-up unit,
+    # 2026-08-14): SAME filename scripts/run_agent.py's own
+    # _DEFAULT_STORE_FILENAMES uses for it -- pointing --data-dir at the
+    # same directory a running run_agent.py process uses must resolve to
+    # the SAME facts.jsonl, not a second, independently-named copy.
+    "fact_store_path": "facts.jsonl",
 }
 
 
@@ -419,6 +455,15 @@ def _parse_args(argv: list[str] | None):
                              "reflects the real, persisted PRODUCTION_ACTIVE/PAUSED/"
                              "DISABLED history (Unit E), never the broker-environment "
                              "'mode' field re-purposed to mean something it does not")
+    parser.add_argument("--fact-store-path",
+                        help="defaults to <data-dir>/facts.jsonl -- point this at the "
+                             "SAME file a running scripts/run_agent.py process's real "
+                             "collectors (agent.market_data_collector/agent."
+                             "edgar_collector/agent.news_collector) append to, so GET "
+                             "/api/state's bars_ingested_today/filings_ingested_today/"
+                             "news_feed fields report real, durable counts instead of "
+                             "an unavailable placeholder (Track B dashboard-truth fix, "
+                             "2026-08-14)")
     parser.add_argument("--host", default="127.0.0.1",
                         help="must stay a loopback address (see agent.dashboard_server)")
     parser.add_argument("--port", type=int, default=8765)
@@ -523,6 +568,7 @@ def main(argv: list[str] | None = None, *,
         ledger_store_path=args.ledger_store_path,
         quarantine_store_path=args.quarantine_store_path,
         mode_store_path=args.mode_store_path,
+        fact_store_path=args.fact_store_path,
         key_id=args.key_id, secret_ref=args.secret_ref,
         secrets_provider_factory=secrets_provider_factory,
         credential_preflight=credential_preflight,

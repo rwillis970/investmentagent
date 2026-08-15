@@ -295,6 +295,7 @@ from agent.ledger_store import read_opening_balance_established_at
 from agent.mode_store import ModeStore
 from agent.model_client import AnthropicModelClient, ModelClient
 from agent.money import to_decimal
+from agent.opportunity_event_store import OpportunityEventStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.pipeline import Gatekeeper
 from agent.pipeline_stage import PipelineRuntime
@@ -443,7 +444,8 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
                           extraction_cache_path: str | Path,
                           analysis_result_store_path: str | Path,
                           approval_request_store_path: str | Path,
-                          opportunity_tracker_path: str | Path) -> PipelineRuntime:
+                          opportunity_tracker_path: str | Path,
+                          opportunity_event_store_path: str | Path | None = None) -> PipelineRuntime:
     """Constructs the real `agent.pipeline_stage.PipelineRuntime` this
     unattended unit's own MONEY GUARDRAIL requires: every one of the four
     stage flags below is read straight from `cfg` (defaulting False, per
@@ -568,6 +570,10 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
         max_approval_requests_per_day=cfg.max_approval_requests_per_day,
         min_peer_group_size=cfg.materiality_min_peer_group_size,
         opportunity_tracker=OpportunityEventTracker(opportunity_tracker_path),
+        opportunity_event_store=(
+            OpportunityEventStore(opportunity_event_store_path)
+            if opportunity_event_store_path is not None else None
+        ),
         live=cfg.mode == "PRODUCTION_ACTIVE",
         t4_analysis_enabled=cfg.t4_analysis_enabled,
         model_client=model_client,
@@ -1022,6 +1028,7 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
                         cash_quarantine_store_path: str | Path,
                         mode_store_path: str | Path,
                         audit_log_path: str | Path,
+                        runtime_status_path: str | Path,
                         secrets_provider_factory: Callable[[str], SecretsProvider],
                         now_fn: Callable[[], datetime], log: logging.Logger) -> int:
     """ONE out-of-market-session recovery/reconciliation cycle, then exit
@@ -1202,6 +1209,105 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
             recon.local_settled_cash if recon is not None else None,
             recon.broker_account.settled_cash if recon is not None else None,
         )
+
+        # RUNTIME_STATUS, source="reconcile_once" + FAILURE-SENTINEL RECOVERY
+        # (PAUSED-reconcile-follow-up runtime-status unit, 2026-08-14).
+        # Best-effort, exactly like `_on_cycle_success`'s own identical
+        # bookkeeping below -- a failure here must never mask, or change
+        # the exit code of, a reconciliation that otherwise genuinely
+        # succeeded (this whole block is a plain observational write, not
+        # part of what "success" means for this command).
+        #
+        # THIRD PRODUCER (see agent/runtime_status.py's own module
+        # docstring, extended this unit). A successful --reconcile-once
+        # exercises the exact same broker-read-plus-exact-reconciliation
+        # work `agent.run_loop.sync_and_build_reconciliations`/`agent.
+        # startup.reconcile_accounts_or_raise` perform inside a real
+        # scheduled cycle -- genuinely stronger evidence than a "diagnostic"
+        # run (which never calls sync_fills/sync_cash_events at all, only
+        # compares whatever is already on record) -- but it is NOT a real
+        # scheduled market-session trading cycle: no pipeline is attached,
+        # no candidate is ever generated, and the real startup sequence's
+        # own audit-chain-verification/approval-expiry-sweep/mode-
+        # transition machinery never runs. `source="reconcile_once"` says exactly
+        # that, distinctly from both "cycle" and "diagnostic" -- never
+        # conflated with either.
+        #
+        # `last_successful_cycle_at` IS CARRIED FORWARD, NEVER FABRICATED.
+        # This is the one field this run has no evidence for either way: if
+        # a real scheduled cycle already set it, overwriting the whole
+        # document (this file's own convention -- see agent/runtime_status.
+        # py's own module docstring) must not silently erase that true fact
+        # just because THIS run cannot itself confirm or deny it; if no real
+        # cycle has ever run, it stays exactly what it already was: null.
+        # Reading the prior file for this one field is the only reason this
+        # block reads runtime_status_path before writing it.
+        try:
+            prior_status = runtime_status_module.read(runtime_status_path)
+            last_successful_cycle_at = (
+                prior_status.last_successful_cycle_at if prior_status is not None else None
+            )
+            session_state, next_open = _session_state_for_runtime_status(now)
+            status = runtime_status_module.RuntimeStatus(
+                generated_at=now, account_id=account_id, mode=persisted_mode,
+                process_status="reconcile-once-run", source="reconcile_once",
+                market_session_state=session_state, next_session_open=next_open,
+                broker_snapshot_status="PASS", broker_snapshot_at=now,
+                reconciliation_status="PASS", reconciliation_at=now,
+                positions_reconciled=True, cash_reconciled=True,
+                open_orders_reconciled=True,
+                last_successful_cycle_at=last_successful_cycle_at,
+                last_failure_at=None, last_failure_type=None, recovered_at=None,
+                collection_last_success_at=None, screen_last_success_at=None,
+                unavailable_reasons={
+                    "collection_last_success_at": "--reconcile-once never runs the "
+                        "data-collection stage -- no candidate/collection component is "
+                        "ever attached to this command; see _run_reconcile_once's own "
+                        "module docstring",
+                    "screen_last_success_at": "--reconcile-once never runs the "
+                        "materiality screen -- no candidate/screening component is "
+                        "ever attached to this command; see _run_reconcile_once's own "
+                        "module docstring",
+                    "last_successful_cycle_at": (
+                        "--reconcile-once never runs a real scheduled market-session "
+                        "cycle or its own startup sequence -- this value, when present, "
+                        "was carried forward unchanged from a prior REAL scheduled "
+                        "cycle, never set or refreshed by this command itself; see "
+                        "agent/runtime_status.py's own THREE PRODUCERS section"
+                    ) if last_successful_cycle_at is None else (
+                        "carried forward unchanged from a prior REAL scheduled cycle "
+                        "(see agent/runtime_status.py's own THREE PRODUCERS section) -- "
+                        "this --reconcile-once run neither set nor refreshed it"
+                    ),
+                },
+            )
+            runtime_status_module.write_atomic(runtime_status_path, status)
+        except Exception as status_exc:   # noqa: BLE001 -- best-effort, see
+            # this block's own opening comment.
+            log.warning("runtime_status write itself failed: %s", status_exc)
+
+        # RECONCILIATION-RELATED FAILURE SENTINEL RECOVERY. Reuses the SAME
+        # `agent.failure_sentinel.mark_recovered` both other producers call
+        # (never a second, competing recovery mechanism) -- a clean
+        # --reconcile-once run is, if anything, STRONGER evidence than a
+        # clean "diagnostic" run (see above: this one actually calls
+        # sync_fills/sync_cash_events against the live broker, a diagnostic
+        # never does), so withholding recovery here while still granting it
+        # to a mere diagnostic run would be inconsistent, not more
+        # conservative. `recovered_by="reconcile_once"` records which
+        # producer actually cleared it -- an operator (or the dashboard)
+        # reading `failure_sentinel.json` afterward can see plainly that
+        # this was NOT a real scheduled cycle recovering itself.
+        try:
+            sentinel_path = Path(audit_log_path).parent / "failure_sentinel.json"
+            failure_sentinel.mark_recovered(sentinel_path, now=now,
+                                            recovered_by="reconcile_once")
+        except Exception as sentinel_exc:   # noqa: BLE001 -- best-effort,
+            # same posture as every other bookkeeping block in this
+            # function and in _on_cycle_success above.
+            log.warning("failure sentinel recovery bookkeeping itself failed: %s",
+                       sentinel_exc)
+
         return 0
     except Exception as exc:   # noqa: BLE001 -- FAILS CLOSED, see this
         # function's own docstring section of the same name: never raise
@@ -1313,6 +1419,11 @@ _DEFAULT_STORE_FILENAMES = {
     "analysis_result_store_path": "analysis_results.jsonl",
     "approval_request_store_path": "approval_requests.jsonl",
     "opportunity_tracker_path": "opportunity_events.jsonl",
+    # Track C, 2026-08-14: deliberately its OWN filename, never
+    # "opportunity_events.jsonl" -- see agent/opportunity_event_store.py's
+    # own module docstring for why the two stores must never collide on
+    # disk (T4-terminal-outcomes-only vs. every raw screen result).
+    "opportunity_event_store_path": "materiality_events.jsonl",
     "ledger_store_path": "ledger.jsonl",
     "quarantine_store_path": "quarantine.jsonl",
     "cash_quarantine_store_path": "cash_quarantine.jsonl",
@@ -1514,6 +1625,13 @@ def _parse_args(argv: list[str] | None):
                              "have already been screened/analysed, so a restart does not "
                              "re-trigger the same filing forever. Defaults to <data-dir>/"
                              "opportunity_events.jsonl.")
+    parser.add_argument("--opportunity-event-store-path",
+                        help="durable agent.opportunity_event_store.OpportunityEventStore file "
+                             "(Track C, 2026-08-14) -- EVERY OpportunityEvent a screen cycle "
+                             "produces (triggered/suppressed/scored-below-threshold alike), "
+                             "keyed by event_id -- a durable record independent of, and never "
+                             "conflated with, --opportunity-tracker-path's T4-outcome-only "
+                             "file. Defaults to <data-dir>/materiality_events.jsonl.")
     parser.add_argument("--account-type", default="TAXABLE",
                         choices=[t.value for t in AccountType],
                         help="this account's tax treatment -- feeds agent.pipeline."
@@ -1746,9 +1864,13 @@ def _parse_args(argv: list[str] | None):
         # of these paths THIS call, so _check_data_dir_sanity never runs
         # against an irrelevant default for a caller who supplied every
         # path explicitly.
+        # runtime_status_path added (PAUSED-reconcile-follow-up runtime-
+        # status unit, 2026-08-14): --reconcile-once now writes a
+        # source="reconcile_once" RuntimeStatus snapshot on success -- see
+        # _run_reconcile_once's own docstring.
         args.data_dir_relevant = _default_relevant_paths((
             "ledger_store_path", "quarantine_store_path", "cash_quarantine_store_path",
-            "mode_store_path", "audit_log_path",
+            "mode_store_path", "audit_log_path", "runtime_status_path",
         ))
     else:
         missing = [name for name, val in (
@@ -1905,6 +2027,7 @@ def main(argv: list[str] | None = None, *,
                 quarantine_store_path=args.quarantine_store_path,
                 cash_quarantine_store_path=args.cash_quarantine_store_path,
                 mode_store_path=args.mode_store_path, audit_log_path=args.audit_log_path,
+                runtime_status_path=args.runtime_status_path,
                 secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
             ),
         )
@@ -1968,8 +2091,11 @@ def main(argv: list[str] | None = None, *,
             # exc_type/consecutive_count/recovered_at to show, rather than a
             # file that simply stopped existing with no trace of what it
             # used to say. See agent/failure_sentinel.py's own module
-            # docstring, ACTIVE VS. RECOVERED.
-            failure_sentinel.mark_recovered(sentinel_path, now=report.now)
+            # docstring, ACTIVE VS. RECOVERED. recovered_by="cycle"
+            # (PAUSED-reconcile-follow-up runtime-status unit, 2026-08-14):
+            # this is the strongest of the three producers -- a REAL
+            # scheduled market-session run_cycle completed without raising.
+            failure_sentinel.mark_recovered(sentinel_path, now=report.now, recovered_by="cycle")
         except Exception as sentinel_exc:   # noqa: BLE001 -- best-effort
             # operational convenience, same posture as the failure-side
             # sentinel bookkeeping in the except-block below.
@@ -2092,6 +2218,7 @@ def main(argv: list[str] | None = None, *,
                 analysis_result_store_path=args.analysis_result_store_path,
                 approval_request_store_path=args.approval_request_store_path,
                 opportunity_tracker_path=args.opportunity_tracker_path,
+                opportunity_event_store_path=args.opportunity_event_store_path,
             )
 
             run_loop_fn(

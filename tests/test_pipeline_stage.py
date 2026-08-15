@@ -684,3 +684,113 @@ def test_a_loosely_typed_approval_outcome_without_suppressed_reason_is_still_mar
                        ledger=FakeLedger(), broker_account=account_snapshot())
     assert trk.is_handled("e1", T0) is True
     assert trk.all()[0].outcome == "analyzed"
+
+
+# --------------------------------------- opportunity_event_store (Track C, 2026-08-14)
+#
+# `opportunity_tracker` (used throughout every test above) records only T4
+# TERMINAL OUTCOMES. These tests cover the SEPARATE `opportunity_event_store`
+# collaborator, which persists EVERY event a screen cycle produces --
+# triggered, suppressed, and below-threshold alike -- regardless of whether
+# T4 analysis is even enabled.
+
+from agent.opportunity_event_store import OpportunityEventStore  # noqa: E402
+
+
+def test_every_screened_event_is_persisted_regardless_of_status(tmp_path):
+    store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    e1 = event(event_id="e1", status="PENDING_ANALYSIS")
+    e2 = event(event_id="e2", status="SUPPRESSED")
+    e3 = event(event_id="e3", status="NOT_MATERIAL", score=0.1)
+    rt = screening_runtime(tmp_path)
+    rt = with_store(rt, store_with_a_triggering_filing())
+    rt = _replace(rt, opportunity_event_store=store)
+
+    import agent.pipeline_stage as ps
+    ps_real = ps.run_materiality_cycle
+    ps.run_materiality_cycle = lambda *a, **k: MaterialityCycleResult(events=[e1, e2, e3])
+    try:
+        run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                           last_collected_at=None, last_screened_at=None)
+    finally:
+        ps.run_materiality_cycle = ps_real
+
+    assert len(store) == 3
+    assert store.get("e1").analysis_status == "PENDING_ANALYSIS"
+    assert store.get("e2").analysis_status == "SUPPRESSED"
+    assert store.get("e3").analysis_status == "NOT_MATERIAL"
+
+
+def test_no_persistence_when_no_store_is_wired(tmp_path):
+    """Default posture: `opportunity_event_store=None` (the dataclass
+    default) means a screen cycle behaves exactly as it did before this
+    collaborator existed -- no store, no side effect, no exception."""
+    rt = with_store(screening_runtime(tmp_path), store_with_a_triggering_filing())
+    assert rt.opportunity_event_store is None
+    result = run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                                last_collected_at=None, last_screened_at=None)
+    assert result.screening is not None   # the screen itself still ran
+
+
+def test_restarting_the_process_and_rescreening_the_same_filing_does_not_duplicate(tmp_path):
+    """The real-world case this exists for: a scheduled cycle re-screens the
+    SAME still-most-recent filing every interval until a newer one supersedes
+    it -- `event_id` is unchanged across those repeats for a FILING-typed
+    event (see `agent.materiality_cycle`'s own deterministic id). A restart
+    must not grow the durable store's row count FOR THAT SPECIFIC EVENT_ID.
+
+    (A PRICE_MOVE-typed event's own event_id is deliberately fresh every
+    cycle by construction -- `observed_at=effective_at=now` for that type,
+    per `agent.materiality_cycle`'s own docstring -- so the store's TOTAL
+    row count legitimately grows cycle over cycle; that is not what this
+    test is checking.)"""
+    path = tmp_path / "materiality_events.jsonl"
+    store1 = OpportunityEventStore(path)
+    rt1 = with_store(screening_runtime(tmp_path), store_with_a_triggering_filing())
+    rt1 = _replace(rt1, opportunity_event_store=store1)
+    run_pipeline_stage(rt1, now=T0, mode="PRODUCTION_ACTIVE",
+                       last_collected_at=None, last_screened_at=None)
+    filing_events = [e for e in store1.all() if e.type == "FILING"]
+    assert len(filing_events) == 1
+    filing_event_id = filing_events[0].event_id
+
+    # Simulate a process restart: fresh store instance, same file, same
+    # underlying filing (same FactStore contents), a later `now` within the
+    # SAME trading session -- `run_materiality_cycle`'s own deterministic
+    # event_id is unchanged for the same still-most-recent filing.
+    store2 = OpportunityEventStore(path)
+    rt2 = with_store(screening_runtime(tmp_path), store_with_a_triggering_filing())
+    rt2 = _replace(rt2, opportunity_event_store=store2)
+    run_pipeline_stage(rt2, now=T0 + timedelta(minutes=5), mode="PRODUCTION_ACTIVE",
+                       last_collected_at=None, last_screened_at=None)
+    filing_events_after = [e for e in store2.all() if e.event_id == filing_event_id]
+    assert len(filing_events_after) == 1   # no duplicate row for the same event_id
+
+
+def test_a_persistence_defect_never_aborts_the_screen_cycle(tmp_path, monkeypatch):
+    """A malformed event (e.g. NaN score) raises inside `OpportunityEventStore
+    .record` -- this must be swallowed, not propagated, so a bad row can
+    never turn a working screen cycle into a halted one."""
+    import math
+    store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    bad_event = event(event_id="bad", status="PENDING_ANALYSIS")
+    bad_event = pipeline_stage.OpportunityEvent(
+        event_id="bad", type="FILING", source_id=EDGAR_SOURCE_ID,
+        observed_at=T0, effective_at=T0, symbols=("AAPL",),
+        materiality_score=math.nan, score_components={}, threshold_version="mat-v1",
+        analysis_status="PENDING_ANALYSIS",
+    )
+    rt = with_store(screening_runtime(tmp_path), store_with_a_triggering_filing())
+    rt = _replace(rt, opportunity_event_store=store)
+
+    import agent.pipeline_stage as ps
+    ps_real = ps.run_materiality_cycle
+    ps.run_materiality_cycle = lambda *a, **k: MaterialityCycleResult(events=[bad_event])
+    try:
+        result = run_pipeline_stage(rt, now=T0, mode="PRODUCTION_ACTIVE",
+                                    last_collected_at=None, last_screened_at=None)
+    finally:
+        ps.run_materiality_cycle = ps_real
+
+    assert result.screening is not None   # cycle completed, not aborted
+    assert len(store) == 0   # the malformed row was never durably written
