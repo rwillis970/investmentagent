@@ -43,15 +43,49 @@ before either write handler is reached, so a forged request never touches
      `_serve_static`'s docstring) -- a cookie needs zero frontend changes,
      since browsers attach `credentials: 'same-origin'` cookies to `fetch`
      automatically by default.
-  2. ORIGIN-HEADER ALLOWLIST (defense in depth). If a state-changing
-     request carries an `Origin` header at all, it must resolve to a
-     loopback host (`_LOOPBACK_HOSTS`) or the request is refused
-     regardless of cookie validity -- this catches a non-browser forger
-     that supplies a stolen/guessed cookie value alongside a spoofed
-     `Origin`. A request with no `Origin` header at all (true of most
-     direct API tooling, and of some legitimate same-origin requests) is
-     not disqualified by this check alone -- the cookie check above is the
-     primary gate.
+  2. EXACT-ORIGIN ALLOWLIST, MANDATORY (security-remediation unit, round
+     2, 2026-08-15; closes a follow-up finding against round 1 above: the
+     original `_origin_ok` accepted ANY `Origin` whose *hostname* resolved
+     to loopback -- `urlparse(origin).hostname in _LOOPBACK_HOSTS` --
+     which never looked at scheme or port at all. Cookies are not scoped
+     by port (only by registrable domain/host), and `SameSite=Strict`
+     governs cross-SITE, not cross-PORT, delivery -- so a hostile page
+     served from `http://127.0.0.1:<any other port>` shares this
+     dashboard's cookie jar and its `SameSite=Strict` "same-site" status,
+     meaning the browser attaches the real CSRF cookie to that forged
+     request too. The OLD Origin check then rubber-stamped it, since
+     "127.0.0.1" was in `_LOOPBACK_HOSTS` regardless of which port sent
+     it. Do not re-introduce a hostname-only or "is this loopback" check
+     here -- that is precisely the bug this round closes.
+
+     `_origin_ok` now requires the incoming `Origin` header to be present
+     (a missing header on either write route is now refused, not
+     tolerated -- every real browser sends `Origin` on POST/PATCH
+     `fetch()`, same-origin or not, so this costs nothing for this
+     dashboard's own bundled frontend; a direct API-tooling caller must
+     now set `Origin` explicitly to this dashboard's own origin) and, once
+     present, to be an EXACT case-insensitive string match against
+     `DashboardRuntime.allowed_origins` -- a small, precomputed set of
+     `scheme://host:port` strings built from the ACTUAL bound socket
+     (`_dashboard_allowed_origins`, called from `make_server` with the
+     real post-bind `server.server_port`, so `port=0` ephemeral binding is
+     handled correctly too), never from a caller-suppliable value. Exact
+     string equality -- not decomposed/re-parsed scheme+host+port
+     comparison -- is deliberate: it is immune by construction to
+     userinfo-confusion (`http://127.0.0.1:8765@evil.com`),
+     suffix-confusion (`http://127.0.0.1:8765.evil.com`), alternate-port
+     (`http://127.0.0.1:9999`), foreign origins, the literal `Origin:
+     null` sandboxed-iframe value, and malformed values generally --
+     every one of those simply fails to equal any member of a 3-element
+     set, with no URL-parsing differential-bug surface at all. A single
+     `Origin` header value containing a comma or any whitespace is treated
+     as unusable and refused outright -- `_Handler._dispatch` folds
+     genuinely repeated request headers (including a real duplicated
+     `Origin`) into one comma-joined value per RFC 7230 SS3.2.2 before
+     `route_request` ever sees them, so a duplicate `Origin` header
+     arrives here already in that shape and is refused the same way a
+     single malformed value is, never by picking "the first" or "the
+     last" of two candidates.
 
 `GET /api/state` and `GET /api/credentials` remain unauthenticated reads,
 exactly as before -- removing the wildcard CORS grant alone is what closes
@@ -96,7 +130,6 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
 
 from .approval import ApprovalService
 from .approval_request_store import ApprovalRequestStore
@@ -116,6 +149,35 @@ from .store import FactStore
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "static"
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+# EXACT-ORIGIN ALLOWLIST (security-remediation unit, round 2, 2026-08-15) --
+# see module docstring's CORS section, protection #2, for the full defect
+# this closes. _DASHBOARD_DEFAULT_PORT matches make_server's own default
+# `port` and scripts/run_dashboard.py's own `--port` default -- used only
+# to seed DashboardRuntime.allowed_origins' default_factory below, for any
+# caller/test that builds a DashboardRuntime directly (never through
+# make_server) and never sets allowed_origins itself. make_server ALWAYS
+# overwrites this default with the real bound socket's actual port (see
+# make_server's own docstring for why: `port=0` ephemeral binding means the
+# argument alone is not the real port).
+_DASHBOARD_DEFAULT_PORT = 8765
+
+
+def _dashboard_allowed_origins(port: int) -> "frozenset[str]":
+    """The small, exact set of origins this dashboard's OWN served page can
+    ever legitimately be loaded from, at the ONE port a given server
+    process is actually bound to. Three loopback spellings (not just the
+    one literal `host` a caller happened to pass to `make_server`) because
+    all three route to the same local machine and an operator may
+    reasonably reach this dashboard via any of them -- but every member is
+    still pinned to the exact real port, which is the entire point: the
+    finding this closes is that the OLD check accepted any port at all, as
+    long as the hostname was one of these three."""
+    return frozenset({
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"http://[::1]:{port}",
+    })
 
 
 @dataclass
@@ -246,6 +308,20 @@ class DashboardRuntime:
     # process invalidates every previously-issued cookie, exactly like
     # restarting any session-token-based server would.
     csrf_token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
+    # EXACT-ORIGIN ALLOWLIST (security-remediation unit, round 2, 2026-08-15)
+    # -- see module docstring's CORS section, protection #2, and
+    # `_dashboard_allowed_origins`'s own docstring immediately above this
+    # class. Defaults to the three loopback spellings at
+    # `_DASHBOARD_DEFAULT_PORT` (8765) so a test/caller that builds a
+    # DashboardRuntime directly -- never through make_server -- still gets
+    # a real, exact allowlist (matching this codebase's own existing
+    # convention of always defaulting to port 8765 in tests and docs), not
+    # an accidentally-empty one that would silently refuse every real
+    # browser request. make_server OVERWRITES this field with the ACTUAL
+    # bound port before returning the server -- see make_server's own
+    # docstring.
+    allowed_origins: "frozenset[str]" = field(
+        default_factory=lambda: _dashboard_allowed_origins(_DASHBOARD_DEFAULT_PORT))
 
 
 @dataclass(frozen=True)
@@ -306,20 +382,65 @@ def _csrf_ok(runtime: DashboardRuntime, headers: dict[str, str] | None) -> bool:
     return secrets.compare_digest(supplied, runtime.csrf_token)
 
 
-def _origin_ok(headers: dict[str, str] | None) -> bool:
+def _normalize_origin_candidate(raw: str | None) -> str | None:
+    """Returns a lowercased, whitespace/comma-free origin string, or `None`
+    if `raw` cannot possibly be one genuine `Origin` header value.
+    Deliberately does NOT decompose/re-parse into scheme+host+port with
+    `urlparse` -- see `_origin_ok`'s own docstring for why exact string
+    equality against a precomputed allowlist is used instead, and why that
+    makes the URL-decomposition class of bug (which is what round 1's
+    `urlparse(...).hostname in _LOOPBACK_HOSTS` check actually was)
+    structurally impossible to reintroduce here. This function only
+    rejects values that are unusable REGARDLESS of allowlist contents:
+      - missing/empty (a caller that supplies no `Origin` at all)
+      - containing a comma -- `_Handler._dispatch` folds genuinely
+        repeated request headers together with ", " per RFC 7230 §3.2.2
+        before `route_request` ever sees them (a real duplicate `Origin`
+        header therefore already arrives in exactly this shape); a
+        single genuine browser-sent `Origin` value is never a list, so
+        any comma here means "more than one candidate was supplied" and
+        the whole value is refused, not split and picked from
+      - containing any whitespace (leading, trailing, or embedded) -- a
+        real `Origin` header value never contains whitespace; this also
+        catches control-character smuggling attempts
+    The literal case-insensitive value `null` (what a browser sends for a
+    sandboxed iframe or a redirected/opaque-origin request) is not special-
+    cased -- lowercased, it is simply the string "null", which cannot equal
+    any `http://host:port` member of a real allowlist, so it is already
+    refused by the membership test in `_origin_ok`, not by this function."""
+    if not raw:
+        return None
+    if raw.strip() != raw:
+        return None
+    for forbidden in (",", " ", "\t", "\n", "\r"):
+        if forbidden in raw:
+            return None
+    return raw.lower()
+
+
+def _origin_ok(runtime: DashboardRuntime, headers: dict[str, str] | None) -> bool:
     """Defense in depth alongside `_csrf_ok` -- see module docstring's CORS
-    section, protection #2. An absent `Origin` header does not fail this
-    check on its own (many legitimate same-origin and direct-tooling
-    requests omit it); a PRESENT, non-loopback `Origin` always fails it,
-    regardless of what `_csrf_ok` finds."""
-    origin = _header_get(headers, "Origin")
-    if not origin:
-        return True
-    try:
-        hostname = urlparse(origin).hostname
-    except ValueError:
+    section, protection #2, for the full round-2 defect/fix writeup. As of
+    round 2 (security-remediation unit, 2026-08-15), this is NOT optional:
+    a state-changing request with no usable `Origin` header now fails this
+    check (round 1 let a missing header pass automatically) -- every real
+    browser `fetch()` call this dashboard's own bundled frontend makes
+    already sends `Origin` on POST/PATCH regardless of same-origin status,
+    so this costs the legitimate caller nothing; a direct API-tooling
+    caller must now set `Origin` explicitly to one of
+    `runtime.allowed_origins`. Once present and normalized (see
+    `_normalize_origin_candidate`), the value must be an EXACT member of
+    `runtime.allowed_origins` -- a small set of `scheme://host:port`
+    strings built from the real bound socket (`_dashboard_allowed_origins`,
+    called from `make_server` with the actual post-bind port). Exact
+    membership, not decomposed scheme/host/port comparison, is what makes
+    this immune to userinfo-confusion, suffix-confusion, alternate-port,
+    and foreign-origin bypasses by construction -- there is no
+    "which part did I forget to check" surface left."""
+    candidate = _normalize_origin_candidate(_header_get(headers, "Origin"))
+    if candidate is None:
         return False
-    return hostname in _LOOPBACK_HOSTS
+    return candidate in runtime.allowed_origins
 
 
 def _forged_request_result() -> RouteResult:
@@ -405,14 +526,14 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
     # touches `_with_writer_lock` -- no lock is ever held for a GET.
     m = _APPROVAL_ACTION_RE.match(path)
     if method == "POST" and m:
-        if not (_origin_ok(headers) and _csrf_ok(runtime, headers)):
+        if not (_origin_ok(runtime, headers) and _csrf_ok(runtime, headers)):
             return _forged_request_result()
         return _with_writer_lock(runtime, lambda: _handle_approval_action(
             runtime, request_id=m.group(1), action=m.group(2), body=body, now=now,
         ))
 
     if method == "PATCH" and path == "/api/config":
-        if not (_origin_ok(headers) and _csrf_ok(runtime, headers)):
+        if not (_origin_ok(runtime, headers) and _csrf_ok(runtime, headers)):
             return _forged_request_result()
         return _with_writer_lock(
             runtime, lambda: _handle_config_patch(runtime, body=body, now=now))
@@ -614,7 +735,26 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
-        headers = {key: value for key, value in self.headers.items()}
+        # REPEATED-HEADER FOLDING (security-remediation unit, round 2,
+        # 2026-08-15). The OLD `{key: value for key, value in
+        # self.headers.items()}` dict comprehension silently kept only the
+        # LAST occurrence of any repeated header name -- for `Origin`
+        # specifically, that meant a forger who sent it twice could pick
+        # whichever of the two values won that race, with no detection at
+        # all. `self.headers` (`http.client.HTTPMessage`) preserves every
+        # occurrence via `.items()`; folding repeats together with ", " per
+        # RFC 7230 §3.2.2's combining rule (the standards-correct way to
+        # interpret repeated header lines generally, not an Origin-specific
+        # special case) means a real duplicated `Origin` header arrives at
+        # `_origin_ok` as one comma-containing string, which
+        # `_normalize_origin_candidate` already refuses outright -- see
+        # that function's own docstring.
+        headers: dict[str, str] = {}
+        for key, value in self.headers.items():
+            if key in headers:
+                headers[key] = f"{headers[key]}, {value}"
+            else:
+                headers[key] = value
         result = route_request(self.runtime, method=method, path=self.path,
                                body=body, headers=headers)
         self.send_response(result.status)
@@ -654,7 +794,20 @@ class _Handler(BaseHTTPRequestHandler):
 def make_server(runtime: DashboardRuntime, *, host: str = "127.0.0.1",
                 port: int = 8765) -> ThreadingHTTPServer:
     """Bind and return the server (caller calls `.serve_forever()`).
-    Refuses any non-loopback host -- see module docstring."""
+    Refuses any non-loopback host -- see module docstring.
+
+    ALWAYS SETS `runtime.allowed_origins` FROM THE REAL BOUND SOCKET
+    (security-remediation unit, round 2, 2026-08-15) -- overwriting
+    whatever `DashboardRuntime.allowed_origins` held before (its own
+    default, or a caller-supplied value), because the ACTUAL port is only
+    knowable after `ThreadingHTTPServer.__init__` has bound the socket:
+    `port=0` (used by every real-socket test in this module, matching
+    `test_make_server_accepts_127_0_0_1`'s own convention) means "ask the
+    OS for an ephemeral port," and `server.server_port` (not the `port`
+    argument, which is still `0` in that case) is the only place the real
+    value is ever available. This is the one and only place
+    `allowed_origins` is computed for a real server -- see
+    `_origin_ok`/`_dashboard_allowed_origins` for how it is then used."""
     if host not in _LOOPBACK_HOSTS:
         raise ValueError(
             f"refusing to bind the operator dashboard to {host!r}: this "
@@ -662,4 +815,6 @@ def make_server(runtime: DashboardRuntime, *, host: str = "127.0.0.1",
             f"({', '.join(_LOOPBACK_HOSTS)} only)"
         )
     handler_cls = type("_BoundHandler", (_Handler,), {"runtime": runtime})
-    return ThreadingHTTPServer((host, port), handler_cls)
+    server = ThreadingHTTPServer((host, port), handler_cls)
+    runtime.allowed_origins = _dashboard_allowed_origins(server.server_port)
+    return server

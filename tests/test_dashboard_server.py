@@ -69,18 +69,40 @@ def add_pending(store, *, now=T0, **over):
     )
 
 
-def csrf_headers(runtime, *, origin=None, token=None):
+# The dashboard's own default origin, matching _dashboard_allowed_origins'
+# _DASHBOARD_DEFAULT_PORT (8765) -- DashboardRuntime.allowed_origins'
+# own default_factory when a test builds a runtime directly, never through
+# make_server (see that field's own docstring). Real-socket tests below
+# (`_serving`, which DOES go through make_server with an ephemeral port)
+# read the real value off `server.RequestHandlerClass.runtime.
+# allowed_origins` instead of this constant -- see those tests.
+_DASHBOARD_ORIGIN = "http://127.0.0.1:8765"
+
+
+def csrf_headers(runtime, *, origin=_DASHBOARD_ORIGIN, token=None):
     """Test-side stand-in for what a browser attaches automatically once
     the SameSite=Strict cookie has been planted (security-remediation
     unit, 2026-08-15 -- see agent.dashboard_server module docstring's CORS
     section). Every legitimate POST/PATCH call site in this file now needs
     this, matching what `_Handler._dispatch` actually sends as `Set-Cookie`
-    on the real wire; the handful of NEW adversarial tests below construct
-    headers WITHOUT this helper (or with a wrong `token`/hostile `origin`)
-    on purpose, to prove the forged case is refused."""
+    on the real wire.
+
+    DEFAULTS TO A REAL, MATCHING ORIGIN (round 2, 2026-08-15) -- `Origin`
+    is no longer optional on a state-changing request (see `_origin_ok`'s
+    own docstring: round 1 let a missing header pass, round 2 does not,
+    because every real browser `fetch()` call already sends it). Every
+    PRE-EXISTING call site in this file that calls `csrf_headers(runtime)`
+    with no `origin=` kwarg is simulating a legitimate same-origin browser
+    request, so this default now supplies the dashboard's own real origin
+    automatically rather than omitting the header -- this changes this
+    helper's default behavior, not any test's actual assertions. A test
+    that wants to prove the MISSING-Origin case is refused (the new
+    adversarial tests below) passes `origin=None` explicitly; a test that
+    wants a specific hostile/malformed value passes that value explicitly,
+    exactly as before."""
     cookie_token = runtime.csrf_token if token is None else token
     headers = {"Cookie": f"{CSRF_COOKIE_NAME}={cookie_token}"}
-    if origin is not None:
+    if origin:   # falsy (None or "") means "omit the Origin header entirely"
         headers["Origin"] = origin
     return headers
 
@@ -931,6 +953,275 @@ def test_patch_config_still_requires_confirmed_even_with_a_valid_csrf_cookie(tmp
         headers=csrf_headers(runtime),
     )
     assert result.status == 428
+
+
+# ------------------------------------ EXACT-ORIGIN ADVERSARIAL TESTS (round
+# 2, security-remediation unit, 2026-08-15) -- closes the follow-up finding
+# against round 1's Origin check above: "another loopback origin, on a
+# different PORT, can forge approvals" (cookies are not port-scoped, and
+# SameSite=Strict governs cross-SITE not cross-PORT delivery -- see module
+# docstring's CORS section, protection #2, for the full writeup). Every
+# test below uses a VALID, correctly-signed CSRF cookie (the one thing a
+# same-site-but-different-port attacker page COULD actually obtain from
+# the browser's own cookie jar) and proves the Origin allowlist alone is
+# what refuses the request, and that the underlying store/file is provably
+# untouched -- not just that the HTTP status looks right.
+
+def test_post_approve_from_an_alternate_loopback_port_is_refused(tmp_path):
+    """The literal named case: a valid stolen/shared cookie plus an Origin
+    naming the SAME loopback host but a DIFFERENT port must still be
+    refused -- round 1's hostname-only check would have accepted this."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="http://127.0.0.1:9999"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_reject_from_an_alternate_loopback_port_is_refused(tmp_path):
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/reject",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="http://127.0.0.1:9999"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_patch_config_from_an_alternate_loopback_port_is_refused(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    before = Path(runtime.config_path).read_text()
+    result = route_request(
+        runtime, method="PATCH", path="/api/config",
+        body=json.dumps({"key": "price_band_pct", "value": 5.0}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="http://localhost:65000"),
+    )
+    assert result.status == 403
+    assert Path(runtime.config_path).read_text() == before
+
+
+def test_post_approve_with_no_origin_header_at_all_is_refused(tmp_path):
+    """Round 2 behavior change from round 1 (see `_origin_ok`'s own
+    docstring): a missing Origin header on a state-changing route is now
+    itself a fail-closed case, not merely "not disqualifying." A valid
+    CSRF cookie alone is no longer sufficient."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin=None),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_a_malformed_origin_is_refused(tmp_path):
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="not-a-url-at-all"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_a_comma_folded_duplicate_origin_is_refused(tmp_path):
+    """Simulates what `_Handler._dispatch` produces for a REAL duplicated
+    `Origin` header (folded with ", " per RFC 7230 SS3.2.2 before
+    `route_request` ever sees it -- see `_normalize_origin_candidate`'s
+    own docstring). Refused even though one of the two folded values,
+    alone, would have been legitimate -- never disambiguated in the
+    caller's favor."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(
+            runtime, origin="http://127.0.0.1:8765, http://127.0.0.1:9999"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_the_literal_null_origin_is_refused(tmp_path):
+    """`Origin: null` -- what a browser sends for a sandboxed iframe or an
+    opaque-origin redirect chain. Not special-cased: lowercased, it is
+    simply the string "null", which cannot equal any real
+    `http://host:port` allowlist member."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="null"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_a_suffix_confused_origin_is_refused(tmp_path):
+    """`http://127.0.0.1:8765.evil.example` -- a hostname that merely
+    STARTS WITH a legitimate origin string is not the same origin. Exact
+    string equality (not `startswith`/substring matching) is what refuses
+    this -- see `_origin_ok`'s own docstring for why exact membership was
+    chosen specifically to make this class of bug structurally
+    impossible."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="http://127.0.0.1:8765.evil.example"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_a_userinfo_confused_origin_is_refused(tmp_path):
+    """`http://127.0.0.1:8765@evil.example` -- a naive validator that does
+    a substring/prefix check (or a `urlparse` whose `.hostname` a caller
+    forgets to actually inspect) can be fooled into thinking this names
+    the legitimate origin; RFC 6454 origin serialization never includes
+    userinfo, so a real browser-sent Origin never looks like this. Exact
+    string equality refuses it with no special userinfo-detection logic
+    needed at all: this string simply does not equal
+    "http://127.0.0.1:8765"."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="http://127.0.0.1:8765@evil.example"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_a_foreign_scheme_https_origin_at_the_right_host_port_is_refused(tmp_path):
+    """`https://127.0.0.1:8765` -- right host, right port, wrong scheme.
+    This dashboard is plain `http.server` with no TLS wired in anywhere
+    (see module docstring's LOCAL-ONLY section) -- a caller claiming
+    `https` is never this dashboard's own page and is refused by the same
+    exact-match mechanism, no scheme-specific branch required."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="https://127.0.0.1:8765"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_mixed_case_origin_still_succeeds(tmp_path):
+    """Positive control: RFC 6454 origin serialization is always
+    already-lowercase for a real browser, but a non-browser caller sending
+    the exact same origin in a different case is still the same origin --
+    `_normalize_origin_candidate` lowercases before the exact-membership
+    test, so this is not itself a bypass surface, just a normalization
+    that costs nothing."""
+    runtime, store = make_runtime(tmp_path, now=T0 + timedelta(seconds=60))
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "operator"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="HTTP://127.0.0.1:8765"),
+    )
+    assert result.status == 200
+    assert store.get(req.request_id).decision == "APPROVED"
+
+
+def test_a_real_alternate_port_origin_over_a_real_socket_cannot_approve(tmp_path):
+    """End-to-end proof over an ACTUAL TCP connection and an ACTUAL cookie
+    read back from a real `Set-Cookie` response header -- not just the
+    pure `route_request` simulation above. This is the literal scenario
+    the finding named: cookies are not port-scoped, so a page served from
+    any other port on 127.0.0.1 shares this dashboard's cookie jar and
+    could attach the real, valid cookie to a forged request; only the
+    Origin allowlist -- now pinned to the REAL bound port via
+    `make_server` -- stops it."""
+    server, thread = _serving(tmp_path)
+    try:
+        runtime = server.RequestHandlerClass.runtime
+        store = runtime.approval_request_store
+        req = add_pending(store)
+        real_port = server.server_address[1]
+
+        conn = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn.request("GET", "/api/state")
+        get_resp = conn.getresponse()
+        get_resp.read()
+        cookie_value = get_resp.getheader("Set-Cookie").split(";")[0]
+        conn.close()
+
+        forger_port = real_port + 1 if real_port < 65535 else real_port - 1
+        body = json.dumps({"actor": "attacker"}).encode("utf-8")
+        conn2 = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn2.request(
+            "POST", f"/api/approval/{req.request_id}/approve", body=body,
+            headers={
+                "Cookie": cookie_value,
+                "Origin": f"http://127.0.0.1:{forger_port}",
+                "Content-Type": "application/json",
+            },
+        )
+        resp2 = conn2.getresponse()
+        resp2.read()
+        conn2.close()
+
+        assert resp2.status == 403
+        assert store.get(req.request_id).decision is None
+    finally:
+        _stop(server, thread)
+
+
+def test_a_real_duplicate_origin_header_over_the_wire_is_refused(tmp_path):
+    """Proves the REAL header-parsing path (`_Handler._dispatch`'s
+    repeated-header folding), not just the pure-function simulation above
+    -- two genuinely separate `Origin:` header lines sent over one real
+    TCP connection, one of which is the dashboard's own real origin."""
+    server, thread = _serving(tmp_path)
+    try:
+        runtime = server.RequestHandlerClass.runtime
+        store = runtime.approval_request_store
+        req = add_pending(store)
+        real_port = server.server_address[1]
+
+        conn = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn.request("GET", "/api/state")
+        get_resp = conn.getresponse()
+        get_resp.read()
+        cookie_value = get_resp.getheader("Set-Cookie").split(";")[0]
+        conn.close()
+
+        body = json.dumps({"actor": "attacker"}).encode("utf-8")
+        conn2 = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn2.putrequest("POST", f"/api/approval/{req.request_id}/approve")
+        conn2.putheader("Cookie", cookie_value)
+        conn2.putheader("Origin", f"http://127.0.0.1:{real_port}")
+        conn2.putheader("Origin", "http://evil.example")
+        conn2.putheader("Content-Type", "application/json")
+        conn2.putheader("Content-Length", str(len(body)))
+        conn2.endheaders(body)
+        resp2 = conn2.getresponse()
+        resp2.read()
+        conn2.close()
+
+        assert resp2.status == 403
+        assert store.get(req.request_id).decision is None
+    finally:
+        _stop(server, thread)
 
 
 def test_an_options_preflight_on_an_unknown_path_still_returns_204(tmp_path):
