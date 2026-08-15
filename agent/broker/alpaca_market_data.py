@@ -80,6 +80,60 @@ RETRY POLICY: every call this client makes is a read (historical bars have no
 side effects), so every call is retryable, bounded by `http_max_retries` --
 unlike `AlpacaPaperAdapter`, there is no write path here that would need the
 opposite (never-retry) discipline.
+
+CENTRALIZED START<END VALIDATION (weekend historical-bar-window bug fix,
+2026-08-15). THE REAL BUG THIS CLOSES: the first canonical `--research-once`
+run against a completed session (`agent.market_data_collector.collect_
+market_data_for_completed_session`) failed with a real Alpaca HTTP 400,
+`"end should not be before start"`. Every window this codebase computes
+LOCALLY for that call was independently re-verified correctly ordered
+(`start < end`, both real UTC instants) -- the defect was that `daily_bars`
+sent `end` (a real, PAST date -- the completed session's own open) while
+omitting `start` ENTIRELY, leaving Alpaca to apply ITS OWN server-side
+default for the missing bound. That default is evidently NOT anchored
+relative to the `end` this client actually sent -- it is safe for this
+client's own long-standing LIVE usage (`end` there is always "today", so
+whatever Alpaca defaults an omitted `start` to has never been observed to
+land after it) but is NOT safe once `end` legitimately becomes a date well
+in the past, which the weekend/historical research path introduced for the
+first time in this codebase's history. The fix is not "guess a safer
+default" -- it is "never omit `start` for a request whose `end` might not
+be recent, and validate locally, before ever reaching the network, that
+whatever `start`/`end` a caller DOES supply are correctly ordered."
+
+`bars()` (below) now validates, BEFORE constructing `params` or making any
+HTTP request, that -- whenever a caller supplies BOTH `start` and `end` --
+`start < end` after the SAME UTC normalization `_format_ts` itself performs
+for serialization (so this check can never pass on the datetime objects and
+then still serialize to something Alpaca would reject). A violation raises
+`AlpacaMarketDataError` LOCALLY, with both serialized values and the
+`timeframe` in the message, and NO request is ever sent. This is
+DELIBERATELY NOT "if start > end, swap them" -- silently reordering the two
+would hide exactly the calendar/session arithmetic defect this fix exists
+to surface, turning a loud, precise, local failure into a request that
+"succeeds" against the wrong window with no error at all. This check
+applies uniformly to every current and future caller of `bars()` (`daily_
+bars`/`minute_bars`, and anything added later) -- it is centralized in the
+one method every timeframe already funnels through, not duplicated per
+caller.
+
+`daily_bars` (below) gained an optional `start` parameter (additive --
+every existing caller that omits it, including this client's own LIVE
+usage inside `agent.market_data_collector.collect_market_data`, is
+completely unaffected: `start=None` still means "no start bound sent,
+Alpaca's own default applies", exactly as before). `agent.market_data_
+collector.collect_market_data_for_completed_session` is the one caller that
+now ALWAYS supplies an explicit `start` for its `daily_bars` call (computed
+from real calendar sessions strictly before the one being fetched) --
+removing its own reliance on Alpaca's unverified implicit default entirely,
+which is what actually closes the bug. `collect_market_data` (the LIVE
+path) is UNCHANGED and still omits `start` for its own `daily_bars` call --
+a disclosed, deliberate scope decision (see that module's own docstring):
+its `end` is always "today", where Alpaca's own default has never been
+observed to conflict, and this fix's own centralized check is a pure,
+inert addition for that call (it only ever fires when BOTH `start` and
+`end` are given) -- so this fix carries zero behavioral risk to the live,
+scheduled collection loop.
 """
 from __future__ import annotations
 
@@ -108,6 +162,34 @@ def _format_ts(dt: datetime) -> str:
     if dt.tzinfo is None:
         raise AlpacaMarketDataError("datetime arguments must be timezone-aware")
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _assert_valid_interval(start: datetime, end: datetime, *, timeframe: str) -> None:
+    """CENTRALIZED START<END VALIDATION -- see module docstring's own
+    section by that name for the real bug this closes. Called from `bars()`
+    itself, BEFORE any HTTP request, whenever a caller supplies BOTH
+    `start` and `end` -- never after the fact, never as a response-side
+    check. Raises `AlpacaMarketDataError` (never swaps the two values) with
+    a precise diagnostic naming both serialized instants and the requested
+    `timeframe`, so a caller reading the error can immediately tell which
+    request and which two real instants were wrong, without needing to
+    reproduce the request against the real API first."""
+    for name, dt in (("start", start), ("end", end)):
+        if dt.tzinfo is None:
+            raise AlpacaMarketDataError(
+                f"bars() {name} must be a timezone-aware datetime for "
+                f"timeframe={timeframe!r}, got a naive one: {dt!r}")
+    if not start < end:
+        raise AlpacaMarketDataError(
+            f"invalid bars() interval for timeframe={timeframe!r}: start "
+            f"({_format_ts(start)}) is not strictly before end "
+            f"({_format_ts(end)}) after UTC serialization -- refusing to "
+            "send a request Alpaca would itself reject with 'end should "
+            "not be before start'. This is a LOCAL, pre-flight check -- no "
+            "HTTP request has been made -- and is almost always a "
+            "calendar/session arithmetic defect in the caller, never a "
+            "value this client silently swaps."
+        )
 
 
 class AlpacaMarketDataClient:
@@ -182,9 +264,16 @@ class AlpacaMarketDataClient:
         counts (25 daily bars, ~20 sessions x ~390 1-minute bars for a small
         universe) are well under Alpaca's page cap in the common case, so
         pagination is expected to be rare, not absent -- it is still fully
-        implemented, not assumed away."""
+        implemented, not assumed away.
+
+        CENTRALIZED START<END VALIDATION (see module docstring's own
+        section by that name): when BOTH `start` and `end` are given, this
+        is checked -- and any violation raised -- BEFORE the first HTTP
+        request, not discovered from Alpaca's own 400 response."""
         if not symbols:
             raise AlpacaMarketDataError("symbols must be non-empty")
+        if start is not None and end is not None:
+            _assert_valid_interval(start, end, timeframe=timeframe)
         out: dict[str, list[dict]] = {s: [] for s in symbols}
         page_token: str | None = None
         while True:
@@ -208,14 +297,26 @@ class AlpacaMarketDataClient:
         return out
 
     def daily_bars(self, symbols: list[str], *, end: datetime,
+                   start: datetime | None = None,
                    limit: int = 25) -> dict[str, list[dict]]:
         """`timeframe=1Day` bars ending at `end` (normally "now" -- the
         current, still-forming session's own bar is the last entry when the
         market is open, and is exactly today's-so-far OHLCV `agent.
         market_data_collector` needs for `ret_since_open`/`volume_so_far`;
         see that module for how the two are told apart from the prior
-        `limit - 1` COMPLETE sessions `atr_20` needs)."""
-        return self.bars(symbols, timeframe="1Day", end=end, limit=limit)
+        `limit - 1` COMPLETE sessions `atr_20` needs).
+
+        `start` is optional and, historically, always omitted by every
+        caller -- the live path's own `end` is always "now"/very recent, so
+        leaving `start` to Alpaca's own server-side default has always been
+        safe there. It is NOT safe once `end` is a genuinely past date, as
+        the historical/completed-session research path legitimately needs
+        (see module docstring's CENTRALIZED START<END VALIDATION section):
+        that path always supplies an explicit `start`, which this method
+        forwards unchanged so `bars()`'s own centralized pre-flight check
+        can validate it before any request is sent."""
+        return self.bars(symbols, timeframe="1Day", start=start, end=end,
+                          limit=limit)
 
     def minute_bars(self, symbols: list[str], *, start: datetime,
                    end: datetime) -> dict[str, list[dict]]:

@@ -130,6 +130,36 @@ calendar.trailing_sessions`, which already tolerates a non-trading `as_of`
 by walking back from it). NEVER used by `collect_market_data` above or by
 `agent.pipeline_stage.run_pipeline_stage` -- both stay exactly as they
 were; this is additive, research-path-only surface.
+
+WEEKEND HISTORICAL BAR WINDOW FIX (2026-08-15). The first real canonical
+run of the path above (a genuine Saturday, against real canonical data)
+surfaced an HTTP 400 "end should not be before start" from Alpaca's own
+`/v2/stocks/bars` endpoint. Root cause: `AlpacaMarketDataClient.
+daily_bars()` had always omitted its own `start` parameter (relying on
+Alpaca's own server-side default for the omitted bound), which was safe
+for `collect_market_data`'s always-recent `end` but unsafe for this
+function's genuinely PAST `end` (a completed session's own open, on a
+weekend when `now` is days later) -- see `agent.broker.alpaca_market_data`
+module docstring's own CENTRALIZED START<END VALIDATION section for the
+full analysis (both locally-computed windows were re-verified correct;
+the defect was the omitted bound, not a calendar-arithmetic error). Fixed
+by: (1) `AlpacaMarketDataClient.bars()` now validates `start < end`
+locally, before any HTTP request, whenever both are supplied, via
+`_assert_valid_interval` -- never silently swapped, per that module's own
+docstring; (2) this function now computes an explicit `atr_start` (a
+SEPARATE `trailing_sessions` call from the same-time-metrics one above,
+landing exactly on the oldest of the `_ATR_LOOKBACK + 1` complete sessions
+`daily_bars` needs -- not "some safely early date", since `sort=asc` +
+`limit` means an overly-early `start` would return the WRONG, staler bars)
+and passes it explicitly to `daily_bars`, rather than relying on any
+implicit default; (3) each of the two batch Alpaca calls below is wrapped
+so a fetch-level failure raises `MarketDataFetchError` tagged with which
+operation failed (`"ATR_HISTORY"` or `"SAME_TIME_VOLUME_HISTORY"`) instead
+of a generic, unattributed error. `collect_market_data` above is completely
+UNCHANGED and carries zero risk from this fix: its own `daily_bars` call
+still omits `start` (its `end` is always recent, the condition that was
+always safe), and the new centralized check only activates when both
+bounds are supplied.
 """
 from __future__ import annotations
 
@@ -140,7 +170,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from . import market_calendar
 from .broker.alpaca import _parse_ts as parse_alpaca_ts
-from .broker.alpaca_market_data import AlpacaMarketDataClient
+from .broker.alpaca_market_data import AlpacaMarketDataClient, AlpacaMarketDataError
 from .store import Fact, FactStore
 
 SOURCE_ID = "alpaca_market_data"
@@ -165,6 +195,26 @@ class MarketDataInputError(ValueError):
     session with same-time-window data for median_volume_same_time). Raised
     internally and caught per-symbol by `collect_market_data` -- see module
     docstring's FAIL-SAFE PER SYMBOL section."""
+
+
+class MarketDataFetchError(MarketDataInputError):
+    """A BATCH-level Alpaca bars request itself failed (network error,
+    malformed request window, HTTP error) -- not one symbol's own bars being
+    insufficient. Raised by `collect_market_data_for_completed_session`
+    around each of its two `client.daily_bars`/`client.minute_bars` calls
+    (2026-08-15 weekend historical-bar-window fix), tagged with `operation`
+    (`"ATR_HISTORY"` or `"SAME_TIME_VOLUME_HISTORY"`) so a caller/log line
+    can identify which request failed without guessing or collapsing into a
+    generic `AlpacaMarketDataError`. Deliberately NOT caught per-symbol --
+    a batch fetch failure means no symbol in this cycle has usable data, so
+    it propagates uncaught out of `collect_market_data_for_completed_session`
+    (mirrors `agent.news_collector`'s own documented fetch-level-vs-per-
+    symbol failure split)."""
+
+    def __init__(self, operation: str, cause: Exception):
+        self.operation = operation
+        self.cause = cause
+        super().__init__(f"{operation}: {cause}")
 
 
 @dataclass(frozen=True)
@@ -347,10 +397,42 @@ def collect_market_data_for_completed_session(
     historical_sessions = trailing[:-1]   # strictly before `session`, mirrors collect_market_data
     range_start = market_calendar.session_times(historical_sessions[0]).open
 
+    # Explicit, locally-computed lower bound for the ATR daily-bars request
+    # -- a SEPARATE trailing_sessions call from the one above, even though
+    # _ATR_LOOKBACK and _SAME_TIME_LOOKBACK_SESSIONS both currently equal 20
+    # (module docstring: "one '20 sessions' concept... not two different
+    # magic numbers" refers to the CONSTANTS, not to this call, which is its
+    # own concept). `trailing_sessions(session, N)` returns N sessions
+    # ending WITH `session` itself (oldest first, since `session` is
+    # already confirmed a trading day above); requesting N=_ATR_LOOKBACK+2
+    # therefore makes index [0] the session exactly _ATR_LOOKBACK+1 places
+    # before `session` -- i.e. the OLDEST of the `_ATR_LOOKBACK + 1`
+    # complete sessions strictly before `session` that `daily_bars`'s own
+    # `end=session_st.open` (unchanged, pre-existing, confirmed-correct
+    # exclusion of `session`'s own bar) plus `limit=_ATR_LOOKBACK + 1` need.
+    # This is deliberately exact, not "some safely early date" (module
+    # docstring's CENTRALIZED START<END VALIDATION section on `agent.
+    # broker.alpaca_market_data`: `sort=asc` + `limit` means a too-early
+    # `start` would return the WRONG, staler `_ATR_LOOKBACK + 1` bars, not
+    # just extra ones).
+    atr_sessions = market_calendar.trailing_sessions(session, _ATR_LOOKBACK + 2)
+    atr_start = market_calendar.session_times(atr_sessions[0]).open
+
     # Same two calls collect_market_data makes, `session`/`session_st.close`
-    # substituted for `today`/`now` throughout -- see module docstring.
-    daily = client.daily_bars(symbols, end=session_st.open, limit=_ATR_LOOKBACK + 1)
-    minute = client.minute_bars(symbols, start=range_start, end=session_st.close)
+    # substituted for `today`/`now` throughout -- see module docstring. Each
+    # is wrapped so a BATCH-level fetch failure (network error, malformed
+    # window, HTTP error -- as opposed to one symbol's own bars being
+    # insufficient, handled per-symbol below) is tagged with which specific
+    # operation failed, per `MarketDataFetchError`'s own docstring.
+    try:
+        daily = client.daily_bars(symbols, start=atr_start, end=session_st.open,
+                                  limit=_ATR_LOOKBACK + 1)
+    except AlpacaMarketDataError as exc:
+        raise MarketDataFetchError("ATR_HISTORY", exc) from exc
+    try:
+        minute = client.minute_bars(symbols, start=range_start, end=session_st.close)
+    except AlpacaMarketDataError as exc:
+        raise MarketDataFetchError("SAME_TIME_VOLUME_HISTORY", exc) from exc
 
     facts: list[Fact] = []
     skipped: dict[str, str] = {}

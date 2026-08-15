@@ -13,7 +13,8 @@ from agent import market_calendar
 from agent.accounts import BrokerCredentials
 from agent.broker.alpaca_market_data import AlpacaMarketDataClient
 from agent.broker.transport import ScriptedTransport
-from agent.market_data_collector import (FIELD, SOURCE_ID, MarketDataInputError,
+from agent.market_data_collector import (FIELD, SOURCE_ID, MarketDataFetchError,
+                                         MarketDataInputError,
                                          collect_market_data,
                                          collect_market_data_for_completed_session,
                                          compute_atr_20, compute_same_time_metrics,
@@ -470,6 +471,124 @@ def test_collect_for_completed_session_feeds_build_materiality_candidates():
     assert cand.symbol == "SPY"
     assert cand.ret_since_open == pytest.approx(0.05)
     assert cand.atr_20 == 2.0
+
+
+# ------------------------- WEEKEND HISTORICAL BAR WINDOW FIX (2026-08-15)
+#
+# Ray's first real canonical weekend --research-once run (now=
+# 2026-08-15T14:32:06Z, a genuine Saturday) hit a real Alpaca HTTP 400
+# "end should not be before start" -- root-caused to `daily_bars()` having
+# always omitted its own `start`, safe only for the live path's own
+# always-recent `end`. These tests prove: (1) the exact canonical scenario
+# now succeeds: (2) the actual SERIALIZED daily-bars request has a valid,
+# explicit, correctly-ordered start/end -- not just correct intermediate
+# datetime objects; (3) a genuine batch-level fetch failure is tagged with
+# which operation failed, not collapsed into a generic error.
+
+def test_collect_for_completed_session_sends_an_explicit_valid_start_for_the_atr_request():
+    """The actual SERIALIZED request params -- not just the intermediate
+    `atr_start` datetime object -- must have start < end, and start must
+    land exactly on the oldest of the 21 complete sessions atr_20 needs."""
+    from agent.market_data_collector import _ATR_LOOKBACK
+
+    store = FactStore()
+    t = ScriptedTransport()
+    historical, daily = _daily_bars_for(FRIDAY)
+    t.enqueue(200, _bars_response({"SPY": daily}))
+    session_open = market_calendar.session_times(FRIDAY).open
+    session_close = market_calendar.session_times(FRIDAY).close
+    y_open = market_calendar.session_times(historical[-1]).open
+    t.enqueue(200, _bars_response({"SPY": [
+        minute_bar(session_open, o=100.0, c=100.0, v=300),
+        minute_bar(y_open, o=50.0, c=50.0, v=800),
+    ]}))
+    now = datetime(2026, 8, 15, 14, 32, 6, tzinfo=timezone.utc)   # the real canonical bug report
+    collect_market_data_for_completed_session(client(t), store, ["SPY"], now=now, session=FRIDAY)
+
+    daily_call = t.calls[0]
+    params = daily_call["params"]
+    assert "start" in params   # no longer omitted/implicit
+    # both are real RFC-3339 UTC strings; parse them back to prove ordering
+    # holds on the ACTUAL SERIALIZED values, not just the Python objects.
+    start_dt = datetime.strptime(params["start"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    end_dt = datetime.strptime(params["end"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    assert start_dt < end_dt
+    atr_sessions = market_calendar.trailing_sessions(FRIDAY, _ATR_LOOKBACK + 2)
+    assert start_dt == market_calendar.session_times(atr_sessions[0]).open
+    assert end_dt == session_open
+
+    minute_call = t.calls[1]
+    m_params = minute_call["params"]
+    m_start_dt = datetime.strptime(m_params["start"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    m_end_dt = datetime.strptime(m_params["end"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    assert m_start_dt < m_end_dt
+    assert m_end_dt == session_close
+
+
+def test_collect_for_completed_session_reproduces_the_exact_canonical_bug_report_and_now_succeeds():
+    """Regression for Ray's own real bug report, verbatim: now=
+    2026-08-15T14:32:06Z (Saturday), selected session=2026-08-14 (Friday).
+    Before this fix, the daily-bars request for this exact scenario raised
+    AlpacaMarketDataError (HTTP 400 'end should not be before start') and
+    the run reported market_data=NOT_YET_OBSERVED. It must now succeed and
+    produce a real snapshot."""
+    store = FactStore()
+    t = ScriptedTransport()
+    historical, daily = _daily_bars_for(FRIDAY)
+    t.enqueue(200, _bars_response({"SPY": daily}))
+    session_open = market_calendar.session_times(FRIDAY).open
+    session_close = market_calendar.session_times(FRIDAY).close
+    y_open = market_calendar.session_times(historical[-1]).open
+    t.enqueue(200, _bars_response({"SPY": [
+        minute_bar(session_open, o=100.0, c=100.0, v=300),
+        minute_bar(session_close - timedelta(minutes=1), o=100.0, c=105.0, v=300),
+        minute_bar(y_open, o=50.0, c=50.0, v=800),
+    ]}))
+    now = datetime(2026, 8, 15, 14, 32, 6, tzinfo=timezone.utc)
+    assert most_recent_completed_session(now) == FRIDAY
+
+    result = collect_market_data_for_completed_session(
+        client(t), store, ["SPY"], now=now, session=FRIDAY)
+
+    assert result.skipped == {}
+    assert len(result.facts) == 1
+    fact = result.facts[0]
+    assert fact.observed_at == now
+    assert fact.effective_at == session_close
+    assert fact.value["session"] == FRIDAY.isoformat()
+
+
+def test_collect_for_completed_session_wraps_a_failed_atr_fetch_with_its_own_operation_tag():
+    """A BATCH-level failure on the daily-bars (ATR) request is tagged
+    ATR_HISTORY, not a generic/unattributed AlpacaMarketDataError -- and is
+    NOT caught per-symbol (the per-symbol try/except only wraps
+    compute_atr_20/compute_same_time_metrics, not the fetch itself)."""
+    store = FactStore()
+    t = ScriptedTransport()
+    t.enqueue(400, {"message": "end should not be before start"})
+    now = datetime(2026, 8, 15, 14, 32, 6, tzinfo=timezone.utc)
+    with pytest.raises(MarketDataFetchError, match="ATR_HISTORY") as exc_info:
+        collect_market_data_for_completed_session(client(t), store, ["SPY"], now=now, session=FRIDAY)
+    assert exc_info.value.operation == "ATR_HISTORY"
+    assert len(store) == 0   # nothing partially written
+    assert len(t.calls) == 1   # the minute-bars call was never even attempted
+
+
+def test_collect_for_completed_session_wraps_a_failed_same_time_fetch_with_its_own_operation_tag():
+    """A BATCH-level failure on the minute-bars (same-time-volume) request
+    is tagged SAME_TIME_VOLUME_HISTORY -- the ATR request having already
+    succeeded is irrelevant; each of the two fetches is tagged
+    independently."""
+    store = FactStore()
+    t = ScriptedTransport()
+    _, daily = _daily_bars_for(FRIDAY)
+    t.enqueue(200, _bars_response({"SPY": daily}))
+    t.enqueue(400, {"message": "end should not be before start"})
+    now = datetime(2026, 8, 15, 14, 32, 6, tzinfo=timezone.utc)
+    with pytest.raises(MarketDataFetchError, match="SAME_TIME_VOLUME_HISTORY") as exc_info:
+        collect_market_data_for_completed_session(client(t), store, ["SPY"], now=now, session=FRIDAY)
+    assert exc_info.value.operation == "SAME_TIME_VOLUME_HISTORY"
+    assert len(store) == 0
 
 
 def test_read_market_snapshot_respects_the_look_ahead_guard():

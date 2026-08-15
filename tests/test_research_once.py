@@ -335,6 +335,48 @@ def test_market_data_holiday_selects_prior_completed_session(tmp_path):
     assert result.market_data.market_session == FRIDAY_BEFORE_LABOR_DAY.isoformat()
 
 
+# --------------------- WEEKEND HISTORICAL BAR WINDOW FIX (2026-08-15)
+#
+# Ray's own real bug report, reproduced verbatim: the first genuine
+# canonical --research-once run against real canonical data (Saturday
+# 2026-08-15 ~14:32 UTC) hit a real Alpaca HTTP 400 "end should not be
+# before start" and reported market_data=NOT_YET_OBSERVED, even though the
+# system correctly stayed PAUSED. Root cause and fix are in
+# agent/broker/alpaca_market_data.py and agent/market_data_collector.py's
+# own module docstrings (CENTRALIZED START<END VALIDATION / WEEKEND
+# HISTORICAL BAR WINDOW FIX sections).
+
+CANONICAL_BUG_NOW = datetime(2026, 8, 15, 14, 32, 6, tzinfo=timezone.utc)
+CANONICAL_BUG_SESSION = date(2026, 8, 14)   # the real Friday this now resolves to
+
+
+def test_market_data_reproduces_the_exact_canonical_bug_report_and_now_succeeds(tmp_path):
+    """The exact scenario from Ray's own real-world run: this must now
+    succeed (COLLECTED_HISTORICAL_COMPLETED_SESSION, session=2026-08-14),
+    not the NOT_YET_OBSERVED/AlpacaMarketDataError HTTP 400 it produced
+    before this fix."""
+    client = _market_data_client(_historical_bars_transport(CANONICAL_BUG_SESSION))
+    result = _run(tmp_path=tmp_path, now=CANONICAL_BUG_NOW, market_data_client=client)
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    assert result.market_data.market_session == CANONICAL_BUG_SESSION.isoformat()
+    assert result.market_data.facts_collected == 1
+    assert "AlpacaMarketDataError" not in (result.market_data.reason or "")
+    assert result.persisted_mode == "PAUSED"
+
+
+def test_market_data_reason_surfaces_which_specific_fetch_operation_failed(tmp_path):
+    """OBSERVABILITY requirement: a genuine batch-level Alpaca fetch
+    failure (here, the ATR daily-bars request, simulated by a real HTTP
+    400 response, not an empty queue) is reported with its specific
+    operation tag, not collapsed into a generic, unattributed error."""
+    transport = ScriptedTransport()
+    transport.enqueue(400, {"message": "end should not be before start"})
+    client = _market_data_client(transport)
+    result = _run(tmp_path=tmp_path, now=CANONICAL_BUG_NOW, market_data_client=client)
+    assert result.market_data.status == "NOT_YET_OBSERVED"
+    assert "ATR_HISTORY" in result.market_data.reason
+
+
 def test_market_data_historical_snapshot_carries_a_real_effective_timestamp(tmp_path):
     from agent import market_calendar as mc
     fact_store = FactStore(tmp_path / "facts.jsonl")

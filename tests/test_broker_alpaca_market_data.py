@@ -6,7 +6,7 @@ tests/test_broker_alpaca.py already uses for the trading adapter.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -102,12 +102,17 @@ def test_daily_bars_hits_the_multi_symbol_endpoint_with_1day_timeframe():
 
 
 def test_minute_bars_hits_the_multi_symbol_endpoint_with_1min_timeframe_and_start_end():
+    # start strictly before end -- see CENTRALIZED START<END VALIDATION
+    # section below; an equal start/end (as this fixture used before the
+    # 2026-08-15 weekend historical-bar-window fix) is itself an invalid
+    # interval now, correctly refused before any request is sent.
+    start = T0 - timedelta(minutes=1)
     t = ScriptedTransport()
     t.enqueue(200, {"bars": {"SPY": [bar()]}, "next_page_token": None})
-    client(t).minute_bars(["SPY"], start=T0, end=T0)
+    client(t).minute_bars(["SPY"], start=start, end=T0)
     params = t.calls[0]["params"]
     assert params["timeframe"] == "1Min"
-    assert params["start"] == "2026-07-31T15:00:00Z"
+    assert params["start"] == "2026-07-31T14:59:00Z"
     assert params["end"] == "2026-07-31T15:00:00Z"
 
 
@@ -170,6 +175,76 @@ def test_reads_give_up_after_max_retries_exhausted():
     with pytest.raises(TransportError):
         client(t, max_retries=1).daily_bars(["SPY"], end=T0)
     assert len(t.calls) == 2
+
+
+# ------------------------------------ CENTRALIZED START<END VALIDATION (2026-08-15)
+#
+# The weekend historical-bar-window fix: `bars()` (and therefore both
+# `daily_bars`/`minute_bars`, which funnel through it) now validates
+# `start < end` LOCALLY, before any HTTP request, whenever a caller
+# supplies both -- see agent/broker/alpaca_market_data.py's own module
+# docstring section by this exact name for the real production bug this
+# closes (Alpaca's own 400 "end should not be before start" on a genuine
+# canonical weekend --research-once run).
+
+def test_bars_rejects_a_reversed_interval_before_any_request():
+    t = ScriptedTransport()
+    start = T0
+    end = T0 - timedelta(days=1)   # reversed: end before start
+    with pytest.raises(AlpacaMarketDataError, match="not strictly before"):
+        client(t).bars(["SPY"], timeframe="1Day", start=start, end=end)
+    assert len(t.calls) == 0   # refused locally -- no HTTP request was made
+
+
+def test_bars_rejects_an_equal_start_and_end_interval_before_any_request():
+    """Strict `<`, not `<=` -- an equal start/end is also refused, never
+    silently treated as a zero-width or single-instant window."""
+    t = ScriptedTransport()
+    with pytest.raises(AlpacaMarketDataError, match="not strictly before"):
+        client(t).bars(["SPY"], timeframe="1Min", start=T0, end=T0)
+    assert len(t.calls) == 0
+
+
+def test_bars_never_swaps_a_reversed_interval():
+    """Per the module docstring's own explicit instruction: swapping the
+    two values would hide a real calendar-arithmetic defect in the caller
+    rather than surfacing it -- the error message itself, not a retried
+    request, is the only outcome of a reversed interval."""
+    t = ScriptedTransport()
+    start = T0
+    end = T0 - timedelta(hours=1)
+    with pytest.raises(AlpacaMarketDataError) as exc_info:
+        client(t).bars(["SPY"], timeframe="1Day", start=start, end=end)
+    # both real, un-swapped instants are named in the diagnostic
+    assert "2026-07-31T15:00:00Z" in str(exc_info.value)
+    assert "2026-07-31T14:00:00Z" in str(exc_info.value)
+    assert len(t.calls) == 0
+
+
+def test_bars_with_only_end_supplied_skips_the_interval_check_entirely():
+    """The live path's own `daily_bars(end=...)` call (agent.
+    market_data_collector.collect_market_data) never supplies `start` --
+    this is the case the new centralized check must NOT interfere with,
+    since it is the one path already proven safe against real Alpaca
+    behaviour and this fix must leave it completely unchanged."""
+    t = ScriptedTransport()
+    t.enqueue(200, {"bars": {"SPY": [bar()]}, "next_page_token": None})
+    client(t).daily_bars(["SPY"], end=T0)   # no start -- must not raise
+    assert len(t.calls) == 1
+    assert "start" not in t.calls[0]["params"]
+
+
+def test_daily_bars_forwards_an_explicit_start_when_given():
+    """New, additive, optional `start` on `daily_bars` -- the historical/
+    completed-session research path's own required fix (agent.
+    market_data_collector.collect_market_data_for_completed_session)."""
+    t = ScriptedTransport()
+    start = T0 - timedelta(days=30)
+    t.enqueue(200, {"bars": {"SPY": [bar()]}, "next_page_token": None})
+    client(t).daily_bars(["SPY"], start=start, end=T0, limit=21)
+    params = t.calls[0]["params"]
+    assert params["start"] == "2026-07-01T15:00:00Z"
+    assert params["end"] == "2026-07-31T15:00:00Z"
 
 
 # ------------------------------------------------------------------ no writes
