@@ -79,6 +79,57 @@ This is a deliberate scope decision (a laptop-hosted JSONL store paying for
 is a real storage cost with no consumer yet that needs bar-level history
 back out), not an oversight; a future need for raw bar history is a
 separate, later decision.
+
+WEEKEND / OUT-OF-SESSION RESEARCH: `most_recent_completed_session` +
+`collect_market_data_for_completed_session` (Task 3 follow-up, weekend
+historical-research unit, 2026-08-15). `collect_market_data` above
+(unchanged, still the ONLY function `agent.pipeline_stage.run_pipeline_
+stage` -- the live scheduled loop -- ever calls) returns an honestly EMPTY
+result outside a live session, by design (see OUTSIDE A TRADING SESSION
+above). That is correct for the live loop, but it is exactly the gap
+`scripts/run_agent.py --research-once` (`agent.research_once`) needs to
+route around on a weekend: real historical bars for the most recent
+COMPLETED session are available from the same `AlpacaMarketDataClient`
+Alpaca already serves this collector from, and using them is not
+fabrication -- it is reading real, already-settled market history instead
+of a still-forming or nonexistent live one.
+
+`collect_market_data_for_completed_session` is ADDITIVE and REUSES THE
+SAME ARITHMETIC (`compute_atr_20`/`compute_same_time_metrics`, both
+UNCHANGED) -- it is `collect_market_data` with `session` substituted for
+`today` and `session`'s own CLOSE substituted for `now` everywhere those
+two appear: `atr_20` still excludes `session`'s own bar (`end=session_
+open`, mirroring the live path's own always-exclude-today's-still-forming-
+bar reasoning, even though `session`'s bar is actually complete -- kept
+consistent rather than re-derived); `ret_since_open`/`volume_so_far` become
+`session`'s own full-day open-to-close return/volume (there is no "so far"
+for a session that has already closed); `median_volume_same_time` becomes
+the median FULL-SESSION volume across the trailing comparison sessions --
+the direct full-day analogue of the live path's own same-elapsed-minutes
+comparison, arrived at by feeding the SAME `compute_same_time_metrics`
+`now=session_close` instead of a live `now` still mid-session.
+
+TRUTHFUL, DELIBERATELY DIFFERENT `observed_at`/`effective_at` -- NEVER
+"FRIDAY DATA STAMPED AS SATURDAY". Unlike the live path (both `now`), a
+historical-completed-session `Fact` sets `observed_at=now` (the REAL
+wall-clock instant this system actually computed/persisted this snapshot
+-- honest per `agent.store.Fact`'s own "earliest moment WE could have
+known this" contract: nothing in this codebase derived this particular
+snapshot before the research command actually ran) and
+`effective_at=session's own real close instant` (the actual period this
+snapshot describes). This is what keeps a Friday session's data from ever
+being represented as Saturday's own: `effective_at` says, truthfully,
+"this describes Friday's close," while `observed_at` honestly says when
+this system came to know it.
+
+`most_recent_completed_session(now)`: the most recent NYSE session that
+has FULLY CLOSED as of `now` -- `today` itself if `now` is at or after
+today's own close, otherwise the most recent trading day strictly before
+`today` (walking back through a weekend/holiday via `agent.market_
+calendar.trailing_sessions`, which already tolerates a non-trading `as_of`
+by walking back from it). NEVER used by `collect_market_data` above or by
+`agent.pipeline_stage.run_pipeline_stage` -- both stay exactly as they
+were; this is additive, research-path-only surface.
 """
 from __future__ import annotations
 
@@ -236,6 +287,96 @@ def collect_market_data(client: AlpacaMarketDataClient, store: FactStore,
         }
         fact = Fact(entity_id=symbol, field=FIELD, value=value,
                    observed_at=now, effective_at=now, source_id=SOURCE_ID)
+        store.append(fact)
+        facts.append(fact)
+    return MarketDataCollectionResult(facts=tuple(facts), skipped=skipped)
+
+
+def most_recent_completed_session(now: datetime) -> date:
+    """The most recent NYSE trading session that had FULLY CLOSED as of
+    `now` -- see module docstring's WEEKEND / OUT-OF-SESSION RESEARCH
+    section. If `now` is at or after today's own session close, today IS
+    the most recent completed session. Otherwise (a non-trading day, or a
+    trading day whose session has not yet closed as of `now`), this walks
+    back to the most recent trading day strictly before today via
+    `agent.market_calendar.trailing_sessions`, which already tolerates a
+    non-trading `as_of` by walking back from it -- so a Saturday, Sunday,
+    or holiday `now` all correctly resolve to the prior Friday (or
+    whatever real trading day precedes them), with no separate weekend/
+    holiday branching needed here."""
+    if now.tzinfo is None:
+        raise MarketDataInputError("now must be a timezone-aware datetime")
+    today = market_calendar.session_for_instant(now)
+    if market_calendar.is_trading_day(today) and now >= market_calendar.session_times(today).close:
+        return today
+    return market_calendar.trailing_sessions(today - timedelta(days=1), 1)[0]
+
+
+def collect_market_data_for_completed_session(
+    client: AlpacaMarketDataClient, store: FactStore, symbols: list[str], *,
+    now: datetime, session: date,
+) -> MarketDataCollectionResult:
+    """Research-only counterpart to `collect_market_data` above, for when
+    `now` falls OUTSIDE a live trading session -- see module docstring's
+    WEEKEND / OUT-OF-SESSION RESEARCH section for the full reasoning.
+    `session` is normally `most_recent_completed_session(now)`; callers may
+    pass a different, already-verified completed session (e.g. a test).
+
+    Refuses (`MarketDataInputError`) if `session` is not itself a real NYSE
+    trading day, or if `session`'s own close is after `now` -- a session
+    that has not yet closed is not "completed", and this function must
+    never be used to reach into a still-forming or future session (no
+    future leakage). FAIL-SAFE PER SYMBOL, identical posture to
+    `collect_market_data`: a symbol with insufficient real history is
+    skipped with an explicit reason, never fabricated."""
+    if now.tzinfo is None:
+        raise MarketDataInputError("now must be a timezone-aware datetime")
+    if not market_calendar.is_trading_day(session):
+        raise MarketDataInputError(
+            f"{session.isoformat()} is not an NYSE trading day -- cannot "
+            "be used as a completed-session as-of point")
+    session_st = market_calendar.session_times(session)
+    if session_st.close > now:
+        raise MarketDataInputError(
+            f"{session.isoformat()}'s own session close "
+            f"({session_st.close.isoformat()}) is after now "
+            f"({now.isoformat()}) -- refusing to treat a session that has "
+            "not yet closed as completed (no future leakage)")
+
+    trailing = market_calendar.trailing_sessions(session, _SAME_TIME_LOOKBACK_SESSIONS + 1)
+    historical_sessions = trailing[:-1]   # strictly before `session`, mirrors collect_market_data
+    range_start = market_calendar.session_times(historical_sessions[0]).open
+
+    # Same two calls collect_market_data makes, `session`/`session_st.close`
+    # substituted for `today`/`now` throughout -- see module docstring.
+    daily = client.daily_bars(symbols, end=session_st.open, limit=_ATR_LOOKBACK + 1)
+    minute = client.minute_bars(symbols, start=range_start, end=session_st.close)
+
+    facts: list[Fact] = []
+    skipped: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            bars = sorted(daily.get(symbol, []), key=lambda b: b["t"])
+            atr_20 = compute_atr_20(bars)
+            intraday = compute_same_time_metrics(
+                minute.get(symbol, []), today=session, now=session_st.close)
+        except MarketDataInputError as exc:
+            skipped[symbol] = str(exc)
+            continue
+        value = {
+            "atr_20": atr_20,
+            "ret_since_open": intraday["ret_since_open"],
+            "volume_so_far": intraday["volume_so_far"],
+            "median_volume_same_time": intraday["median_volume_same_time"],
+            "current_price": intraday["current_price"],
+            # Additive, research-path-only marker distinguishing a
+            # historical-completed-session snapshot from a live one on
+            # inspection -- does not change the four keys agent.
+            # materiality_cycle.build_materiality_candidates itself reads.
+            "session": session.isoformat(),
+        }
+        fact = Fact(entity_id=symbol, field=FIELD, value=value,
+                   observed_at=now, effective_at=session_st.close, source_id=SOURCE_ID)
         store.append(fact)
         facts.append(fact)
     return MarketDataCollectionResult(facts=tuple(facts), skipped=skipped)

@@ -14,8 +14,10 @@ from agent.accounts import BrokerCredentials
 from agent.broker.alpaca_market_data import AlpacaMarketDataClient
 from agent.broker.transport import ScriptedTransport
 from agent.market_data_collector import (FIELD, SOURCE_ID, MarketDataInputError,
-                                         collect_market_data, compute_atr_20,
-                                         compute_same_time_metrics,
+                                         collect_market_data,
+                                         collect_market_data_for_completed_session,
+                                         compute_atr_20, compute_same_time_metrics,
+                                         most_recent_completed_session,
                                          read_market_snapshot)
 from agent.secrets_provider import InMemorySecretsProvider
 from agent.store import FactStore
@@ -261,6 +263,214 @@ def test_collect_requests_daily_bars_ending_at_todays_open_not_now():
 
 
 # --------------------------------------------------------------- read_market_snapshot
+
+# ---------------------------------------------------- most_recent_completed_session
+#
+# Weekend / out-of-session historical-research unit (2026-08-15). Real,
+# confirmed dates: 2026-08-14 is a Friday (an ordinary NYSE trading day),
+# 2026-08-15/16 are the following Saturday/Sunday, 2026-08-17 is the next
+# Monday (also an ordinary trading day), and 2026-09-07 is Labor Day (a
+# real NYSE holiday, itself a Monday) with 2026-09-04 the Friday before it.
+
+FRIDAY = date(2026, 8, 14)
+SATURDAY = date(2026, 8, 15)
+SUNDAY = date(2026, 8, 16)
+MONDAY = date(2026, 8, 17)
+LABOR_DAY = date(2026, 9, 7)
+FRIDAY_BEFORE_LABOR_DAY = date(2026, 9, 4)
+
+
+def test_most_recent_completed_session_saturday_selects_friday():
+    now = datetime(2026, 8, 15, 15, 0, tzinfo=timezone.utc)
+    assert most_recent_completed_session(now) == FRIDAY
+
+
+def test_most_recent_completed_session_sunday_selects_friday():
+    now = datetime(2026, 8, 16, 15, 0, tzinfo=timezone.utc)
+    assert most_recent_completed_session(now) == FRIDAY
+
+
+def test_most_recent_completed_session_pre_open_monday_selects_friday():
+    monday_open = market_calendar.session_times(MONDAY).open
+    now = monday_open - timedelta(minutes=5)
+    assert most_recent_completed_session(now) == FRIDAY
+
+
+def test_most_recent_completed_session_after_close_monday_selects_monday():
+    monday_close = market_calendar.session_times(MONDAY).close
+    now = monday_close + timedelta(minutes=5)
+    assert most_recent_completed_session(now) == MONDAY
+
+
+def test_most_recent_completed_session_mid_session_monday_selects_friday():
+    """During-session behaviour is handled by the DISPATCH in
+    agent.research_once (it never calls this function while the market is
+    actually open) -- but this function's own contract, exercised directly,
+    is still correct on its own terms: a session that has not yet closed
+    is not yet "completed", so the answer is still the prior session."""
+    monday_open = market_calendar.session_times(MONDAY).open
+    now = monday_open + timedelta(minutes=30)
+    assert most_recent_completed_session(now) == FRIDAY
+
+
+def test_most_recent_completed_session_holiday_selects_prior_session():
+    now = datetime(2026, 9, 7, 15, 0, tzinfo=timezone.utc)   # Labor Day
+    assert most_recent_completed_session(now) == FRIDAY_BEFORE_LABOR_DAY
+
+
+def test_most_recent_completed_session_rejects_naive_datetime():
+    with pytest.raises(MarketDataInputError, match="timezone-aware"):
+        most_recent_completed_session(datetime(2026, 8, 15, 15, 0))
+
+
+# ------------------------------------------------ collect_market_data_for_completed_session
+
+def _daily_bars_for(session: date, n: int = 21):
+    historical = market_calendar.trailing_sessions(session, n + 1)[:-1]
+    return historical, [daily_bar(f"{d.isoformat()}T00:00:00Z", 100.0, h=101.0, l=99.0)
+                        for d in historical]
+
+
+def test_collect_for_completed_session_carries_a_real_effective_timestamp_distinct_from_now():
+    """THE central truthfulness guarantee: effective_at is the session's
+    OWN real close instant (Friday), observed_at is the real wall-clock
+    `now` this command actually ran at (Saturday) -- never Friday data
+    stamped as if it were Saturday's."""
+    store = FactStore()
+    t = ScriptedTransport()
+    historical, daily = _daily_bars_for(FRIDAY)
+    t.enqueue(200, _bars_response({"SPY": daily}))
+
+    session_open = market_calendar.session_times(FRIDAY).open
+    session_close = market_calendar.session_times(FRIDAY).close
+    y_open = market_calendar.session_times(historical[-1]).open
+    t.enqueue(200, _bars_response({"SPY": [
+        minute_bar(session_open, o=100.0, c=100.0, v=300),
+        minute_bar(session_close - timedelta(minutes=1), o=100.0, c=105.0, v=300),
+        minute_bar(y_open, o=50.0, c=50.0, v=800),
+    ]}))
+
+    now = datetime(2026, 8, 15, 15, 0, tzinfo=timezone.utc)   # Saturday
+    result = collect_market_data_for_completed_session(
+        client(t), store, ["SPY"], now=now, session=FRIDAY)
+
+    assert result.skipped == {}
+    assert len(result.facts) == 1
+    fact = result.facts[0]
+    assert fact.observed_at == now                      # real collection instant
+    assert fact.effective_at == session_close            # Friday's own real close
+    assert fact.effective_at != now
+    assert fact.effective_at.date() == FRIDAY
+    assert fact.value["session"] == FRIDAY.isoformat()
+    assert fact.value["ret_since_open"] == pytest.approx(0.05)
+    assert fact.value["volume_so_far"] == 600.0
+    assert fact.value["median_volume_same_time"] == 800.0
+    assert len(store) == 1
+
+
+def test_collect_for_completed_session_never_requests_bars_past_the_sessions_own_close():
+    """NO FUTURE LEAKAGE: the minute-bar window's own `end` param sent to
+    the market data client is the completed session's own close, never
+    `now` (which, for a Saturday research run, is genuinely later) -- so a
+    real Monday bar could never even be requested, let alone leak in."""
+    store = FactStore()
+    t = ScriptedTransport()
+    _, daily = _daily_bars_for(FRIDAY)
+    t.enqueue(200, _bars_response({"SPY": daily}))
+    session_open = market_calendar.session_times(FRIDAY).open
+    session_close = market_calendar.session_times(FRIDAY).close
+    t.enqueue(200, _bars_response({"SPY": [
+        minute_bar(session_open, o=100.0, c=100.0, v=1),
+        minute_bar(market_calendar.trailing_sessions(FRIDAY, 22)[0], o=1.0, c=1.0, v=1),
+    ]}))
+    now = datetime(2026, 8, 17, 20, 0, tzinfo=timezone.utc)   # Monday evening, well after Friday
+    collect_market_data_for_completed_session(client(t), store, ["SPY"], now=now, session=FRIDAY)
+
+    daily_call, minute_call = t.calls[0], t.calls[1]
+    expected_daily_end = session_open.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expected_minute_end = session_close.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert daily_call["params"]["end"] == expected_daily_end
+    assert minute_call["params"]["end"] == expected_minute_end
+    # Neither request's own `end` is `now` -- both are strictly bounded by
+    # `session`'s own real times, regardless of how much later `now` is.
+    assert expected_minute_end != now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_collect_for_completed_session_skips_a_symbol_with_insufficient_history_never_invents_values():
+    store = FactStore()
+    t = ScriptedTransport()
+    historical, good_daily = _daily_bars_for(FRIDAY)
+    t.enqueue(200, _bars_response({"SPY": good_daily, "NEWCO": good_daily[-5:]}))
+    session_open = market_calendar.session_times(FRIDAY).open
+    y_open = market_calendar.session_times(historical[-1]).open
+    minute_bars = {
+        "SPY": [minute_bar(session_open, o=100.0, c=105.0, v=400),
+               minute_bar(y_open, o=50.0, c=50.0, v=800)],
+        "NEWCO": [minute_bar(session_open, o=10.0, c=10.0, v=10),
+                 minute_bar(y_open, o=10.0, c=10.0, v=10)],
+    }
+    t.enqueue(200, _bars_response(minute_bars))
+    now = datetime(2026, 8, 15, 15, 0, tzinfo=timezone.utc)
+    result = collect_market_data_for_completed_session(
+        client(t), store, ["SPY", "NEWCO"], now=now, session=FRIDAY)
+    assert set(result.skipped) == {"NEWCO"}
+    assert "21" in result.skipped["NEWCO"]
+    assert [f.entity_id for f in result.facts] == ["SPY"]
+    # NEWCO gets no fact at all -- never a fabricated/guessed snapshot.
+    assert read_market_snapshot(store.as_of(now), "NEWCO") is None
+
+
+def test_collect_for_completed_session_refuses_a_non_trading_day_session():
+    store = FactStore()
+    with pytest.raises(MarketDataInputError, match="not an NYSE trading day"):
+        collect_market_data_for_completed_session(
+            client(ScriptedTransport()), store, ["SPY"],
+            now=datetime(2026, 8, 15, 15, 0, tzinfo=timezone.utc), session=SATURDAY)
+
+
+def test_collect_for_completed_session_refuses_a_session_that_has_not_yet_closed():
+    """A second no-future-leakage guard, independent of the bar-request
+    windowing test above: even asking this function to treat a session
+    that has not yet closed (relative to `now`) as "completed" is refused
+    outright, before any request is made."""
+    store = FactStore()
+    session_open = market_calendar.session_times(MONDAY).open
+    still_open = session_open + timedelta(minutes=30)
+    with pytest.raises(MarketDataInputError, match="not yet closed"):
+        collect_market_data_for_completed_session(
+            client(ScriptedTransport()), store, ["SPY"], now=still_open, session=MONDAY)
+
+
+def test_collect_for_completed_session_feeds_build_materiality_candidates():
+    """The resulting historical snapshot is READABLE by the same T3 input-
+    building function the live path feeds -- proves this isn't a shape
+    that only looks right in isolation."""
+    from agent.materiality_cycle import build_materiality_candidates
+
+    store = FactStore()
+    t = ScriptedTransport()
+    historical, daily = _daily_bars_for(FRIDAY)
+    t.enqueue(200, _bars_response({"SPY": daily}))
+    session_open = market_calendar.session_times(FRIDAY).open
+    session_close = market_calendar.session_times(FRIDAY).close
+    y_open = market_calendar.session_times(historical[-1]).open
+    t.enqueue(200, _bars_response({"SPY": [
+        minute_bar(session_open, o=100.0, c=100.0, v=300),
+        minute_bar(session_close - timedelta(minutes=1), o=100.0, c=105.0, v=300),
+        minute_bar(y_open, o=50.0, c=50.0, v=800),
+    ]}))
+    now = datetime(2026, 8, 15, 15, 0, tzinfo=timezone.utc)
+    collect_market_data_for_completed_session(client(t), store, ["SPY"], now=now, session=FRIDAY)
+
+    built = build_materiality_candidates(
+        store.as_of(now), {"SPY": "ETF"}, now=now, min_peer_group_size=3)
+    assert built.skipped == {}
+    assert len(built.candidates) == 1
+    cand = built.candidates[0]
+    assert cand.symbol == "SPY"
+    assert cand.ret_since_open == pytest.approx(0.05)
+    assert cand.atr_20 == 2.0
+
 
 def test_read_market_snapshot_respects_the_look_ahead_guard():
     store = FactStore()

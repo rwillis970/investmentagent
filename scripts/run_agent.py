@@ -1411,13 +1411,15 @@ def _run_research_once(*, config_path: str, account_id: str | None, key_id: str 
         return 1
 
     log.info(
-        "--research-once complete: persisted_mode=%s market_data=%s(collected=%d "
-        "dedup=%d) edgar_filings=%s(collected=%d dedup=%d) news=%s(collected=%d "
+        "--research-once complete: persisted_mode=%s collected_now=%s "
+        "market_data=%s(collected=%d dedup=%d) market_session=%s "
+        "edgar_filings=%s(collected=%d dedup=%d) news=%s(collected=%d "
         "dedup=%d) materiality_evaluations=%d triggered=%d suppressed=%d "
         "not_material=%d events_persisted=%d events_persistence_failed=%d",
-        result.persisted_mode,
+        result.persisted_mode, result.now.isoformat(),
         result.market_data.status, result.market_data.facts_collected,
         result.market_data.facts_deduplicated,
+        result.market_data.market_session or "n/a",
         result.edgar_filings.status, result.edgar_filings.facts_collected,
         result.edgar_filings.facts_deduplicated,
         result.news.status, result.news.facts_collected, result.news.facts_deduplicated,

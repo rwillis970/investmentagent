@@ -123,7 +123,9 @@ from .broker.alpaca_market_data import AlpacaMarketDataClient
 from .cost import CostLedger
 from .edgar import EdgarClient
 from .edgar_collector import EdgarCollectionResult, TickerCikCache, collect_filings
-from .market_data_collector import MarketDataCollectionResult, collect_market_data
+from .market_data_collector import (MarketDataCollectionResult, collect_market_data,
+                                    collect_market_data_for_completed_session,
+                                    most_recent_completed_session)
 from .materiality import MaterialityPolicy
 from .materiality_cycle import run_materiality_cycle
 from .mode_store import ModeStore
@@ -136,6 +138,14 @@ REQUIRED_MODE = "PAUSED"
 
 _NOT_YET_OBSERVED = "NOT_YET_OBSERVED"
 _COLLECTED = "COLLECTED"
+# Weekend historical-market-research follow-up unit, 2026-08-15: a market
+# snapshot sourced from the most recent COMPLETED trading session's real
+# historical bars, not a live/still-forming session -- see agent.market_
+# data_collector's own WEEKEND / OUT-OF-SESSION RESEARCH section. Reported
+# as its own distinct status, never silently folded into "COLLECTED", so a
+# reader of this command's output can always tell live data from historical
+# research data apart at a glance.
+_COLLECTED_HISTORICAL_COMPLETED_SESSION = "COLLECTED_HISTORICAL_COMPLETED_SESSION"
 
 
 class ResearchOnceRefused(Exception):
@@ -158,6 +168,12 @@ class ProviderOutcome:
     facts_deduplicated: int = 0
     skipped: dict = field(default_factory=dict)
     reason: str | None = None
+    # Only ever set when status == _COLLECTED_HISTORICAL_COMPLETED_SESSION
+    # (weekend historical-market-research unit, 2026-08-15) -- the real
+    # NYSE trading-session date (ISO, e.g. "2026-08-14") the historical
+    # snapshot describes, distinct from `now`/`collected_now` (when this
+    # command actually ran). None for every other provider/status.
+    market_session: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +196,26 @@ class ResearchOnceResult:
     )
 
 
+def _in_live_session(now: datetime) -> bool:
+    """True only while today's own regular session is actually open --
+    `session.open <= now < session.close` on a real trading day. This is
+    the ONE dispatch decision `_facts_collector_market_data` makes between
+    the live path (`collect_market_data`, unchanged) and the weekend/
+    historical path (`collect_market_data_for_completed_session`, added
+    this unit) -- see agent.market_data_collector's own WEEKEND / OUT-OF-
+    SESSION RESEARCH section. Deliberately stricter than `collect_market_
+    data`'s own internal `now < today_open` check alone: this function ALSO
+    routes an after-close `now` on an otherwise-real trading day to the
+    historical path (mission requirement: "after-close Monday -> selects
+    Monday completed session"), which `collect_market_data`'s own check
+    would not have caught by itself."""
+    today = market_calendar.session_for_instant(now)
+    if not market_calendar.is_trading_day(today):
+        return False
+    st = market_calendar.session_times(today)
+    return st.open <= now < st.close
+
+
 def _facts_collector_market_data(client: AlpacaMarketDataClient | None,
                                  fact_store: FactStore, symbols: list[str], *,
                                  now: datetime) -> ProviderOutcome:
@@ -187,29 +223,36 @@ def _facts_collector_market_data(client: AlpacaMarketDataClient | None,
         return ProviderOutcome(status=_NOT_YET_OBSERVED,
                                reason="no market data client configured "
                                       "(--key-id/--secret-ref not supplied)")
-    today = market_calendar.session_for_instant(now)
-    if not market_calendar.is_trading_day(today):
-        return ProviderOutcome(
-            status=_NOT_YET_OBSERVED,
-            reason=f"{today.isoformat()} is not a trading day -- agent."
-                   f"market_data_collector.collect_market_data returns no "
-                   f"facts, no error, outside a trading session (see that "
-                   f"module's own OUTSIDE A TRADING SESSION section)")
-    today_open = market_calendar.session_times(today).open
-    if now < today_open:
-        return ProviderOutcome(
-            status=_NOT_YET_OBSERVED,
-            reason=f"now ({now.isoformat()}) is before today's own session "
-                   f"open ({today_open.isoformat()}) -- same honest-empty "
-                   f"collector behaviour as a non-trading day")
+    if _in_live_session(now):
+        # WHEN THE MARKET IS OPEN: preserve existing current-session
+        # behaviour, byte-for-byte -- see this unit's own mission text.
+        try:
+            result: MarketDataCollectionResult = collect_market_data(
+                client, fact_store, symbols, now=now)
+        except Exception as exc:   # noqa: BLE001 -- report, never abort the run
+            return ProviderOutcome(status=_NOT_YET_OBSERVED,
+                                   reason=f"{type(exc).__name__}: {exc}")
+        return ProviderOutcome(status=_COLLECTED, facts_collected=len(result.facts),
+                               facts_deduplicated=0, skipped=dict(result.skipped))
+
+    # WHEN THE MARKET IS CLOSED (weekend, holiday, before today's own
+    # open, or after today's own close): retrieve the most recent
+    # COMPLETED session's real historical bars instead of returning empty
+    # -- see agent.market_data_collector's own WEEKEND / OUT-OF-SESSION
+    # RESEARCH section for the full reasoning and the truthful-timestamp
+    # guarantee (never "Friday data stamped as Saturday").
     try:
-        result: MarketDataCollectionResult = collect_market_data(
-            client, fact_store, symbols, now=now)
+        session = most_recent_completed_session(now)
+        result = collect_market_data_for_completed_session(
+            client, fact_store, symbols, now=now, session=session)
     except Exception as exc:   # noqa: BLE001 -- report, never abort the run
         return ProviderOutcome(status=_NOT_YET_OBSERVED,
                                reason=f"{type(exc).__name__}: {exc}")
-    return ProviderOutcome(status=_COLLECTED, facts_collected=len(result.facts),
-                           facts_deduplicated=0, skipped=dict(result.skipped))
+    return ProviderOutcome(
+        status=_COLLECTED_HISTORICAL_COMPLETED_SESSION,
+        facts_collected=len(result.facts), facts_deduplicated=0,
+        skipped=dict(result.skipped), market_session=session.isoformat(),
+    )
 
 
 def _facts_collector_edgar(client: EdgarClient | None, fact_store: FactStore,

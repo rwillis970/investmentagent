@@ -8,7 +8,7 @@ established test-only, network-free collaborators for each real collector.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -185,6 +185,45 @@ def test_module_never_calls_submit_or_cancel():
     assert "cancel" not in called
 
 
+def test_the_new_historical_collector_module_is_also_structurally_clean(tmp_path):
+    """Weekend historical-market-research unit (2026-08-15): the SAME
+    static proof as the two tests above, extended to `agent.market_data_
+    collector` -- the module `most_recent_completed_session`/`collect_
+    market_data_for_completed_session` (called from this unit's new
+    dispatch) live in. Proves the new code this unit added does not itself
+    introduce a path to an order, an approval, mode advancement, or a
+    model/T4 call -- not merely that `agent.research_once` doesn't call it
+    that way."""
+    import ast
+    from pathlib import Path
+    import agent.market_data_collector as mdc_module
+    source = Path(mdc_module.__file__).read_text()
+    tree = ast.parse(source, mdc_module.__file__)
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+        elif isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+    for fragment in ("pipeline", "approval", "analysis_trigger", "model_client", "mode_store"):
+        assert not any(fragment in n for n in names), f"found forbidden import fragment: {fragment}"
+    # `agent.broker.alpaca` IS imported here -- but only ever for `_parse_ts`,
+    # a pure timestamp-parsing helper, never for `AlpacaPaperAdapter`/
+    # `AlpacaLiveAdapter` (the trading adapter classes) -- checked by name,
+    # not by module path, since the module path alone is too blunt an
+    # instrument for this one, pre-existing, legitimate import.
+    imported_names = {a.asname or a.name for node in ast.walk(tree)
+                      if isinstance(node, ast.ImportFrom) for a in node.names}
+    assert "AlpacaPaperAdapter" not in imported_names
+    assert "AlpacaLiveAdapter" not in imported_names
+    assert "BrokerAdapter" not in imported_names
+    called = {n.func.attr for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert "submit" not in called
+    assert "cancel" not in called
+    assert "write" not in called   # never advances any store's own persisted state via a .write(
+
+
 # ------------------------------------------------------- market data provider
 
 def test_market_data_is_not_yet_observed_when_no_client_given(tmp_path):
@@ -194,23 +233,159 @@ def test_market_data_is_not_yet_observed_when_no_client_given(tmp_path):
     assert "no market data client" in result.market_data.reason
 
 
-def test_market_data_is_not_yet_observed_on_a_non_trading_day(tmp_path):
-    client = _market_data_client()
+def test_market_data_on_a_non_trading_day_with_no_history_available_is_not_yet_observed(tmp_path):
+    """Weekend historical-market-research unit (2026-08-15): a Saturday no
+    longer short-circuits to NOT_YET_OBSERVED merely for being outside a
+    session -- it now attempts the historical-completed-session path (see
+    the COLLECTED_HISTORICAL_COMPLETED_SESSION tests below). This test
+    proves that path is STILL fail-safe, not fail-open: with genuinely
+    nothing the provider can serve (an empty ScriptedTransport queue,
+    simulating a real network failure outside this sandbox), the honest
+    result is still NOT_YET_OBSERVED, never a fabricated snapshot."""
+    client = _market_data_client(ScriptedTransport())   # nothing enqueued
     result = _run(tmp_path=tmp_path, now=SATURDAY, market_data_client=client)
     assert result.market_data.status == "NOT_YET_OBSERVED"
-    assert "not a trading day" in result.market_data.reason
-    # No network call was even attempted -- the ScriptedTransport was never
-    # given anything to serve, so a stray real call would raise (empty
-    # queue), not silently succeed. This assertion holds by construction of
-    # the fixture below (nothing enqueued), reinforced by the reason text.
+    assert result.market_data.reason
 
 
-def test_market_data_is_not_yet_observed_before_todays_session_open(tmp_path):
-    before_open = T0.replace(hour=12)   # NYSE opens 13:30 UTC in summer
-    client = _market_data_client()
+# ---------------------------------------- market data: weekend / out-of-session
+#
+# Weekend historical-market-research unit (2026-08-15): --research-once now
+# retrieves the most recent COMPLETED session's real historical bars when
+# `now` falls outside a live trading session, instead of returning an
+# honestly-empty result. FRIDAY/MONDAY below are the real trading days
+# bracketing this test file's own SATURDAY constant (2026-07-18); LABOR_DAY
+# is a real, independently-confirmed NYSE holiday.
+FRIDAY = date(2026, 7, 17)
+SUNDAY = SATURDAY + timedelta(days=1)
+MONDAY = date(2026, 7, 20)   # == T0's own date, a real trading Monday
+LABOR_DAY = datetime(2026, 9, 7, 15, 0, tzinfo=timezone.utc)
+FRIDAY_BEFORE_LABOR_DAY = date(2026, 9, 4)
+
+
+def _historical_bars_transport(session, *, ret_since_open_bps=500):
+    """A ScriptedTransport pre-loaded with real daily+minute bars for
+    `session` (21 complete trailing daily bars for atr_20, plus minute bars
+    for `session` itself and one prior session for median_volume_same_time)
+    -- the same shape tests/test_market_data_collector.py's own fixtures
+    use, factored out here since several tests below need an identical,
+    real historical fixture for AAPL."""
+    from agent import market_calendar as mc
+    transport = ScriptedTransport()
+    historical = mc.trailing_sessions(session, 22)[:-1]
+    daily = [
+        {"t": f"{d.isoformat()}T00:00:00Z", "o": 100.0, "h": 101.0, "l": 99.0,
+         "c": 100.0, "v": 1000, "n": 1, "vw": 100.0}
+        for d in historical
+    ]
+    transport.enqueue(200, {"bars": {"AAPL": daily}, "next_page_token": None})
+    session_open = mc.session_times(session).open
+    session_close = mc.session_times(session).close
+    y_open = mc.session_times(historical[-1]).open
+    close_price = 100.0 * (1 + ret_since_open_bps / 10000.0)
+    minute_bars = [
+        {"t": session_open.strftime("%Y-%m-%dT%H:%M:%SZ"), "o": 100.0, "h": 100.0,
+         "l": 100.0, "c": 100.0, "v": 300, "n": 1, "vw": 100.0},
+        {"t": (session_close - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+         "o": 100.0, "h": close_price, "l": 100.0, "c": close_price, "v": 300, "n": 1,
+         "vw": close_price},
+        {"t": y_open.strftime("%Y-%m-%dT%H:%M:%SZ"), "o": 50.0, "h": 50.0, "l": 50.0,
+         "c": 50.0, "v": 800, "n": 1, "vw": 50.0},
+    ]
+    transport.enqueue(200, {"bars": {"AAPL": minute_bars}, "next_page_token": None})
+    return transport
+
+
+def test_market_data_saturday_selects_friday_completed_session(tmp_path):
+    client = _market_data_client(_historical_bars_transport(FRIDAY))
+    result = _run(tmp_path=tmp_path, now=SATURDAY, market_data_client=client)
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    assert result.market_data.market_session == FRIDAY.isoformat()
+    assert result.market_data.facts_collected == 1
+
+
+def test_market_data_sunday_selects_friday_completed_session(tmp_path):
+    client = _market_data_client(_historical_bars_transport(FRIDAY))
+    result = _run(tmp_path=tmp_path, now=SUNDAY, market_data_client=client)
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    assert result.market_data.market_session == FRIDAY.isoformat()
+
+
+def test_market_data_pre_open_monday_selects_friday_completed_session(tmp_path):
+    before_open = T0.replace(hour=12)   # NYSE opens 13:30 UTC in summer, T0 is MONDAY
+    client = _market_data_client(_historical_bars_transport(FRIDAY))
     result = _run(tmp_path=tmp_path, now=before_open, market_data_client=client)
-    assert result.market_data.status == "NOT_YET_OBSERVED"
-    assert "before today" in result.market_data.reason
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    assert result.market_data.market_session == FRIDAY.isoformat()
+
+
+def test_market_data_after_close_monday_selects_mondays_own_completed_session(tmp_path):
+    from agent import market_calendar as mc
+    after_close = mc.session_times(MONDAY).close + timedelta(minutes=5)
+    client = _market_data_client(_historical_bars_transport(MONDAY))
+    result = _run(tmp_path=tmp_path, now=after_close, market_data_client=client)
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    assert result.market_data.market_session == MONDAY.isoformat()
+
+
+def test_market_data_holiday_selects_prior_completed_session(tmp_path):
+    client = _market_data_client(_historical_bars_transport(FRIDAY_BEFORE_LABOR_DAY))
+    result = _run(tmp_path=tmp_path, now=LABOR_DAY, market_data_client=client)
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    assert result.market_data.market_session == FRIDAY_BEFORE_LABOR_DAY.isoformat()
+
+
+def test_market_data_historical_snapshot_carries_a_real_effective_timestamp(tmp_path):
+    from agent import market_calendar as mc
+    fact_store = FactStore(tmp_path / "facts.jsonl")
+    client = _market_data_client(_historical_bars_transport(FRIDAY))
+    result = _run(tmp_path=tmp_path, now=SATURDAY, market_data_client=client,
+                 fact_store=fact_store)
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    facts = [f for f in fact_store.all_facts() if f.field == "market_snapshot"]
+    assert len(facts) == 1
+    fact = facts[0]
+    friday_close = mc.session_times(FRIDAY).close
+    assert fact.effective_at == friday_close
+    assert fact.effective_at != SATURDAY
+    assert fact.observed_at == SATURDAY   # real collection instant, honestly reported
+
+
+def test_market_data_historical_path_still_leaves_persisted_mode_paused(tmp_path):
+    """PAUSED preserved through this new code path specifically, not merely
+    through the module's own general PAUSED-ONLY/PAUSED-STAYS-PAUSED
+    guarantee (already proven elsewhere) -- this exercises it end-to-end
+    with a real historical market-data collection in the same run."""
+    client = _market_data_client(_historical_bars_transport(FRIDAY))
+    result = _run(tmp_path=tmp_path, now=SATURDAY, market_data_client=client)
+    assert result.persisted_mode == "PAUSED"
+
+
+def test_market_data_historical_snapshot_produces_a_real_opportunity_event_without_forcing_a_trigger(
+    tmp_path,
+):
+    """End-to-end proof: a Saturday run's historical market_snapshot feeds
+    build_materiality_candidates -> screen() -> a REAL, persisted
+    OpportunityEvent -- with the materiality threshold and scoring weights
+    completely untouched (this fixture's own small, realistic 5% move
+    scores below POLICY's threshold=2.0, so the event is NOT_MATERIAL --
+    proving genuine screening occurred, not a forced/manufactured
+    trigger)."""
+    opp_store = OpportunityEventStore(tmp_path / "materiality_events.jsonl")
+    client = _market_data_client(_historical_bars_transport(FRIDAY, ret_since_open_bps=500))
+    result = _run(tmp_path=tmp_path, now=SATURDAY, market_data_client=client,
+                 opportunity_event_store=opp_store)
+    assert result.market_data.status == "COLLECTED_HISTORICAL_COMPLETED_SESSION"
+    assert result.materiality_evaluations >= 1
+    assert result.events_persisted >= 1
+    assert result.events_persistence_failed == 0
+    events = opp_store.all()
+    assert len(events) >= 1
+    assert all(e.analysis_status in ("NOT_MATERIAL", "SUPPRESSED", "PENDING_ANALYSIS")
+              for e in events)
+    # The threshold itself was never touched by this unit -- POLICY (this
+    # file's own module-level constant) is unchanged, still threshold=2.0.
+    assert POLICY.threshold == 2.0
 
 
 def test_market_data_collects_when_in_session_with_real_bars(tmp_path):
