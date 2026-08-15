@@ -10,15 +10,55 @@ module-level discussion in this unit's own report for why re-auth below is
 a boolean flag, not a credential check) and must never be reachable off the
 operator's own machine.
 
-CORS IS WILDCARD-OPEN (dashboard-CORS unit, 2026-08-12), NOT THE SAME THING
-AS "still local-only" -- see `_Handler`'s own docstring for the fuller
-security-model note. Loopback-only binding stops a remote MACHINE from
-reaching this port; `Access-Control-Allow-Origin: *` separately means any
-locally-open browser TAB, on any origin, can now read (and, via the
-approve/reject/config routes, write to) this surface with no credential
-check. Acceptable for the pilot this was requested for; not a substitute
-for real auth if this surface is ever exposed beyond a single operator's
-own machine.
+CORS IS NO LONGER WILDCARD-OPEN (security-remediation unit, 2026-08-15;
+Codex Security full-repo scan, HIGH finding). The dashboard-CORS unit
+(2026-08-12) shipped `Access-Control-Allow-Origin: *`, which meant any
+locally-open browser TAB, on ANY origin -- including a malicious page with
+no relationship to this app -- could read `GET /api/state` (enumerating
+pending approval `request_id`s) and drive `POST /api/approval/<id>/approve`
+or `PATCH /api/config`, with no credential check anywhere in this module.
+That grant is now removed entirely (not narrowed to an allowlist -- there
+is no legitimate cross-origin caller of this surface). Two independent
+protections replace it, both enforced immediately in `route_request`,
+before either write handler is reached, so a forged request never touches
+`approval_request_store`, `audit_log`, or `config.json`:
+
+  1. SESSION-BOUND CSRF COOKIE. `DashboardRuntime.csrf_token` is a random,
+     per-process high-entropy value (`secrets.token_urlsafe(32)`), set as
+     an `HttpOnly; SameSite=Strict` cookie on every response (see
+     `_Handler._dispatch`). `SameSite=Strict` means NO browser mechanism
+     -- not `fetch`, not `credentials: 'include'`, not a plain HTML form
+     POST -- ever attaches this cookie to a cross-site request; only a
+     same-origin page (this dashboard's own served HTML) ever carries it.
+     `POST /api/approval/*/(approve|reject)` and `PATCH /api/config`
+     require the incoming `Cookie` header to carry the exact current
+     value (`secrets.compare_digest`-checked); anything else is a 403,
+     before any store is touched. `HttpOnly` means the bundled frontend
+     never needs to read or set this cookie itself -- see this unit's own
+     report for why a header-based CSRF token (the pattern used for the
+     Admin Console branch) was rejected here: this surface's actual
+     mutating `fetch()` calls live inside `dashboard/static/
+     agent_command_center.html` / `approval_card.html`, byte-identical
+     bundled builds this codebase's own convention forbids editing (see
+     `_serve_static`'s docstring) -- a cookie needs zero frontend changes,
+     since browsers attach `credentials: 'same-origin'` cookies to `fetch`
+     automatically by default.
+  2. ORIGIN-HEADER ALLOWLIST (defense in depth). If a state-changing
+     request carries an `Origin` header at all, it must resolve to a
+     loopback host (`_LOOPBACK_HOSTS`) or the request is refused
+     regardless of cookie validity -- this catches a non-browser forger
+     that supplies a stolen/guessed cookie value alongside a spoofed
+     `Origin`. A request with no `Origin` header at all (true of most
+     direct API tooling, and of some legitimate same-origin requests) is
+     not disqualified by this check alone -- the cookie check above is the
+     primary gate.
+
+`GET /api/state` and `GET /api/credentials` remain unauthenticated reads,
+exactly as before -- removing the wildcard CORS grant alone is what closes
+the "cross-origin GET enumerates pending IDs" half of the finding: a
+cross-origin page can still cause the browser to SEND the GET (it needs no
+preflight), but can no longer READ the JSON response, since there is no
+longer any `Access-Control-Allow-Origin` telling the browser to expose it.
 
 `route_request` IS PURE DISPATCH, NO SOCKET CONCEPT -- the actual
 `http.server.BaseHTTPRequestHandler` subclass (`_Handler`) below is a thin
@@ -50,11 +90,13 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from .approval import ApprovalService
 from .approval_request_store import ApprovalRequestStore
@@ -194,6 +236,16 @@ class DashboardRuntime:
     opportunity_event_store: OpportunityEventStore | None = None
     opportunity_event_store_refresh_fn: (
         Callable[[], "OpportunityEventStore | None"] | None) = None
+    # CSRF SESSION TOKEN (security-remediation unit, 2026-08-15) -- see
+    # module docstring's CORS section. Generated once per `DashboardRuntime`
+    # (i.e. once per dashboard process's life, matching this class's own
+    # "constructed once, held for the process's life" convention above) and
+    # never written to `config.json` or any durable store -- it exists only
+    # in this process's memory and in the `Set-Cookie` this unit's own
+    # `_Handler._dispatch` sends on every response. Restarting the dashboard
+    # process invalidates every previously-issued cookie, exactly like
+    # restarting any session-token-based server would.
+    csrf_token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
 
 
 @dataclass(frozen=True)
@@ -211,9 +263,85 @@ def _json_result(status: int, payload: Any) -> RouteResult:
 _APPROVAL_ACTION_RE = re.compile(r"^/api/approval/([^/]+)/(approve|reject)$")
 
 
+CSRF_COOKIE_NAME = "ia_dashboard_csrf"
+
+
+def _header_get(headers: dict[str, str] | None, name: str) -> str | None:
+    """Case-insensitive header lookup -- `http.server`'s real `self.headers`
+    is already case-insensitive, but `route_request` accepts a plain
+    `dict[str, str]` (so tests can call it with no socket, per module
+    docstring), and plain dicts are not."""
+    if not headers:
+        return None
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return None
+
+
+def _parse_cookie_header(raw: str | None) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    if not raw:
+        return cookies
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        name, _, value = part.strip().partition("=")
+        name = name.strip()
+        if name:
+            cookies[name] = value.strip()
+    return cookies
+
+
+def _csrf_ok(runtime: DashboardRuntime, headers: dict[str, str] | None) -> bool:
+    """True only if the request carries the exact current per-process CSRF
+    cookie -- see DashboardRuntime.csrf_token's own docstring. A real
+    cross-site browser request never carries this cookie at all
+    (`SameSite=Strict`), so `False` here is the expected, safe outcome for
+    the forgery this closes -- not an error condition to work around."""
+    supplied = _parse_cookie_header(_header_get(headers, "Cookie")).get(CSRF_COOKIE_NAME)
+    if not supplied:
+        return False
+    return secrets.compare_digest(supplied, runtime.csrf_token)
+
+
+def _origin_ok(headers: dict[str, str] | None) -> bool:
+    """Defense in depth alongside `_csrf_ok` -- see module docstring's CORS
+    section, protection #2. An absent `Origin` header does not fail this
+    check on its own (many legitimate same-origin and direct-tooling
+    requests omit it); a PRESENT, non-loopback `Origin` always fails it,
+    regardless of what `_csrf_ok` finds."""
+    origin = _header_get(headers, "Origin")
+    if not origin:
+        return True
+    try:
+        hostname = urlparse(origin).hostname
+    except ValueError:
+        return False
+    return hostname in _LOOPBACK_HOSTS
+
+
+def _forged_request_result() -> RouteResult:
+    return _json_result(403, {
+        "error": "refused: this request could not prove it originated from "
+                 "this dashboard's own same-origin page (missing/invalid "
+                 "CSRF cookie, or a non-loopback Origin header present)",
+    })
+
+
 def route_request(runtime: DashboardRuntime, *, method: str, path: str,
-                  body: bytes | None = None) -> RouteResult:
-    """Pure routing + dispatch. See module docstring."""
+                  body: bytes | None = None,
+                  headers: dict[str, str] | None = None) -> RouteResult:
+    """Pure routing + dispatch. See module docstring. `headers`, when
+    supplied, is consulted ONLY by the two writable routes below (CSRF
+    cookie + Origin allowlist, security-remediation unit 2026-08-15) --
+    every read-only route ignores it completely, exactly as before this
+    unit. `None` (the default) means "no headers known" -- both writable
+    routes then fail the CSRF check by construction (no cookie can ever be
+    found in `None`) and refuse with 403, which is the correct fail-closed
+    behavior for any caller that does not thread real request headers
+    through, not a caller convenience to route around."""
     now = runtime.now_fn()
 
     if method == "GET" and path == "/api/state":
@@ -277,11 +405,15 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
     # touches `_with_writer_lock` -- no lock is ever held for a GET.
     m = _APPROVAL_ACTION_RE.match(path)
     if method == "POST" and m:
+        if not (_origin_ok(headers) and _csrf_ok(runtime, headers)):
+            return _forged_request_result()
         return _with_writer_lock(runtime, lambda: _handle_approval_action(
             runtime, request_id=m.group(1), action=m.group(2), body=body, now=now,
         ))
 
     if method == "PATCH" and path == "/api/config":
+        if not (_origin_ok(headers) and _csrf_ok(runtime, headers)):
+            return _forged_request_result()
         return _with_writer_lock(
             runtime, lambda: _handle_config_patch(runtime, body=body, now=now))
 
@@ -449,57 +581,50 @@ def _serve_static(filename: str) -> RouteResult:
 class _Handler(BaseHTTPRequestHandler):
     """Thin adapter over `route_request` -- no business logic here.
 
-    CORS (dashboard-CORS unit, 2026-08-12): a request to add this arrived
-    written for Flask (`@app.before_request`/`@app.after_request`,
-    `app.route(...)`) -- this module has no Flask `app` object anywhere
-    (see module docstring: it is a plain `http.server.BaseHTTPRequestHandler`
-    subclass, chosen so `route_request` stays pure dispatch, callable from
-    tests with no socket at all). CORS headers are themselves a wire-level
-    concern with no equivalent in `route_request`'s pure `RouteResult`
-    (status/content_type/body, no headers) -- `_send_cors_headers` here,
-    called from every real dispatch AND from the new `do_OPTIONS` preflight
-    handler below, is the actual equivalent of a Flask after_request hook
-    for this server. `Access-Control-Allow-Methods` includes PATCH (the
-    original request's snippet only listed GET/OPTIONS/POST) because
-    `/api/config` is a real PATCH route here (`_handle_config_patch`) --
-    omitting it would silently CORS-block that endpoint the moment a
-    cross-origin preflight covered it.
+    NO CORS GRANT (security-remediation unit, 2026-08-15; supersedes the
+    dashboard-CORS unit, 2026-08-12, which sent
+    `Access-Control-Allow-Origin: *` on every response -- see module
+    docstring's CORS section for the finding this closes and the two
+    protections that replace it). This handler no longer sends any
+    `Access-Control-Allow-*` header at all: there is no legitimate
+    cross-origin caller of this surface, so there is nothing to allowlist.
+    A cross-origin browser page can still cause a "simple" GET to be sent
+    (no header can prevent that), but can no longer read the response, and
+    a cross-origin POST/PATCH cannot pass either the CSRF-cookie
+    check (`_csrf_ok`, `SameSite=Strict` means the browser never attaches
+    the cookie cross-site) or, for a non-browser forger who supplies a
+    stolen cookie value directly, the Origin allowlist (`_origin_ok`) --
+    both enforced inside `route_request` itself, before any store is
+    touched, so this wire-level handler does not need to duplicate that
+    logic; it only carries the real request headers down into
+    `route_request` and writes the session cookie back out.
 
-    SECURITY MODEL, NOT JUST "unauthenticated read" (see this unit's own
-    report for the fuller version): `Access-Control-Allow-Origin: *` does
-    NOT reopen the loopback-only bind `make_server` still enforces above --
-    a remote machine still cannot reach this port. What it DOES do is let
-    ANY page open in the operator's own browser, on any origin (including a
-    malicious tab with no relationship to this app), issue JS `fetch()`
-    calls against `http://localhost:8765/...` and read the response. That
-    is broader than "read /api/state": `POST /api/approval/<id>/approve`
-    is also a real route here, and `GET /api/state` already returns pending
-    request_ids in plaintext -- so a malicious page open locally could, in
-    principle, discover a pending request_id and drive an approve/reject
-    itself, with no credential check anywhere in this module (module
-    docstring: "no authentication of its own... single-operator pilot").
-    This was true before this unit in the sense that nothing stopped a
-    same-origin page from doing it; wildcard CORS is what newly allows a
-    page that is NOT this dashboard to do it too. Acceptable for a
-    localhost-only pilot per the request that asked for this change --
-    genuinely not acceptable un-hardened in production (an explicit origin
-    allowlist, or real auth on the approve/reject/config routes, would be
-    the fix -- neither exists today)."""
+    SESSION COOKIE ON EVERY RESPONSE: `_dispatch` below sends
+    `Set-Cookie: {CSRF_COOKIE_NAME}=<DashboardRuntime.csrf_token>;
+    Path=/; SameSite=Strict; HttpOnly` unconditionally, on every response
+    (GET included) -- so the dashboard's own first page load already
+    plants the cookie the browser will automatically re-attach
+    (`fetch`'s default `credentials: 'same-origin'`) to that same page's
+    later approve/reject/config `fetch()` calls, with zero change to the
+    bundled frontend HTML (see module docstring's CORS section, protection
+    #1, for why a cookie was chosen specifically to avoid touching those
+    byte-identical files)."""
     runtime: DashboardRuntime   # set by `make_server` before the server starts
-
-    def _send_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _dispatch(self, method: str) -> None:
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
-        result = route_request(self.runtime, method=method, path=self.path, body=body)
+        headers = {key: value for key, value in self.headers.items()}
+        result = route_request(self.runtime, method=method, path=self.path,
+                               body=body, headers=headers)
         self.send_response(result.status)
         self.send_header("Content-Type", result.content_type)
         self.send_header("Content-Length", str(len(result.body)))
-        self._send_cors_headers()
+        self.send_header(
+            "Set-Cookie",
+            f"{CSRF_COOKIE_NAME}={self.runtime.csrf_token}; "
+            "Path=/; SameSite=Strict; HttpOnly",
+        )
         self.end_headers()
         self.wfile.write(result.body)
 
@@ -513,15 +638,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._dispatch("PATCH")
 
     def do_OPTIONS(self) -> None:
-        """CORS preflight -- a browser sends this ahead of any cross-origin
-        request whose method/headers require one (every POST/PATCH here,
-        since they all carry `Content-Type: application/json`). No
-        `route_request` dispatch: a preflight has no body and expects no
-        payload, only the headers `_send_cors_headers` sets. 204 (No
-        Content), matching the exact response the original request asked
-        for."""
+        """No CORS grant is sent (see class docstring) -- a cross-origin
+        preflight now gets a bare 204 with no `Access-Control-Allow-*`
+        header, which the browser treats as "not permitted" and refuses to
+        follow up with the real request. Same-origin requests never
+        trigger a preflight at all, so this path is unreachable for the
+        dashboard's own legitimate traffic."""
         self.send_response(204)
-        self._send_cors_headers()
         self.end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:   # noqa: A002

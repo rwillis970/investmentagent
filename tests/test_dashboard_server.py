@@ -21,8 +21,8 @@ from agent.approval_request_store import ApprovalRequestStore
 from agent.audit import AuditLog
 from agent.broker.base import AccountSnapshot
 from agent.cost import CostLedger
-from agent.dashboard_server import (STATIC_DIR, DashboardRuntime,
-                                    make_server, route_request)
+from agent.dashboard_server import (CSRF_COOKIE_NAME, STATIC_DIR,
+                                    DashboardRuntime, make_server, route_request)
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.process_lock import acquire_process_lock
 from tests.test_config_fixture import valid_raw_config
@@ -67,6 +67,22 @@ def add_pending(store, *, now=T0, **over):
         risk_result={}, price_at_analysis=100.0, price_band_low=99.0,
         price_band_high=101.0, earmark=50.0, now=now, expiration=timedelta(minutes=30),
     )
+
+
+def csrf_headers(runtime, *, origin=None, token=None):
+    """Test-side stand-in for what a browser attaches automatically once
+    the SameSite=Strict cookie has been planted (security-remediation
+    unit, 2026-08-15 -- see agent.dashboard_server module docstring's CORS
+    section). Every legitimate POST/PATCH call site in this file now needs
+    this, matching what `_Handler._dispatch` actually sends as `Set-Cookie`
+    on the real wire; the handful of NEW adversarial tests below construct
+    headers WITHOUT this helper (or with a wrong `token`/hostile `origin`)
+    on purpose, to prove the forged case is refused."""
+    cookie_token = runtime.csrf_token if token is None else token
+    headers = {"Cookie": f"{CSRF_COOKIE_NAME}={cookie_token}"}
+    if origin is not None:
+        headers["Origin"] = origin
+    return headers
 
 
 # ------------------------------------------------------------------ GET /api/state
@@ -125,7 +141,7 @@ def test_post_approve_after_min_display_returns_200_with_token(tmp_path):
     req = add_pending(store, now=T0)
     runtime.now_fn = lambda: T0 + timedelta(seconds=46)
     result = route_request(
-        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/approve",
         body=b"{}",
     )
     assert result.status == 200
@@ -138,7 +154,7 @@ def test_post_approve_before_min_display_is_a_422(tmp_path):
     req = add_pending(store, now=T0)
     # runtime.now_fn still returns T0 -- zero elapsed since shown_at.
     result = route_request(
-        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/approve",
         body=b"{}",
     )
     assert result.status == 422
@@ -149,7 +165,7 @@ def test_post_reject_returns_200(tmp_path):
     runtime, store = make_runtime(tmp_path, now=T0)
     req = add_pending(store, now=T0)
     result = route_request(
-        runtime, method="POST", path=f"/api/approval/{req.request_id}/reject",
+        runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/reject",
         body=b"{}",
     )
     assert result.status == 200
@@ -158,7 +174,7 @@ def test_post_reject_returns_200(tmp_path):
 
 def test_post_approve_unknown_request_id_is_404(tmp_path):
     runtime, _ = make_runtime(tmp_path)
-    result = route_request(runtime, method="POST",
+    result = route_request(runtime, method="POST", headers=csrf_headers(runtime),
                            path="/api/approval/apr-nope/approve", body=b"{}")
     assert result.status == 404
 
@@ -166,10 +182,10 @@ def test_post_approve_unknown_request_id_is_404(tmp_path):
 def test_post_reject_then_approve_same_id_is_409_conflict(tmp_path):
     runtime, store = make_runtime(tmp_path, now=T0)
     req = add_pending(store, now=T0)
-    route_request(runtime, method="POST",
+    route_request(runtime, method="POST", headers=csrf_headers(runtime),
                  path=f"/api/approval/{req.request_id}/reject", body=b"{}")
     runtime.now_fn = lambda: T0 + timedelta(seconds=46)
-    result = route_request(runtime, method="POST",
+    result = route_request(runtime, method="POST", headers=csrf_headers(runtime),
                            path=f"/api/approval/{req.request_id}/approve", body=b"{}")
     assert result.status == 409
 
@@ -179,7 +195,7 @@ def test_approve_size_pct_and_limit_price_travel_in_the_body(tmp_path):
     req = add_pending(store, now=T0)
     runtime.now_fn = lambda: T0 + timedelta(seconds=46)
     result = route_request(
-        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/approve",
         body=json.dumps({"size_pct": 50.0, "limit_price": 99.0}).encode(),
     )
     assert result.status == 200
@@ -193,7 +209,7 @@ def test_approve_favourable_limit_move_from_the_client_is_refused(tmp_path):
     req = add_pending(store, now=T0)
     runtime.now_fn = lambda: T0 + timedelta(seconds=46)
     result = route_request(
-        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/approve",
         body=json.dumps({"limit_price": 101.0}).encode(),   # BUY: favourable == higher
     )
     assert result.status == 422
@@ -204,7 +220,7 @@ def test_approve_favourable_limit_move_from_the_client_is_refused(tmp_path):
 def test_patch_config_freely_writable_accepted_200(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(
-        runtime, method="PATCH", path="/api/config",
+        runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
         body=json.dumps({"key": "opportunity_screen_interval_minutes",
                         "value": 10}).encode(),
     )
@@ -216,7 +232,7 @@ def test_patch_config_freely_writable_accepted_200(tmp_path):
 def test_patch_config_re_auth_without_confirmed_is_428(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(
-        runtime, method="PATCH", path="/api/config",
+        runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
         body=json.dumps({"key": "max_position_pct", "value": 9.0}).encode(),
     )
     assert result.status == 428
@@ -225,7 +241,7 @@ def test_patch_config_re_auth_without_confirmed_is_428(tmp_path):
 def test_patch_config_re_auth_with_confirmed_is_200(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(
-        runtime, method="PATCH", path="/api/config",
+        runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
         body=json.dumps({"key": "max_position_pct", "value": 9.0,
                         "confirmed": True}).encode(),
     )
@@ -235,7 +251,7 @@ def test_patch_config_re_auth_with_confirmed_is_200(tmp_path):
 def test_patch_config_not_writable_is_403(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(
-        runtime, method="PATCH", path="/api/config",
+        runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
         body=json.dumps({"key": "mode", "value": "PRODUCTION_ACTIVE",
                         "confirmed": True}).encode(),
     )
@@ -245,7 +261,7 @@ def test_patch_config_not_writable_is_403(tmp_path):
 def test_patch_config_unknown_key_is_404(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(
-        runtime, method="PATCH", path="/api/config",
+        runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
         body=json.dumps({"key": "not_a_real_field", "value": 1}).encode(),
     )
     assert result.status == 404
@@ -254,7 +270,7 @@ def test_patch_config_unknown_key_is_404(tmp_path):
 def test_patch_config_failing_validation_is_422(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(
-        runtime, method="PATCH", path="/api/config",
+        runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
         body=json.dumps({"key": "max_position_pct", "value": 99.0,
                         "confirmed": True}).encode(),
     )
@@ -263,7 +279,7 @@ def test_patch_config_failing_validation_is_422(tmp_path):
 
 def test_patch_config_without_a_key_is_400(tmp_path):
     runtime, _ = make_runtime(tmp_path)
-    result = route_request(runtime, method="PATCH", path="/api/config",
+    result = route_request(runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
                            body=b"{}")
     assert result.status == 400
 
@@ -271,7 +287,7 @@ def test_patch_config_without_a_key_is_400(tmp_path):
 def test_patch_config_response_never_includes_the_full_config_object(tmp_path):
     runtime, _ = make_runtime(tmp_path)
     result = route_request(
-        runtime, method="PATCH", path="/api/config",
+        runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
         body=json.dumps({"key": "opportunity_screen_interval_minutes",
                         "value": 10}).encode(),
     )
@@ -296,7 +312,7 @@ def test_post_approve_refuses_with_503_while_the_scheduled_loop_holds_the_lock(t
     runtime.now_fn = lambda: T0 + timedelta(seconds=46)
     with acquire_process_lock(tmp_path):   # simulates the scheduled loop mid-cycle
         result = route_request(
-            runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+            runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/approve",
             body=b"{}",
         )
     assert result.status == 503
@@ -317,7 +333,7 @@ def test_post_reject_refuses_with_503_while_the_scheduled_loop_holds_the_lock(tm
     req = add_pending(store, now=T0)
     with acquire_process_lock(tmp_path):
         result = route_request(
-            runtime, method="POST", path=f"/api/approval/{req.request_id}/reject",
+            runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/reject",
             body=b"{}",
         )
     assert result.status == 503
@@ -330,7 +346,7 @@ def test_patch_config_refuses_with_503_while_the_scheduled_loop_holds_the_lock(t
     before = runtime.config.opportunity_screen_interval_minutes
     with acquire_process_lock(tmp_path):
         result = route_request(
-            runtime, method="PATCH", path="/api/config",
+            runtime, method="PATCH", headers=csrf_headers(runtime), path="/api/config",
             body=json.dumps({"key": "opportunity_screen_interval_minutes",
                             "value": 10}).encode(),
         )
@@ -351,7 +367,7 @@ def test_writable_routes_succeed_normally_once_the_lock_is_released(tmp_path):
     req = add_pending(store, now=T0)
     runtime.now_fn = lambda: T0 + timedelta(seconds=46)
     result = route_request(
-        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/approve",
         body=b"{}",
     )
     assert result.status == 200
@@ -369,7 +385,7 @@ def test_process_lock_data_dir_unset_preserves_the_old_unlocked_behavior(tmp_pat
     runtime.now_fn = lambda: T0 + timedelta(seconds=46)
     with acquire_process_lock(tmp_path / "unrelated"):
         result = route_request(
-            runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+            runtime, method="POST", headers=csrf_headers(runtime), path=f"/api/approval/{req.request_id}/approve",
             body=b"{}",
         )
     assert result.status == 200
@@ -718,13 +734,19 @@ def test_make_server_accepts_127_0_0_1(tmp_path):
         server.server_close()
 
 
-# --------------------------------------------------------- CORS (dashboard-CORS unit, 2026-08-12)
+# ------------------------------------------------- CORS + CSRF (security-
+# remediation unit, 2026-08-15; supersedes the dashboard-CORS unit,
+# 2026-08-12, which sent Access-Control-Allow-Origin: * on every response
+# -- see agent.dashboard_server module docstring's CORS section for the
+# HIGH finding this closes, from the Codex Security full-repo scan of the
+# codex/admin-console-v1 branch, and the two protections that replace it.
 #
-# route_request itself has no header concept (RouteResult is status/
-# content_type/body only, by design -- see module docstring) -- CORS is set
-# at the wire level in _Handler, so these are the only tests in this file
-# that need a real socket, mirroring test_make_server_accepts_127_0_0_1's
-# own pattern of an ephemeral port (port=0) rather than a fixed one.
+# route_request itself has no socket/header-writing concept (RouteResult is
+# status/content_type/body only, by design -- see module docstring) -- CORS
+# absence and the Set-Cookie are both wire-level, set in _Handler, so these
+# are the only tests in this file that need a real socket, mirroring
+# test_make_server_accepts_127_0_0_1's own pattern of an ephemeral port
+# (port=0) rather than a fixed one.
 
 def _serving(tmp_path):
     runtime, _ = make_runtime(tmp_path)
@@ -740,7 +762,13 @@ def _stop(server, thread):
     server.server_close()
 
 
-def test_a_real_get_response_carries_cors_headers(tmp_path):
+def test_a_real_get_response_carries_no_permissive_cors_grant(tmp_path):
+    """Rewritten from `test_a_real_get_response_carries_cors_headers`
+    (which asserted the OLD, now-removed, wildcard grant) -- this is the
+    load-bearing assertion for the finding: no `Access-Control-Allow-*`
+    header exists anywhere in a real response, so a cross-origin page's JS
+    cannot read this response even though the browser still sent the
+    (header-less, "simple") GET over the wire."""
     server, thread = _serving(tmp_path)
     try:
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
@@ -749,19 +777,42 @@ def test_a_real_get_response_carries_cors_headers(tmp_path):
         body = resp.read()
         conn.close()
         assert resp.status == 200
-        assert resp.getheader("Access-Control-Allow-Origin") == "*"
-        # PATCH is included even though the original request's own snippet
-        # only listed GET/OPTIONS/POST -- /api/config is a real PATCH route
-        # here (_handle_config_patch); omitting it would silently
-        # CORS-block that endpoint under a real cross-origin preflight.
-        assert resp.getheader("Access-Control-Allow-Methods") == "GET, POST, PATCH, OPTIONS"
-        assert resp.getheader("Access-Control-Allow-Headers") == "Content-Type"
+        assert resp.getheader("Access-Control-Allow-Origin") is None
+        assert resp.getheader("Access-Control-Allow-Methods") is None
+        assert resp.getheader("Access-Control-Allow-Headers") is None
         assert json.loads(body)   # a real JSON body, not an empty/broken response
     finally:
         _stop(server, thread)
 
 
-def test_an_options_preflight_returns_204_with_cors_headers_and_no_body(tmp_path):
+def test_a_real_get_response_plants_the_csrf_session_cookie(tmp_path):
+    """The other half of the same wire behavior: every response -- GET
+    included -- carries `Set-Cookie` for the exact per-process
+    `DashboardRuntime.csrf_token`, `HttpOnly; SameSite=Strict`, with no
+    frontend code needed to plant it (see module docstring's CORS section,
+    protection #1)."""
+    server, thread = _serving(tmp_path)
+    try:
+        runtime = server.RequestHandlerClass.runtime
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request("GET", "/api/state")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        set_cookie = resp.getheader("Set-Cookie")
+        assert set_cookie is not None
+        assert f"{CSRF_COOKIE_NAME}={runtime.csrf_token}" in set_cookie
+        assert "HttpOnly" in set_cookie
+        assert "SameSite=Strict" in set_cookie
+    finally:
+        _stop(server, thread)
+
+
+def test_an_options_preflight_returns_204_with_no_permissive_cors_grant(tmp_path):
+    """Rewritten from `test_an_options_preflight_returns_204_with_cors_
+    headers_and_no_body` -- a real cross-origin preflight now gets no
+    `Access-Control-Allow-*` grant at all, so the browser refuses to send
+    the follow-up cross-origin POST/PATCH it was gating."""
     server, thread = _serving(tmp_path)
     try:
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
@@ -771,11 +822,115 @@ def test_an_options_preflight_returns_204_with_cors_headers_and_no_body(tmp_path
         conn.close()
         assert resp.status == 204
         assert body == b""
-        assert resp.getheader("Access-Control-Allow-Origin") == "*"
-        assert resp.getheader("Access-Control-Allow-Methods") == "GET, POST, PATCH, OPTIONS"
-        assert resp.getheader("Access-Control-Allow-Headers") == "Content-Type"
+        assert resp.getheader("Access-Control-Allow-Origin") is None
+        assert resp.getheader("Access-Control-Allow-Methods") is None
+        assert resp.getheader("Access-Control-Allow-Headers") is None
     finally:
         _stop(server, thread)
+
+
+# ------------------------------------------ ADVERSARIAL BROWSER-ORIGIN TESTS
+# (security-remediation unit, 2026-08-15) -- Priority A's own explicit final
+# requirement. Each test below proves a request that a real forged
+# cross-origin browser page (or a non-browser forger who has to guess/steal
+# the token) could actually send is refused, and -- critically -- that the
+# underlying store/config file is provably untouched, not just that the
+# HTTP status looks right.
+
+def test_post_approve_with_no_csrf_cookie_at_all_is_refused(tmp_path):
+    """The exact real-world case: a cross-origin browser page's fetch()
+    never carries this SameSite=Strict cookie in the first place, so no
+    headers dict a real cross-origin attacker could ever produce contains
+    it. No `headers=` at all is the honest simulation of that."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None   # still PENDING, untouched
+
+
+def test_post_approve_with_a_wrong_guessed_csrf_cookie_is_refused(tmp_path):
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, token="guessed-not-the-real-token"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_a_stolen_cookie_but_hostile_origin_is_still_refused(tmp_path):
+    """Defense in depth (module docstring's CORS section, protection #2):
+    even a forger who somehow obtained the real cookie value is refused if
+    a non-loopback Origin header is present -- proves the Origin allowlist
+    is independently enforced, not merely redundant with the cookie
+    check."""
+    runtime, store = make_runtime(tmp_path)
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "attacker"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="https://evil.example"),
+    )
+    assert result.status == 403
+    assert store.get(req.request_id).decision is None
+
+
+def test_post_approve_with_valid_cookie_and_a_loopback_origin_still_succeeds(tmp_path):
+    """Positive control: a same-origin-like request (valid cookie, Origin
+    naming the dashboard's own loopback host) is not caught by the Origin
+    allowlist -- proves protection #2 does not break the legitimate case
+    when a browser DOES send an Origin header on a same-origin request."""
+    runtime, store = make_runtime(tmp_path, now=T0 + timedelta(seconds=60))
+    req = add_pending(store)
+    result = route_request(
+        runtime, method="POST", path=f"/api/approval/{req.request_id}/approve",
+        body=json.dumps({"actor": "operator"}).encode("utf-8"),
+        headers=csrf_headers(runtime, origin="http://127.0.0.1:8765"),
+    )
+    assert result.status == 200
+    assert store.get(req.request_id).decision == "APPROVED"
+
+
+def test_patch_config_forged_confirmed_true_from_cross_origin_is_refused_before_reauth_logic(tmp_path):
+    """Ray's explicit named risk: "attacker-supplied confirmed=true" must
+    not be sufficient proof on its own. This proves the CSRF gate is
+    checked BEFORE `_handle_config_patch`/`apply_config_patch` ever sees
+    the body -- a forged request supplying `confirmed: true` for a
+    RE_AUTH_REQUIRED field is refused with 403 (CSRF failure), never
+    reaches the re-auth branch, and the config file on disk is unchanged."""
+    runtime, _ = make_runtime(tmp_path)
+    before = runtime.config_path.read_text() if hasattr(runtime.config_path, "read_text")         else Path(runtime.config_path).read_text()
+    result = route_request(
+        runtime, method="PATCH", path="/api/config",
+        body=json.dumps({
+            "key": "price_band_pct", "value": 5.0, "confirmed": True,
+            "actor": "attacker",
+        }).encode("utf-8"),
+    )
+    assert result.status == 403
+    after = Path(runtime.config_path).read_text()
+    assert after == before   # config.json on disk is byte-identical, untouched
+
+
+def test_patch_config_still_requires_confirmed_even_with_a_valid_csrf_cookie(tmp_path):
+    """Preserves the existing reauthentication semantics exactly (Priority
+    A's own explicit requirement) -- a legitimate, same-origin-proven
+    request for a RE_AUTH_REQUIRED field still gets 428 without
+    `confirmed: true`. The CSRF fix is additive, not a replacement for
+    this existing gate."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(
+        runtime, method="PATCH", path="/api/config",
+        body=json.dumps({"key": "price_band_pct", "value": 5.0}).encode("utf-8"),
+        headers=csrf_headers(runtime),
+    )
+    assert result.status == 428
 
 
 def test_an_options_preflight_on_an_unknown_path_still_returns_204(tmp_path):
