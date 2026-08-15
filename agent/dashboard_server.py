@@ -736,25 +736,48 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
         # REPEATED-HEADER FOLDING (security-remediation unit, round 2,
-        # 2026-08-15). The OLD `{key: value for key, value in
-        # self.headers.items()}` dict comprehension silently kept only the
-        # LAST occurrence of any repeated header name -- for `Origin`
-        # specifically, that meant a forger who sent it twice could pick
-        # whichever of the two values won that race, with no detection at
-        # all. `self.headers` (`http.client.HTTPMessage`) preserves every
-        # occurrence via `.items()`; folding repeats together with ", " per
-        # RFC 7230 §3.2.2's combining rule (the standards-correct way to
-        # interpret repeated header lines generally, not an Origin-specific
-        # special case) means a real duplicated `Origin` header arrives at
+        # 2026-08-15; case-insensitivity fix, round 3, 2026-08-15). The OLD
+        # `{key: value for key, value in self.headers.items()}` dict
+        # comprehension silently kept only the LAST occurrence of any
+        # repeated header name -- for `Origin` specifically, that meant a
+        # forger who sent it twice could pick whichever of the two values
+        # won that race, with no detection at all. `self.headers`
+        # (`http.client.HTTPMessage`) preserves every occurrence via
+        # `.items()`; folding repeats together with ", " per RFC 7230
+        # §3.2.2's combining rule (the standards-correct way to interpret
+        # repeated header lines generally, not an Origin-specific special
+        # case) means a real duplicated `Origin` header arrives at
         # `_origin_ok` as one comma-containing string, which
         # `_normalize_origin_candidate` already refuses outright -- see
         # that function's own docstring.
+        #
+        # ROUND 3: the round-2 fold above keyed `headers` on the RAW,
+        # as-received header name (`key`, whatever casing the wire sent),
+        # and tested membership with the case-sensitive `key in headers`.
+        # HTTP header field names are case-insensitive (RFC 7230 §3.2), so
+        # that check missed same-name duplicates sent with different
+        # capitalization: `Origin: <legit>` followed by `origin: <forged>`
+        # produced TWO separate dict entries (`headers["Origin"]` and
+        # `headers["origin"]`) instead of one folded, comma-joined,
+        # automatically-refused value -- silently defeating the very
+        # protection this fold exists to provide, for `Origin`, for the
+        # `Cookie` header `_csrf_ok` reads the CSRF token from, and for
+        # every other header this dict carries. The fix: normalize the KEY
+        # to lowercase before both the membership test and the store, so
+        # every casing of the same header name folds together. `_header_get`
+        # (used by `_origin_ok`/`_csrf_ok` to read this dict) already does
+        # its own case-insensitive scan, so lowercased keys here are fully
+        # transparent to every downstream reader -- this only changes
+        # whether two differently-cased occurrences of the same header are
+        # recognized as duplicates, never which header a caller can look up
+        # or what a single, validly-cased request's headers resolve to.
         headers: dict[str, str] = {}
         for key, value in self.headers.items():
-            if key in headers:
-                headers[key] = f"{headers[key]}, {value}"
+            normalized_key = key.lower()
+            if normalized_key in headers:
+                headers[normalized_key] = f"{headers[normalized_key]}, {value}"
             else:
-                headers[key] = value
+                headers[normalized_key] = value
         result = route_request(self.runtime, method=method, path=self.path,
                                body=body, headers=headers)
         self.send_response(result.status)

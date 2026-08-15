@@ -1224,6 +1224,137 @@ def test_a_real_duplicate_origin_header_over_the_wire_is_refused(tmp_path):
         _stop(server, thread)
 
 
+def test_a_real_mixed_case_duplicate_origin_header_over_the_wire_is_refused(tmp_path):
+    """Round-3 regression: the round-2 fold in `_Handler._dispatch` keyed
+    its dict on the RAW, as-received header name and tested duplicate
+    membership with `key in headers` -- a case-SENSITIVE dict-key check.
+    HTTP header names are case-insensitive (RFC 7230 SS3.2), so `Origin`
+    followed by `origin` (same name, different wire capitalization) used to
+    land in two separate dict entries instead of being folded into one
+    comma-joined, automatically-refused value -- silently defeating the
+    duplicate-Origin protection the same test class above already proves
+    for same-case duplicates. This test sends the identical adversarial
+    shape but with the second occurrence lowercased, and asserts the fix
+    still refuses it before the store is ever touched."""
+    server, thread = _serving(tmp_path)
+    try:
+        runtime = server.RequestHandlerClass.runtime
+        store = runtime.approval_request_store
+        req = add_pending(store)
+        real_port = server.server_address[1]
+
+        conn = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn.request("GET", "/api/state")
+        get_resp = conn.getresponse()
+        get_resp.read()
+        cookie_value = get_resp.getheader("Set-Cookie").split(";")[0]
+        conn.close()
+
+        body = json.dumps({"actor": "attacker"}).encode("utf-8")
+        conn2 = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn2.putrequest("POST", f"/api/approval/{req.request_id}/approve")
+        conn2.putheader("Cookie", cookie_value)
+        conn2.putheader("Origin", f"http://127.0.0.1:{real_port}")
+        # Same header name as above, but lowercased on the wire -- this is
+        # the exact case the round-2 fold missed.
+        conn2.putheader("origin", "http://evil.example")
+        conn2.putheader("Content-Type", "application/json")
+        conn2.putheader("Content-Length", str(len(body)))
+        conn2.endheaders(body)
+        resp2 = conn2.getresponse()
+        resp2.read()
+        conn2.close()
+
+        assert resp2.status == 403
+        assert store.get(req.request_id).decision is None
+    finally:
+        _stop(server, thread)
+
+
+def test_a_real_all_caps_duplicate_origin_header_over_the_wire_is_refused(tmp_path):
+    """Same regression as above, using an ALL-CAPS second occurrence
+    (`ORIGIN`) instead of all-lowercase, to prove the fix normalizes on
+    every casing, not just one specific alternate form."""
+    server, thread = _serving(tmp_path)
+    try:
+        runtime = server.RequestHandlerClass.runtime
+        store = runtime.approval_request_store
+        req = add_pending(store)
+        real_port = server.server_address[1]
+
+        conn = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn.request("GET", "/api/state")
+        get_resp = conn.getresponse()
+        get_resp.read()
+        cookie_value = get_resp.getheader("Set-Cookie").split(";")[0]
+        conn.close()
+
+        body = json.dumps({"actor": "attacker"}).encode("utf-8")
+        conn2 = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn2.putrequest("POST", f"/api/approval/{req.request_id}/approve")
+        conn2.putheader("Cookie", cookie_value)
+        conn2.putheader("Origin", f"http://127.0.0.1:{real_port}")
+        conn2.putheader("ORIGIN", "http://evil.example")
+        conn2.putheader("Content-Type", "application/json")
+        conn2.putheader("Content-Length", str(len(body)))
+        conn2.endheaders(body)
+        resp2 = conn2.getresponse()
+        resp2.read()
+        conn2.close()
+
+        assert resp2.status == 403
+        assert store.get(req.request_id).decision is None
+    finally:
+        _stop(server, thread)
+
+
+def test_a_real_mixed_case_duplicate_cookie_header_over_the_wire_is_refused(tmp_path):
+    """Same case-insensitive-fold regression as the Origin tests above, but
+    for the `Cookie` header `_csrf_ok` reads the CSRF token from -- Ray's
+    instruction was explicit that the fix must cover "CSRF ... headers"
+    at "the same boundary", not just Origin. Sends the real, valid CSRF
+    cookie as `Cookie:` and a second, differently-cased `cookie:` header
+    with a bogus value; once folded case-insensitively the two values are
+    comma-joined into one string that `_parse_cookie_header` cannot parse
+    back into the real token, so `_csrf_ok` correctly refuses -- proving
+    the fold protects Cookie/CSRF the same way it protects Origin, from
+    the single shared boundary in `_Handler._dispatch`, with no
+    Cookie-specific logic required."""
+    server, thread = _serving(tmp_path)
+    try:
+        runtime = server.RequestHandlerClass.runtime
+        store = runtime.approval_request_store
+        req = add_pending(store)
+        real_port = server.server_address[1]
+
+        conn = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn.request("GET", "/api/state")
+        get_resp = conn.getresponse()
+        get_resp.read()
+        cookie_value = get_resp.getheader("Set-Cookie").split(";")[0]
+        conn.close()
+
+        body = json.dumps({"actor": "attacker"}).encode("utf-8")
+        conn2 = http.client.HTTPConnection("127.0.0.1", real_port, timeout=5)
+        conn2.putrequest("POST", f"/api/approval/{req.request_id}/approve")
+        conn2.putheader("Cookie", cookie_value)
+        # Same header name as above, but lowercased on the wire, carrying a
+        # forged/irrelevant value.
+        conn2.putheader("cookie", f"{CSRF_COOKIE_NAME}=forged-value")
+        conn2.putheader("Origin", f"http://127.0.0.1:{real_port}")
+        conn2.putheader("Content-Type", "application/json")
+        conn2.putheader("Content-Length", str(len(body)))
+        conn2.endheaders(body)
+        resp2 = conn2.getresponse()
+        resp2.read()
+        conn2.close()
+
+        assert resp2.status == 403
+        assert store.get(req.request_id).decision is None
+    finally:
+        _stop(server, thread)
+
+
 def test_an_options_preflight_on_an_unknown_path_still_returns_204(tmp_path):
     """A preflight is a request ABOUT a future request, not the request
     itself -- route_request never sees it (no path-based 404 possible
