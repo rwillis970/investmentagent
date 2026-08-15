@@ -4,6 +4,7 @@ import json
 import os
 import plistlib
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,12 +15,15 @@ from agent.admin_console import (
     AdminRuntime, LaunchctlServiceManager, ServiceStatus, build_status,
     discover_dashboard_url, launchctl_command, make_server, parse_launchctl_list,
     route_request, runtime_data_git_tracking, utility_command,
+    _run_utility_subprocess,
 )
 from scripts.install_admin_console import install
 from scripts.uninstall_admin_console import NAME as ADMIN_PLIST, uninstall
 
 REPO_ROOT = Path(__file__).parents[1]
 CSRF = "test-only-csrf-token"
+LOCAL_HOST = "127.0.0.1:8766"
+LOCAL_ORIGIN = "http://127.0.0.1:8766"
 
 
 class FakeServices:
@@ -43,8 +47,17 @@ def admin_runtime(tmp_path, *, repo_root=None, csrf_token=CSRF):
                         csrf_token=csrf_token)
 
 
-def csrf_headers(token=CSRF):
-    return {"X-InvestmentAgent-CSRF": token}
+def local_headers(*, host=LOCAL_HOST, origin=None, token=None, **extra):
+    headers = {"Host": host, **extra}
+    if origin is not None:
+        headers["Origin"] = origin
+    if token is not None:
+        headers["X-InvestmentAgent-CSRF"] = token
+    return headers
+
+
+def csrf_headers(token=CSRF, *, host=LOCAL_HOST, origin=LOCAL_ORIGIN, **extra):
+    return local_headers(host=host, origin=origin, token=token, **extra)
 
 
 def test_service_status_parsing():
@@ -165,7 +178,8 @@ def test_dashboard_discovery(tmp_path):
 
 
 def test_csrf_token_is_in_local_html_but_not_a_url(tmp_path):
-    result = route_request(admin_runtime(tmp_path), "GET", "/")
+    result = route_request(admin_runtime(tmp_path), "GET", "/",
+                           headers=local_headers())
     assert result.status == 200
     assert CSRF.encode() in result.body
     assert b"?csrf=" not in result.body
@@ -175,7 +189,8 @@ def test_csrf_token_is_in_local_html_but_not_a_url(tmp_path):
 @pytest.mark.parametrize("token", [None, "wrong-token"])
 def test_service_post_rejects_missing_or_wrong_csrf(tmp_path, token):
     runtime = admin_runtime(tmp_path)
-    headers = {} if token is None else csrf_headers(token)
+    headers = (local_headers(origin=LOCAL_ORIGIN) if token is None
+               else csrf_headers(token))
     result = route_request(runtime, "POST",
                            "/api/services/com.investmentagent.dashboard/restart",
                            headers=headers)
@@ -192,14 +207,60 @@ def test_service_post_accepts_valid_same_origin_ui_token(tmp_path):
     assert runtime.service_manager.calls == [("com.investmentagent.dashboard", "restart")]
 
 
+@pytest.mark.parametrize("host", [
+    "127.0.0.1", "127.0.0.1:8766", "localhost", "localhost:8766",
+])
+def test_exact_local_host_allowlist_accepts_supported_forms(tmp_path, host):
+    result = route_request(admin_runtime(tmp_path), "GET", "/",
+                           headers=local_headers(host=host))
+    assert result.status == 200
+    assert CSRF.encode() in result.body
+
+
+@pytest.mark.parametrize("path", ["/", "/app.js", "/api/status", "/api/logs"])
+@pytest.mark.parametrize("host", [None, "evil.example", "evil.example:8766",
+                                  "localhost.evil.example:8766", "127.0.0.1:9999"])
+def test_foreign_or_missing_host_is_rejected_before_any_response(tmp_path, host, path):
+    headers = {} if host is None else {"Host": host}
+    result = route_request(admin_runtime(tmp_path), "GET", path, headers=headers)
+    assert result.status == 403
+    assert CSRF.encode() not in result.body
+
+
+@pytest.mark.parametrize("origin", [None, "http://evil.example:8766",
+                                    "http://localhost.evil.example:8766",
+                                    "https://127.0.0.1:8766", "http://127.0.0.1:9999"])
+def test_service_post_rejects_missing_or_foreign_origin(tmp_path, origin):
+    runtime = admin_runtime(tmp_path)
+    headers = local_headers(token=CSRF, origin=origin)
+    result = route_request(
+        runtime, "POST", "/api/services/com.investmentagent.dashboard/restart",
+        headers=headers,
+    )
+    assert result.status == 403
+    assert runtime.service_manager.calls == []
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:8766", "http://localhost:8766"])
+def test_service_post_accepts_supported_local_origins(tmp_path, origin):
+    runtime = admin_runtime(tmp_path)
+    result = route_request(
+        runtime, "POST", "/api/services/com.investmentagent.dashboard/restart",
+        headers=csrf_headers(origin=origin),
+    )
+    assert result.status == 200
+    assert runtime.service_manager.calls == [("com.investmentagent.dashboard", "restart")]
+
+
 @pytest.mark.parametrize("name", ["health", "backup", "pre-reboot", "evidence"])
 def test_all_utility_posts_are_csrf_protected(tmp_path, name, monkeypatch):
     runtime = admin_runtime(tmp_path, repo_root=REPO_ROOT)
     calls = []
-    monkeypatch.setattr("agent.admin_console.subprocess.run",
+    monkeypatch.setattr("agent.admin_console._run_utility_subprocess",
                         lambda argv, **kwargs: calls.append(argv) or
                         subprocess.CompletedProcess(argv, 0, "ok", ""))
-    assert route_request(runtime, "POST", f"/api/utilities/{name}").status == 403
+    assert route_request(runtime, "POST", f"/api/utilities/{name}",
+                         headers=local_headers(origin=LOCAL_ORIGIN)).status == 403
     assert calls == []
     result = route_request(runtime, "POST", f"/api/utilities/{name}",
                            headers=csrf_headers())
@@ -222,10 +283,43 @@ def test_logs_are_fixed_allowlisted_and_truncated(tmp_path):
     logs.mkdir()
     (logs / "dashboard.out.log").write_text("A" * 13000)
     (logs / "not-allowed.log").write_text("SECRET")
-    payload = json.loads(route_request(runtime, "GET", "/api/logs").body)
+    payload = json.loads(route_request(runtime, "GET", "/api/logs",
+                                       headers=local_headers()).body)
     assert set(payload) == {"dashboard.out.log"}
     assert payload["dashboard.out.log"] == "A" * 12000
-    assert route_request(runtime, "GET", "/api/logs/../../etc/passwd").status == 404
+    assert route_request(runtime, "GET", "/api/logs/../../etc/passwd",
+                         headers=local_headers()).status == 404
+
+
+def test_log_tail_does_not_use_unbounded_path_read_text(tmp_path, monkeypatch):
+    runtime = admin_runtime(tmp_path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    target = logs / "dashboard.out.log"
+    target.write_text("discard-me" * 10000 + "Z" * 12000)
+    real_read_text = Path.read_text
+
+    def guarded_read_text(path, *args, **kwargs):
+        if path == target:
+            raise AssertionError("log tail must not read the entire file")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    result = route_request(runtime, "GET", "/api/logs", headers=local_headers())
+    assert result.status == 200
+    assert json.loads(result.body)["dashboard.out.log"] == "Z" * 12000
+
+
+def test_log_tail_refuses_symlink_to_non_log_file(tmp_path):
+    runtime = admin_runtime(tmp_path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must not be returned")
+    (logs / "dashboard.out.log").symlink_to(outside)
+    result = route_request(runtime, "GET", "/api/logs", headers=local_headers())
+    assert result.status == 200
+    assert "dashboard.out.log" not in json.loads(result.body)
 
 
 @pytest.mark.parametrize("path,content_type", [
@@ -234,14 +328,16 @@ def test_logs_are_fixed_allowlisted_and_truncated(tmp_path):
     ("/style.css", "text/css; charset=utf-8"),
 ])
 def test_static_routes(path, content_type, tmp_path):
-    result = route_request(admin_runtime(tmp_path), "GET", path)
+    result = route_request(admin_runtime(tmp_path), "GET", path,
+                           headers=local_headers())
     assert result.status == 200
     assert result.content_type == content_type
 
 
 @pytest.mark.parametrize("path", ["/../../etc/passwd", "/app.js/../secrets", "/%2e%2e/etc/passwd"])
 def test_path_traversal_is_refused(path, tmp_path):
-    assert route_request(admin_runtime(tmp_path), "GET", path).status == 404
+    assert route_request(admin_runtime(tmp_path), "GET", path,
+                         headers=local_headers()).status == 404
 
 
 @pytest.mark.parametrize("word", [
@@ -250,17 +346,123 @@ def test_path_traversal_is_refused(path, tmp_path):
 ])
 @pytest.mark.parametrize("method", ["GET", "POST"])
 def test_broad_forbidden_endpoint_sweep(word, method, tmp_path):
+    headers = csrf_headers() if method == "POST" else local_headers()
     assert route_request(admin_runtime(tmp_path), method, f"/api/{word}",
-                         headers=csrf_headers()).status == 404
+                         headers=headers).status == 404
 
 
 def test_read_only_gets_need_no_csrf_and_no_cors_headers(tmp_path):
     runtime = admin_runtime(tmp_path)
     for path in ("/", "/index.html", "/app.js", "/style.css", "/api/logs"):
-        result = route_request(runtime, "GET", path)
+        result = route_request(runtime, "GET", path, headers=local_headers())
         assert result.status == 200
         assert not any(name.lower() == "access-control-allow-origin"
                        for name, _value in result.headers)
+
+
+def test_options_does_not_grant_cross_origin_access(tmp_path):
+    result = route_request(admin_runtime(tmp_path), "OPTIONS", "/api/status",
+                           headers=local_headers(origin="http://evil.example"))
+    assert result.status == 404
+    assert not any(name.lower().startswith("access-control-")
+                   for name, _value in result.headers)
+
+
+@pytest.mark.parametrize("method,path,headers", [
+    ("GET", "/", local_headers()),
+    ("GET", "/missing", local_headers()),
+    ("GET", "/", {"Host": "evil.example"}),
+    ("POST", "/api/services/com.investmentagent.dashboard/restart", csrf_headers()),
+])
+def test_security_headers_prevent_framing_on_every_response(tmp_path, method, path, headers):
+    result = route_request(admin_runtime(tmp_path), method, path, headers=headers)
+    response_headers = {name.lower(): value for name, value in result.headers}
+    assert response_headers["content-security-policy"] == "frame-ancestors 'none'"
+    assert response_headers["x-frame-options"] == "DENY"
+
+
+@pytest.mark.parametrize("extra,expected", [
+    ({"Content-Length": "1"}, 400),
+    ({"Content-Length": "1025"}, 413),
+    ({"Content-Length": "-1"}, 400),
+    ({"Content-Length": "not-a-number"}, 400),
+    ({"Transfer-Encoding": "chunked"}, 400),
+])
+def test_unexpected_or_oversized_request_bodies_are_rejected(tmp_path, extra, expected):
+    runtime = admin_runtime(tmp_path)
+    result = route_request(
+        runtime, "POST", "/api/services/com.investmentagent.dashboard/restart",
+        headers=csrf_headers(**extra), body=b"x" if extra.get("Content-Length") == "1" else None,
+    )
+    assert result.status == expected
+    assert runtime.service_manager.calls == []
+
+
+def test_utility_execution_is_single_flight_and_returns_busy(tmp_path, monkeypatch):
+    runtime = admin_runtime(tmp_path, repo_root=REPO_ROOT)
+    calls = []
+    monkeypatch.setattr("agent.admin_console._run_utility_subprocess",
+                        lambda argv, **kwargs: calls.append(argv) or
+                        subprocess.CompletedProcess(argv, 0, "ok", ""))
+    assert runtime.utility_lock.acquire(blocking=False)
+    try:
+        result = route_request(runtime, "POST", "/api/utilities/backup",
+                               headers=csrf_headers())
+    finally:
+        runtime.utility_lock.release()
+    assert result.status == 409
+    assert calls == []
+
+
+def test_concurrent_backup_storm_has_one_runner_and_one_busy_response(tmp_path, monkeypatch):
+    runtime = admin_runtime(tmp_path, repo_root=REPO_ROOT)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocking_run(argv, **_kwargs):
+        calls.append(argv)
+        entered.set()
+        assert release.wait(timeout=5)
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr("agent.admin_console._run_utility_subprocess", blocking_run)
+    first = {}
+
+    def run_first():
+        first["result"] = route_request(runtime, "POST", "/api/utilities/backup",
+                                        headers=csrf_headers())
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert entered.wait(timeout=5)
+    second = route_request(runtime, "POST", "/api/utilities/pre-reboot",
+                           headers=csrf_headers())
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert first["result"].status == 200
+    assert second.status == 409
+    assert len(calls) == 1
+
+
+def test_utility_subprocess_retains_only_bounded_output_tail(tmp_path):
+    result = _run_utility_subprocess(
+        ["/usr/bin/python3", "-c", "import sys; sys.stdout.write('A' * 20000 + 'TAIL')"],
+        cwd=tmp_path, output_limit=1024,
+    )
+    assert result.returncode == 0
+    assert len(result.stdout.encode()) <= 1024
+    assert result.stdout.endswith("TAIL")
+
+
+def test_utility_subprocess_timeout_is_bounded(tmp_path):
+    result = _run_utility_subprocess(
+        ["/usr/bin/python3", "-c", "import time; time.sleep(5)"],
+        cwd=tmp_path, timeout=0.05, output_limit=1024,
+    )
+    assert result.returncode == 124
+    assert "timed out" in result.stdout
 
 
 def test_uninstall_installed_and_absent(tmp_path):

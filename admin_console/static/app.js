@@ -1,9 +1,10 @@
 const labels={"com.investmentagent.reconcile-loop":"Reconcile Loop","com.investmentagent.dashboard":"Dashboard Service"};
 const esc=x=>String(x??'UNAVAILABLE').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const csrfHeaders={'X-InvestmentAgent-CSRF':document.querySelector('meta[name="investmentagent-csrf"]').content};
+const disruptiveActions=new Set(['stop','restart']);
 const tone=value=>['FAIL','ACTIVE','STOPPED'].includes(value)?'fail':['STALE','NOT_YET_OBSERVED'].includes(value)?'caution':['UNAVAILABLE','UNKNOWN'].includes(value)?'unknown':'good';
 const card=(name,value,extra='')=>`<article><span>${esc(name)}</span><strong class="${tone(value)}">${esc(value)}</strong>${extra?`<small>${esc(extra)}</small>`:''}</article>`;
-async function act(label,action){await fetch(`/api/services/${encodeURIComponent(label)}/${action}`,{method:'POST',headers:csrfHeaders}); await load();}
+async function act(label,action){if(disruptiveActions.has(action)&&!window.confirm(`Confirm ${action} for ${labels[label]}?`))return; await fetch(`/api/services/${encodeURIComponent(label)}/${action}`,{method:'POST',headers:csrfHeaders}); await load();}
 async function utility(name){const r=await fetch(`/api/utilities/${name}`,{method:'POST',headers:csrfHeaders}); document.querySelector('#utility-output').textContent=JSON.stringify(await r.json(),null,2); await load();}
 async function logs(){const r=await fetch('/api/logs'); document.querySelector('#utility-output').textContent=JSON.stringify(await r.json(),null,2);}
 async function load(){const s=await (await fetch('/api/status')).json(); let h='';

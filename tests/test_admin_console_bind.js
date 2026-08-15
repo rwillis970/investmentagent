@@ -18,6 +18,11 @@ test('admin UI reads the process token from same-origin HTML and sends the custo
   assert.doesNotMatch(script, /[?&]csrf=/);
 });
 
+test('admin UI confirms disruptive service actions', () => {
+  assert.match(script, /new Set\(\['stop','restart'\]\)/);
+  assert.match(script, /window\.confirm/);
+});
+
 test('stale and unavailable states have explicit non-green visual classes', () => {
   assert.match(script, /\['STALE','NOT_YET_OBSERVED'\]/);
   assert.match(script, /\['UNAVAILABLE','UNKNOWN'\]/);
