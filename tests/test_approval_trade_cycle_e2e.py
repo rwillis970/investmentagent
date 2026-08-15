@@ -62,6 +62,7 @@ from agent import config as config_module
 from agent.accounts import AccountType, BrokerCredentials
 from agent.approval import ApprovalService
 from agent.approval_execution import execute_approved_request
+from agent.mode_store import ModeStore
 from agent.approval_request_store import ApprovalRequestStore
 from agent.approval_trigger import request_approval_for_analysis
 from agent.audit import AuditLog
@@ -69,7 +70,7 @@ from agent.broker.alpaca import AlpacaPaperAdapter
 from agent.broker.base import AccountSnapshot, Position
 from agent.broker.transport import ScriptedTransport
 from agent.cost import CostLedger
-from agent.dashboard_server import DashboardRuntime, route_request
+from agent.dashboard_server import CSRF_COOKIE_NAME, DashboardRuntime, route_request
 from agent.daytrade import DayTradeGuard
 from agent.entities import AnalysisResult, OpportunityEvent
 from agent.execution_quarantine import ExecutionQuarantineStore
@@ -80,6 +81,7 @@ from agent.ledger_store import LedgerStore
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.pipeline import Gatekeeper
 from agent.policy import initial_policy
+from agent import runtime_status as runtime_status_module
 from agent.risk import RiskPolicy
 from agent.secrets_provider import InMemorySecretsProvider
 from tests.test_config_fixture import valid_raw_config
@@ -263,6 +265,7 @@ def test_full_paper_approval_and_trade_cycle(tmp_path):
     approve_result = route_request(
         runtime, method="POST", path=f"/api/approval/{request_id}/approve",
         body=json.dumps({"actor": "operator"}).encode("utf-8"),
+        headers={"Cookie": f"{CSRF_COOKIE_NAME}={runtime.csrf_token}"},
     )
     assert approve_result.status == 200
     approve_body = json.loads(approve_result.body)
@@ -293,9 +296,30 @@ def test_full_paper_approval_and_trade_cycle(tmp_path):
     # -- this single override keeps both consistent with NOW instead of
     # real wall-clock time.
     adapter.clock = lambda: NOW + timedelta(seconds=30)
+    # SAFETY-CRITICAL fix (security-remediation unit, 2026-08-15):
+    # execute_approved_request now requires a fresh PAPER mode +
+    # PASSing reconciliation snapshot immediately before it will submit
+    # -- see agent/approval_execution.py's own module docstring, "MODE +
+    # RECONCILIATION GATE" section. Seeded here at the SAME instant the
+    # adapter's own clock is fixed to, above.
+    submit_now = NOW + timedelta(seconds=30)
+    mode_store_path = tmp_path / "mode_state.jsonl"
+    ModeStore(mode_store_path).write("PAPER", changed_at=NOW - timedelta(days=1))
+    runtime_status_path = tmp_path / "runtime_status.json"
+    runtime_status_module.write_atomic(runtime_status_path, runtime_status_module.RuntimeStatus(
+        generated_at=submit_now, account_id=ACCT, mode="PAPER", process_status="running",
+        source="cycle", market_session_state="OPEN", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=submit_now,
+        reconciliation_status="PASS", reconciliation_at=submit_now,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=submit_now, last_failure_at=None, last_failure_type=None,
+        recovered_at=None, collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    ))
     order = execute_approved_request(
         request_id, store=approval_store, adapter=adapter, gatekeeper=gatekeeper,
-        token=token, reference_price=100.0,
+        token=token, quote_provider=lambda symbol: 100.0,
+        mode_store_path=mode_store_path, runtime_status_path=runtime_status_path,
     )
     assert order.client_order_id == client_order_id
     assert order.status == "filled"
@@ -436,10 +460,11 @@ def test_a_second_approve_after_execution_is_a_replay_not_a_re_execution(tmp_pat
         audit_log=audit_log, account_id=ACCT,
         now_fn=lambda: NOW + timedelta(seconds=15),
     )
+    csrf = {"Cookie": f"{CSRF_COOKIE_NAME}={runtime.csrf_token}"}
     first = route_request(runtime, method="POST", path=f"/api/approval/{request_id}/approve",
-                          body=json.dumps({"actor": "operator"}).encode("utf-8"))
+                          body=json.dumps({"actor": "operator"}).encode("utf-8"), headers=csrf)
     second = route_request(runtime, method="POST", path=f"/api/approval/{request_id}/approve",
-                           body=json.dumps({"actor": "operator"}).encode("utf-8"))
+                           body=json.dumps({"actor": "operator"}).encode("utf-8"), headers=csrf)
     assert first.status == 200 and second.status == 200
     first_body = json.loads(first.body)
     second_body = json.loads(second.body)

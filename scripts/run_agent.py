@@ -395,6 +395,57 @@ def _resolve_gatekeeper_signing_key(secrets_provider: SecretsProvider,
     return key
 
 
+def _alpaca_quote_provider(market_data_client: AlpacaMarketDataClient,
+                          *, now_fn: Callable[[], datetime],
+                          max_quote_age: timedelta = timedelta(minutes=15),
+                          log: logging.Logger) -> Callable[[str], "float | None"]:
+    """Real `agent.approval_execution.QuoteProvider` implementation
+    (security-remediation unit, 2026-08-15; see that module's own
+    docstring, "PRICE BAND" section, for the finding this closes). Fetches
+    the most recent 1-minute bar for `symbol` from the SAME read-only
+    Alpaca market-data API `_run_research_once`/the scheduled collector
+    already use -- never invents a second data source. Returns `None`
+    (fail closed, per `execute_approved_request`'s own `QuoteUnavailable`)
+    if the request itself fails, no bar comes back, or the most recent bar
+    is older than `max_quote_age` -- a stale feed is treated exactly like
+    no feed at all, the same posture `agent.runtime_status.is_stale`
+    already uses for reconciliation freshness elsewhere in this unit.
+    Never raises: any failure is logged and reported as `None`, matching
+    `_build_broker_state`'s own "never raises" contract (scripts/
+    run_dashboard.py) for the identical reason -- a caller-visible
+    exception here should come from `execute_approved_request` itself
+    (which wraps `None` into `QuoteUnavailable`), not leak a raw
+    `AlpacaMarketDataError`/`TransportError` past this boundary."""
+    def provider(symbol: str) -> float | None:
+        now = now_fn()
+        try:
+            bars = market_data_client.minute_bars([symbol], end=now, limit=1)
+        except Exception as exc:   # noqa: BLE001 -- see docstring: never raises
+            log.warning("quote_provider: minute_bars(%s) failed: %s", symbol, exc)
+            return None
+        rows = bars.get(symbol) or []
+        if not rows:
+            log.warning("quote_provider: no recent bar returned for %s", symbol)
+            return None
+        last = rows[-1]
+        try:
+            bar_time = datetime.fromisoformat(str(last["t"]).replace("Z", "+00:00"))
+            price = float(last["c"])
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("quote_provider: malformed bar for %s: %s", symbol, exc)
+            return None
+        if now - bar_time > max_quote_age:
+            log.warning("quote_provider: most recent bar for %s is stale "
+                       "(bar_time=%s, now=%s, max_age=%s)",
+                       symbol, bar_time.isoformat(), now.isoformat(), max_quote_age)
+            return None
+        if price <= 0:
+            log.warning("quote_provider: non-positive price %r for %s", price, symbol)
+            return None
+        return price
+    return provider
+
+
 def build_account_runtime(cfg: config_module.Config, *, account_id: str,
                           credentials: BrokerCredentials,
                           ledger_store_path: str | Path,
@@ -613,17 +664,26 @@ def build_pipeline_runtime(cfg: config_module.Config, *, account_id: str,
 
 
 def _real_adapter_factory(secrets_provider: SecretsProvider,
+                          broker_account_uuid: str | None = None,
                           ) -> Callable[[AccountRuntime], BrokerAdapter]:
     """A fresh AlpacaPaperAdapter per call -- safe and cheap (module
     docstring: the adapter is stateless in the way that matters, the
     broker's real state lives at Alpaca, not in this object). No
     `capability_policy` is attached: this loop never calls submit()/
     cancel(), only the read methods and fills(), none of which touch
-    capability_policy at all."""
+    capability_policy at all.
+
+    `broker_account_uuid` (security-remediation unit, 2026-08-15) is
+    `cfg.broker_account_uuid`, threaded straight through to
+    `expected_broker_account_id` -- see agent/broker/alpaca.py's own
+    module docstring, "BROKER ACCOUNT IDENTITY BINDING" section. This is
+    the read side (reconciliation); `_run_submit_approved` below wires the
+    same config value into the write side."""
     def factory(acct: AccountRuntime) -> BrokerAdapter:
         return AlpacaPaperAdapter(
             account_id=acct.account_id, credentials=acct.credentials,
             secrets_provider=secrets_provider,
+            expected_broker_account_id=broker_account_uuid,
         )
     return factory
 
@@ -914,9 +974,13 @@ def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
                          key_id: str, secret_ref: str, signing_key_secret_ref: str,
                          account_type: str,
                          approval_request_store_path: str | Path,
-                         audit_log_path: str | Path, reference_price: float,
+                         audit_log_path: str | Path,
+                         mode_store_path: str | Path, runtime_status_path: str | Path,
                          secrets_provider_factory: Callable[[str], SecretsProvider],
-                         now_fn: Callable[[], datetime], log: logging.Logger) -> int:
+                         now_fn: Callable[[], datetime], log: logging.Logger,
+                         quote_provider_factory: Callable[
+                             [AlpacaMarketDataClient], Callable[[str], "float | None"]
+                         ] | None = None) -> int:
     """The operator path for executing an APPROVED request (see module
     docstring's --SUBMIT-APPROVED section). Mirrors `_run_admit_or_reject`'s
     SHAPE -- one-shot, narrow, dispatched before any pipeline/loop
@@ -936,14 +1000,26 @@ def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
     approved-and-minted through the dashboard or is minting for the first
     time right here.
 
-    REFERENCE PRICE IS OPERATOR-SUPPLIED, NOT FETCHED. `agent.
-    approval_execution`'s own docstring explains why: no market-data client
-    is threaded through this command, so `--submit-approved-reference-
-    price` is REQUIRED and its value is passed straight through to
-    `execute_approved_request` -- the same figure `ApprovalToken.consume`
-    (called inside `BrokerAdapter.submit`) checks against the approved
-    price band. The operator is expected to read a current quote
-    themselves (the broker's own dashboard, say) before invoking this.
+    QUOTE IS FETCHED FRESH, NEVER OPERATOR-SUPPLIED (security-remediation
+    unit, 2026-08-15; MEDIUM finding, Codex Security scan -- supersedes
+    the paragraph this replaces, which had the CLI's own `--submit-
+    approved-reference-price` flag feed a plain operator-typed float
+    straight into the price-band check: "a token may be consumed against
+    a caller-provided in-band value while the actual market order fills
+    outside the approved band" is exactly what that let happen). A real
+    `AlpacaMarketDataClient` is now constructed here (the SAME read-only
+    market-data client `_run_research_once`/the scheduled collector
+    already use, reusing the SAME `secrets_provider`/`credentials` already
+    built above for the broker adapter -- see agent/broker/
+    alpaca_market_data.py's own `_EXPECTED_SECRETS_MODE` guard, which this
+    satisfies identically to every other caller in this script) and wrapped
+    by `_alpaca_quote_provider` into the `quote_provider` callable `agent.
+    approval_execution.execute_approved_request` now requires -- see that
+    function's own docstring, "PRICE BAND" section. `quote_provider_
+    factory`, when supplied (tests only -- production callers leave it
+    `None`), replaces `_alpaca_quote_provider` entirely, preserving
+    deterministic testing with a scripted quote instead of a real network
+    call, per this unit's own explicit instruction.
 
     CAPABILITY POLICY IS ATTACHED, UNLIKE `_real_adapter_factory` ABOVE.
     That factory (the real scheduled loop) never calls `submit()`/
@@ -958,7 +1034,21 @@ def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
     signing_key` -- so the `Gatekeeper` built below verifies against the
     SAME durable key the scheduled loop staged the order with, rather than
     a fresh one this invocation would have to re-sign against (removed;
-    see agent/approval_execution.py's own module docstring)."""
+    see agent/approval_execution.py's own module docstring).
+
+    MODE_STORE_PATH/RUNTIME_STATUS_PATH ARE THE SAME `--mode-store-path`/
+    `--runtime-status-path` FLAGS ALREADY DEFINED ON THIS PARSER FOR
+    `--reconcile-once`/`--research-once` (security-remediation unit,
+    2026-08-15; SAFETY-CRITICAL finding, Codex Security scan) -- passed
+    straight through to `execute_approved_request`, which reads BOTH fresh
+    from disk, immediately before the one real `adapter.submit(...)` call,
+    regardless of anything checked here. Before this unit, THIS specific
+    one-shot CLI dispatch never consulted `ModeStore` or `runtime_status.
+    json` at all, so a persisted PAUSED/DISABLED mode did not stop a fully
+    -valid, signed, in-band approval from reaching a real broker submit --
+    see agent/approval_execution.py's own module docstring, "MODE +
+    RECONCILIATION GATE" section, for the full fix (which lives THERE, not
+    here, specifically so it holds for every caller, not just this one)."""
     try:
         cfg = config_module.load(json.loads(Path(config_path).read_text()))
         secrets_provider = secrets_provider_factory(cfg.mode)
@@ -993,12 +1083,26 @@ def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
         )
         adapter = AlpacaPaperAdapter(account_id=account_id, credentials=credentials,
                                      secrets_provider=secrets_provider,
-                                     capability_policy=cfg.capability_policy)
+                                     capability_policy=cfg.capability_policy,
+                                     expected_broker_account_id=cfg.broker_account_uuid)
+
+        market_data_client = AlpacaMarketDataClient(
+            credentials=credentials, secrets_provider=secrets_provider,
+            feed=cfg.market_data_feed,
+            http_timeout_seconds=cfg.market_data_http_timeout_seconds,
+            http_max_retries=cfg.market_data_http_max_retries,
+        )
+        if quote_provider_factory is not None:
+            quote_provider = quote_provider_factory(market_data_client)
+        else:
+            quote_provider = _alpaca_quote_provider(
+                market_data_client, now_fn=now_fn, log=log)
 
         try:
             order = execute_approved_request(
                 request_id, store=store, adapter=adapter, gatekeeper=gatekeeper,
-                token=token, reference_price=reference_price,
+                token=token, quote_provider=quote_provider,
+                mode_store_path=mode_store_path, runtime_status_path=runtime_status_path,
             )
         except ExecutionError as exc:
             log.error("refusing --submit-approved %s: %s", request_id, exc)
@@ -1190,7 +1294,9 @@ def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
         persisted_mode = mode_store.current()
 
         sync_result = sync_and_build_reconciliations(
-            accounts=[account], adapter_factory=_real_adapter_factory(secrets_provider),
+            accounts=[account],
+            adapter_factory=_real_adapter_factory(
+                secrets_provider, broker_account_uuid=cfg.broker_account_uuid),
             now=now, audit_log=audit_log,
         )
         reconciled_accounts = reconcile_accounts_or_raise(
@@ -1836,17 +1942,21 @@ def _parse_args(argv: list[str] | None):
                              "machinery) but not its collaborators: this command constructs a "
                              "REAL AlpacaPaperAdapter and submits through it. NOT wired into "
                              "the unattended loop this unit. Requires --account-id, --config, "
-                             "--key-id, --secret-ref, --signing-key-secret-ref, "
-                             "--approval-request-store-path and --submit-approved-reference-"
-                             "price; every other pipeline flag is ignored.")
+                             "--key-id, --secret-ref, --signing-key-secret-ref and "
+                             "--approval-request-store-path; every other pipeline flag is "
+                             "ignored.")
     parser.add_argument("--submit-approved-reference-price", default=None, type=float,
                         metavar="PRICE",
-                        help="required by --submit-approved: a current market price for the "
-                             "approved order's symbol, read by the OPERATOR from a live quote "
-                             "-- this command fetches no market data of its own (see agent/"
-                             "approval_execution.py's own module docstring for why). Checked "
-                             "against the approved price band exactly as any other submission "
-                             "would be.")
+                        help="DEPRECATED, NO LONGER USED (security-remediation unit, "
+                             "2026-08-15): this command now fetches its own fresh market "
+                             "quote via a real AlpacaMarketDataClient immediately before "
+                             "submission -- see agent/approval_execution.py's own module "
+                             "docstring, \"PRICE BAND\" section, for the finding this closes "
+                             "(a caller-supplied price could be consumed in-band while the "
+                             "real market had already moved outside the approved band). "
+                             "Accepted for backward CLI compatibility only, ignored if given, "
+                             "and logged as a warning -- never passed to execute_approved_"
+                             "request.")
     parser.add_argument("--reconcile-once", action="store_true",
                         help="run ONE broker-read + sync_fills + sync_cash_events + account "
                              "reconciliation cycle -- agent.run_loop.sync_and_build_"
@@ -1976,14 +2086,14 @@ def _parse_args(argv: list[str] | None):
             ("--account-id", args.account_id), ("--config", args.config),
             ("--key-id", args.key_id), ("--secret-ref", args.secret_ref),
             ("--signing-key-secret-ref", args.signing_key_secret_ref),
-            ("--submit-approved-reference-price", args.submit_approved_reference_price),
         ) if val is None]
         if missing:
             parser.error(
                 "the following arguments are required for --submit-approved: "
                 + ", ".join(missing)
             )
-        _default_relevant_paths(("approval_request_store_path", "audit_log_path"))
+        _default_relevant_paths(("approval_request_store_path", "audit_log_path",
+                                 "mode_store_path", "runtime_status_path"))
     elif args.reconcile_once:
         missing = [name for name, val in (
             ("--account-id", args.account_id), ("--config", args.config),
@@ -2068,6 +2178,9 @@ def main(argv: list[str] | None = None, *,
             = default_keychain_secrets_provider_factory,
         notify_fn: Callable[[str], None] = _default_notify,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        quote_provider_factory: Callable[
+            [AlpacaMarketDataClient], Callable[[str], "float | None"]
+        ] | None = None,
         ) -> int:
     """Returns 0 or 1 -- never raises. `run_loop_fn`/`secrets_provider_factory`/
     `notify_fn`/`now_fn` are injectable so this can be tested with no real
@@ -2112,7 +2225,15 @@ def main(argv: list[str] | None = None, *,
     touches a durable store or (for --submit-approved) can ever reach
     `adapter.submit` -- see `_run_one_shot_locked`'s own docstring/comment
     block (writer-lock-gap unit, 2026-08-14) for why this closes the gap
-    with a single acquisition site and no nested-lock risk."""
+    with a single acquisition site and no nested-lock risk.
+
+    `quote_provider_factory` is injectable (tests only; production callers
+    leave it `None`) and threads straight through to `_run_submit_approved`,
+    mirroring how `secrets_provider_factory`/`now_fn` are already threaded
+    through -- see that function's own docstring, "QUOTE IS FETCHED FRESH"
+    section, for why: without this, every `--submit-approved` test would
+    either need real network egress to Alpaca or would fail closed on
+    `QuoteUnavailable` (security-remediation unit, 2026-08-15)."""
     args = _parse_args(argv)
     logging.basicConfig(level=args.log_level)
     log = logging.getLogger(LOGGER_NAME)
@@ -2158,6 +2279,14 @@ def main(argv: list[str] | None = None, *,
         )
 
     if args.submit_approved is not None:
+        if args.submit_approved_reference_price is not None:
+            log.warning(
+                "--submit-approved-reference-price is deprecated and no longer "
+                "used (security-remediation unit, 2026-08-15) -- this command "
+                "now fetches its own fresh quote; the value you supplied "
+                "(%s) is being IGNORED",
+                args.submit_approved_reference_price,
+            )
         return _run_one_shot_locked(
             data_dir=args.data_dir, log=log,
             action_desc=f"--submit-approved {args.submit_approved}",
@@ -2168,8 +2297,21 @@ def main(argv: list[str] | None = None, *,
                 account_type=args.account_type,
                 approval_request_store_path=args.approval_request_store_path,
                 audit_log_path=args.audit_log_path,
-                reference_price=args.submit_approved_reference_price,
+                # SAFETY-CRITICAL fix (security-remediation unit, 2026-08-15):
+                # the SAME --mode-store-path/--runtime-status-path flags
+                # --reconcile-once/--research-once already use -- see
+                # _run_submit_approved's own docstring and agent/
+                # approval_execution.py's module docstring for why this
+                # closes the scanner's finding. --submit-approved-reference-
+                # price is deliberately NOT threaded through any more (MEDIUM
+                # finding -- see _run_submit_approved's own docstring,
+                # "QUOTE IS FETCHED FRESH" section); a warning is logged here
+                # if the operator still supplied it, so the flag's own
+                # DEPRECATED help text is not the only place this is visible.
+                mode_store_path=args.mode_store_path,
+                runtime_status_path=args.runtime_status_path,
                 secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
+                quote_provider_factory=quote_provider_factory,
             ),
         )
 
@@ -2406,7 +2548,8 @@ def main(argv: list[str] | None = None, *,
 
             run_loop_fn(
                 accounts=[account],
-                adapter_factory=_real_adapter_factory(secrets_provider),
+                adapter_factory=_real_adapter_factory(
+                    secrets_provider, broker_account_uuid=cfg.broker_account_uuid),
                 mode_store=mode_store, audit_log=audit_log,
                 approval_service=approval_service, target_mode=cfg.mode,
                 confirmed=args.confirmed,

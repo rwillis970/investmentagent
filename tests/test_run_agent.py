@@ -30,8 +30,8 @@ from agent.mode_store import ModeStore
 from agent.secrets_provider import InMemorySecretsProvider
 from agent.process_lock import acquire_process_lock
 from scripts.run_agent import (DataDirConflict, _account_ids_in,
-                               _check_data_dir_sanity, build_account_runtime,
-                               main)
+                               _check_data_dir_sanity, _real_adapter_factory,
+                               build_account_runtime, main)
 
 
 def base_config(**over):
@@ -1678,14 +1678,51 @@ def _submit_approved_request(tmp_path, *, price=100.0, max_position_pct=10.0):
     return store_path, result
 
 
+def _seed_submit_approved_mode_and_reconciliation(tmp_path, *, mode="PAPER",
+                                                    now=_SA_SUBMIT_AT):
+    """SAFETY-CRITICAL fix (security-remediation unit, 2026-08-15):
+    `execute_approved_request` now REQUIRES a fresh, PASSing ModeStore/
+    runtime_status pair immediately before it will submit -- see agent/
+    approval_execution.py's own module docstring, "MODE + RECONCILIATION
+    GATE" section. Every --submit-approved test in this file needs a
+    passing pair seeded, or it fails for a reason unrelated to what it
+    actually tests; the NEW tests further down in this section are what
+    prove PAUSED/DISABLED/missing actually block a real CLI invocation."""
+    mode_store_path = tmp_path / "sa_mode_state.jsonl"
+    if mode is not None:
+        ModeStore(mode_store_path).write(mode, changed_at=now - timedelta(days=1))
+    runtime_status_path = tmp_path / "sa_runtime_status.json"
+    status = runtime_status_module.RuntimeStatus(
+        generated_at=now, account_id=_SA_ACCT, mode="PAPER", process_status="running",
+        source="cycle", market_session_state="OPEN", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=now,
+        reconciliation_status="PASS", reconciliation_at=now,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=now, last_failure_at=None, last_failure_type=None,
+        recovered_at=None, collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    )
+    runtime_status_module.write_atomic(runtime_status_path, status)
+    return mode_store_path, runtime_status_path
+
+
 def _submit_approved_argv(*, tmp_path, request_id, reference_price=100.0,
-                          config_path=None, approval_request_store_path):
+                          config_path=None, approval_request_store_path,
+                          mode_store_path=None, runtime_status_path=None,
+                          seed_mode="PAPER", seed_now=_SA_SUBMIT_AT):
+    if mode_store_path is None or runtime_status_path is None:
+        seeded_mode_path, seeded_status_path = _seed_submit_approved_mode_and_reconciliation(
+            tmp_path, mode=seed_mode, now=seed_now)
+        mode_store_path = mode_store_path or seeded_mode_path
+        runtime_status_path = runtime_status_path or seeded_status_path
     return [
         "--config", str(config_path or tmp_path / "config.json"),
         "--account-id", _SA_ACCT, "--key-id", "k", "--secret-ref", "ref",
         "--signing-key-secret-ref", SIGNING_KEY_SECRET_REF,
         "--approval-request-store-path", str(approval_request_store_path),
         "--audit-log-path", str(tmp_path / "audit.jsonl"),
+        "--mode-store-path", str(mode_store_path),
+        "--runtime-status-path", str(runtime_status_path),
         "--submit-approved", request_id,
         "--submit-approved-reference-price", str(reference_price),
     ]
@@ -1704,6 +1741,101 @@ def _fake_alpaca_factory(*, cash=500.0, price=100.0):
         b.set_price("AAPL", price)
         return b
     return factory
+
+
+def _fake_quote_provider_factory(*, price=100.0, symbol="AAPL"):
+    """Stands in for the real `_alpaca_quote_provider` (agent/broker/
+    alpaca_market_data.py-backed, real network egress) that `_run_submit_
+    approved` now builds unconditionally -- see that function's own
+    docstring, "QUOTE IS FETCHED FRESH" section. `main()`'s injectable
+    `quote_provider_factory` parameter (added alongside this fixture,
+    security-remediation unit, 2026-08-15) replaces it entirely here, the
+    same way `secrets_provider_factory`/`now_fn` are already replaced for
+    every --submit-approved test in this file -- this sandbox has no
+    network egress, so leaving the real one in place would fail every one
+    of these tests closed on `QuoteUnavailable`, for a reason unrelated to
+    what each test actually exercises. Ignores the `market_data_client`
+    argument `main()` passes it (mirroring `_fake_alpaca_factory`'s own
+    `**_ignored` discipline) -- the whole point is to never construct or
+    call the real one."""
+    def factory(market_data_client):
+        def quote_provider(sym):
+            return price if sym == symbol else None
+        return quote_provider
+    return factory
+
+
+# ---------------- BROKER ACCOUNT IDENTITY BINDING (security-remediation unit, 2026-08-15)
+#
+# `cfg.broker_account_uuid` -> `AlpacaPaperAdapter`'s `expected_broker_
+# account_id` -- see agent/broker/alpaca.py's own module docstring, "BROKER
+# ACCOUNT IDENTITY BINDING" section, and agent/config.py's own field
+# docstring, for the fix these tests prove is actually wired end to end,
+# not just implemented in isolation on the adapter.
+
+def _minimal_account_runtime_stub(account_id="acct-a"):
+    """`_real_adapter_factory`'s returned `factory` only reads `acct.
+    account_id`/`acct.credentials` (see scripts/run_agent.py's own body) --
+    a full `agent.run_loop.AccountRuntime` needs a `policy_registry`/
+    day-trade/quarantine-path shape this narrow test has no reason to
+    build. A tiny stand-in with just those two attributes is enough to
+    prove the threading these tests actually check."""
+    from types import SimpleNamespace
+    from agent.accounts import BrokerCredentials as _Creds
+    return SimpleNamespace(
+        account_id=account_id,
+        credentials=_Creds(account_id=account_id, key_id="k", secret_ref="ref"),
+    )
+
+
+def test_real_adapter_factory_threads_broker_account_uuid_into_the_adapter():
+    secrets_provider = _secrets_provider_factory("PAPER")
+    factory = _real_adapter_factory(secrets_provider, broker_account_uuid="pinned-uuid-123")
+    adapter = factory(_minimal_account_runtime_stub())
+    assert adapter._expected_broker_account_id == "pinned-uuid-123"
+
+
+def test_real_adapter_factory_defaults_to_none_when_config_never_set_it():
+    secrets_provider = _secrets_provider_factory("PAPER")
+    factory = _real_adapter_factory(secrets_provider)   # no broker_account_uuid at all
+    adapter = factory(_minimal_account_runtime_stub())
+    assert adapter._expected_broker_account_id is None
+
+
+def test_submit_approved_threads_the_configured_broker_account_uuid_into_the_real_adapter_construction(
+    tmp_path, monkeypatch,
+):
+    """CLI-level proof, not just the unit-level ones above: a config with
+    `broker_account_uuid` set actually reaches the real
+    `AlpacaPaperAdapter(...)` construction inside `_run_submit_approved`,
+    via the ordinary `--submit-approved` path -- captured here by
+    monkeypatching the class itself and inspecting the kwargs it was
+    constructed with, the same technique `_fake_alpaca_factory` already
+    uses to stand in for a real broker."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    captured_kwargs = {}
+
+    def _capturing_factory(**kwargs):
+        captured_kwargs.update(kwargs)
+        return _fake_alpaca_factory()(**kwargs)
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(
+        base_config(broker_account_uuid="pinned-uuid-abc")))
+    store_path, result = _submit_approved_request(tmp_path)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _capturing_factory)
+
+    code = main(
+        _submit_approved_argv(tmp_path=tmp_path, request_id=result.request.request_id,
+                              config_path=config_path, approval_request_store_path=store_path),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _SA_SUBMIT_AT,
+        quote_provider_factory=_fake_quote_provider_factory(),
+    )
+    assert code == 0
+    assert captured_kwargs.get("expected_broker_account_id") == "pinned-uuid-abc"
 
 
 def test_submit_approved_requires_its_own_flags(tmp_path):
@@ -1728,6 +1860,7 @@ def test_submit_approved_executes_against_a_fake_broker_and_audits(tmp_path, mon
                               approval_request_store_path=store_path),
         secrets_provider_factory=_secrets_provider_factory,
         now_fn=lambda: _SA_SUBMIT_AT,
+        quote_provider_factory=_fake_quote_provider_factory(),
     )
     assert code == 0
 
@@ -1758,6 +1891,7 @@ def test_submit_approved_never_constructs_the_real_scheduled_loop(tmp_path, monk
         run_loop_fn=_boom,
         secrets_provider_factory=_secrets_provider_factory,
         now_fn=lambda: _SA_SUBMIT_AT,
+        quote_provider_factory=_fake_quote_provider_factory(),
     )
     assert code == 0
 
@@ -1808,9 +1942,11 @@ def test_submit_approved_is_idempotent_across_two_separate_invocations(tmp_path,
                                  config_path=config_path,
                                  approval_request_store_path=store_path)
     first = main(argv, secrets_provider_factory=_secrets_provider_factory,
-                now_fn=lambda: _SA_SUBMIT_AT)
+                now_fn=lambda: _SA_SUBMIT_AT,
+                quote_provider_factory=_fake_quote_provider_factory())
     second = main(argv, secrets_provider_factory=_secrets_provider_factory,
-                 now_fn=lambda: _SA_SUBMIT_AT + timedelta(seconds=5))
+                 now_fn=lambda: _SA_SUBMIT_AT + timedelta(seconds=5),
+                 quote_provider_factory=_fake_quote_provider_factory())
     assert first == 0
     assert second == 0
 
@@ -2000,6 +2136,7 @@ def test_submit_approved_succeeds_normally_once_the_competing_lock_is_released(
     code = main(
         argv, secrets_provider_factory=_secrets_provider_factory,
         now_fn=lambda: _SA_SUBMIT_AT,
+        quote_provider_factory=_fake_quote_provider_factory(),
     )
     assert code == 0
 

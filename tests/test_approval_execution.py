@@ -13,17 +13,20 @@ from __future__ import annotations
 import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import agent.approval_execution as approval_execution_module
+from agent import runtime_status as runtime_status_module
 from agent.accounts import AccountType
 from agent.approval import ApprovalService, PriceOutOfBand
 from agent.approval_bridge import mint_approval_token
 from agent.approval_execution import (DriftDetected, ExecutionError,
-                                      SessionClosed, StagingSignatureInvalid,
-                                      execute_approved_request)
+                                      ModeNotPermitted, QuoteUnavailable,
+                                      ReconciliationNotFresh, SessionClosed,
+                                      StagingSignatureInvalid, execute_approved_request)
 from agent.approval_request_store import ApprovalRequestStore
 from agent.approval_trigger import MissingStagedOrder, request_approval_for_analysis
 from agent.audit import AuditLog
@@ -33,6 +36,7 @@ from agent.daytrade import DayTradeGuard
 from agent.entities import AnalysisResult, OpportunityEvent
 from agent.holding import HoldingPolicy, HoldingPolicyRegistry
 from agent.ledger import Fill, Ledger
+from agent.mode_store import ModeStore
 from agent.pipeline import Gatekeeper
 from agent.policy import initial_policy
 from agent.risk import RiskPolicy
@@ -177,6 +181,64 @@ def broker(*, cash=500.0, now=None):
     return SimulatorBroker(account_id=ACCT, cash=cash, now=now or DECIDE_AT + timedelta(seconds=10))
 
 
+# ------------------------------------------- MODE + RECONCILIATION GATE
+# fixtures (security-remediation unit, 2026-08-15). See agent.
+# approval_execution's own module docstring "MODE + RECONCILIATION GATE"
+# section: `execute_approved_request` now reads BOTH fresh, from a path,
+# immediately before the one real `adapter.submit` call. Every existing
+# happy-path/guard/drift/signature/price-band/session-gate test below
+# needs a PASSING pair (PAPER + a fresh PASS reconciliation snapshot) or
+# it would now fail for a reason unrelated to what it actually tests; the
+# NEW adversarial tests at the bottom of this file are what actually
+# prove PAUSED/DISABLED/missing/stale all land on NO TRADE.
+
+def mode_store_path(tmp_path, *, mode="PAPER", changed_at=NOW - timedelta(days=1),
+                    filename="mode_state.jsonl"):
+    p = tmp_path / filename
+    if mode is not None:
+        ModeStore(p).write(mode, changed_at=changed_at)
+    return p
+
+
+def runtime_status_path(tmp_path, *, now, reconciliation_status="PASS",
+                        generated_at=None, filename="runtime_status.json"):
+    """`generated_at` defaults to `now` itself -- i.e. maximally fresh, so
+    the ONLY way a test's snapshot reads as stale is if it deliberately
+    passes a `generated_at` far enough in the past (see the new staleness
+    test below)."""
+    p = tmp_path / filename
+    gen = generated_at if generated_at is not None else now
+    status = runtime_status_module.RuntimeStatus(
+        generated_at=gen, account_id=ACCT, mode="PAPER", process_status="running",
+        source="cycle", market_session_state="OPEN", next_session_open=None,
+        broker_snapshot_status="PASS", broker_snapshot_at=gen,
+        reconciliation_status=reconciliation_status, reconciliation_at=gen,
+        positions_reconciled=True, cash_reconciled=True, open_orders_reconciled=True,
+        last_successful_cycle_at=gen, last_failure_at=None, last_failure_type=None,
+        recovered_at=None, collection_last_success_at=None, screen_last_success_at=None,
+        unavailable_reasons={},
+    )
+    runtime_status_module.write_atomic(p, status)
+    return p
+
+
+def gate_kwargs(tmp_path, *, now=DECIDE_AT + timedelta(seconds=10), mode="PAPER",
+                reconciliation_status="PASS", generated_at=None):
+    """The passing pair, splatted into every existing call site below --
+    `**gate_kwargs(tmp_path)` for the common default-broker-clock case,
+    `**gate_kwargs(tmp_path, now=OUTSIDE_SESSION)` etc. when a test uses a
+    non-default broker `now`, so the new gate reads as fresh relative to
+    THAT instant rather than going stale purely as an artifact of adding
+    it, unrelated to what the test itself is proving."""
+    return {
+        "mode_store_path": mode_store_path(tmp_path, mode=mode),
+        "runtime_status_path": runtime_status_path(
+            tmp_path, now=now, reconciliation_status=reconciliation_status,
+            generated_at=generated_at,
+        ),
+    }
+
+
 def submit_spy(b):
     """Wraps `b.submit` (a bound method inherited from `BrokerAdapter`) in a
     `MagicMock` that still calls through to the real implementation, and
@@ -210,7 +272,7 @@ def test_a_buy_executes_against_the_persisted_staged_order(tmp_path):
 
     order = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path),
     )
     assert order.status == "filled"
     assert order.symbol == "AAPL"
@@ -230,7 +292,7 @@ def test_a_close_executes_against_the_persisted_staged_order(tmp_path):
 
     order = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path),
     )
     assert order.status == "filled"
     assert order.side == "CLOSE" or order.side == "SELL"   # simulator normalizes; see below
@@ -245,9 +307,10 @@ def test_a_second_call_after_a_successful_submit_returns_the_same_order_not_a_re
     b = broker()
     b.set_price("AAPL", 100.0)
 
+    gk_paths = gate_kwargs(tmp_path)
     first = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gk_paths,
     )
     assert token.consumed_at is not None
 
@@ -256,7 +319,7 @@ def test_a_second_call_after_a_successful_submit_returns_the_same_order_not_a_re
     # time, which would raise TokenConsumed.
     second = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gk_paths,
     )
     assert second.broker_order_id == first.broker_order_id
     assert second.client_order_id == first.client_order_id
@@ -285,8 +348,9 @@ def test_a_retry_never_reaches_the_token_when_the_order_already_exists(tmp_path)
     token = token_for(s, result.request.request_id)
     b = broker()
     b.set_price("AAPL", 100.0)
+    gk_paths = gate_kwargs(tmp_path)
     execute_approved_request(result.request.request_id, store=s, adapter=b, gatekeeper=gk,
-                             token=token, reference_price=100.0)
+                             token=token, quote_provider=lambda symbol: 100.0, **gk_paths)
     assert token.consumed_at is not None
 
     # A fresh token object reconstructed from the store, simulating a
@@ -298,7 +362,7 @@ def test_a_retry_never_reaches_the_token_when_the_order_already_exists(tmp_path)
 
     order = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=fresh_token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gk_paths,
     )
     assert order.client_order_id == result.staged.client_order_id
     # No TokenConsumed was raised above -- proof consume() was never
@@ -323,7 +387,8 @@ def test_refuses_an_undecided_request(tmp_path):
     )
     with pytest.raises(ExecutionError, match="not approved"):
         execute_approved_request(result.request.request_id, store=s, adapter=broker(),
-                                 gatekeeper=gk, token=None, reference_price=100.0)
+                                 gatekeeper=gk, token=None, quote_provider=lambda symbol: 100.0,
+                                 **gate_kwargs(tmp_path))
 
 
 def test_refuses_an_unknown_request_id(tmp_path):
@@ -331,7 +396,7 @@ def test_refuses_an_unknown_request_id(tmp_path):
     s = ApprovalRequestStore(tmp_path / "approval_request.jsonl")
     with pytest.raises(ExecutionError, match="unknown request_id"):
         execute_approved_request("apr-does-not-exist", store=s, adapter=broker(), gatekeeper=gk,
-                                 token=None, reference_price=100.0)
+                                 token=None, quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path))
 
 
 def test_fails_closed_on_a_pre_unit_1_request_missing_a_staged_order(tmp_path):
@@ -353,7 +418,7 @@ def test_fails_closed_on_a_pre_unit_1_request_missing_a_staged_order(tmp_path):
     gk = gatekeeper()
     with pytest.raises(MissingStagedOrder):
         execute_approved_request(req.request_id, store=s, adapter=broker(), gatekeeper=gk,
-                                 token=None, reference_price=100.0)
+                                 token=None, quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path))
 
 
 def test_refuses_a_token_belonging_to_a_different_request(tmp_path):
@@ -371,7 +436,8 @@ def test_refuses_a_token_belonging_to_a_different_request(tmp_path):
     token_a = token_for(s_a, result_a.request.request_id)
     with pytest.raises(ExecutionError, match="belongs to request"):
         execute_approved_request(result_b.request.request_id, store=s_b, adapter=broker(),
-                                 gatekeeper=gk, token=token_a, reference_price=100.0)
+                                 gatekeeper=gk, token=token_a, quote_provider=lambda symbol: 100.0,
+                                 **gate_kwargs(tmp_path))
 
 
 # ------------------------------------------------------------------- drift
@@ -387,7 +453,7 @@ def test_a_buy_refuses_when_settled_cash_has_since_dropped_below_the_approved_no
 
     with pytest.raises(DriftDetected, match="settled cash"):
         execute_approved_request(result.request.request_id, store=s, adapter=b, gatekeeper=gk,
-                                 token=token, reference_price=100.0)
+                                 token=token, quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path))
     # And the token was never consumed by the refused attempt.
     assert token.consumed_at is None
 
@@ -404,7 +470,7 @@ def test_a_close_refuses_when_the_held_qty_has_since_dropped_below_the_approved_
 
     with pytest.raises(DriftDetected, match="held qty"):
         execute_approved_request(result.request.request_id, store=s, adapter=b, gatekeeper=gk,
-                                 token=token, reference_price=100.0)
+                                 token=token, quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path))
     assert token.consumed_at is None
 
 
@@ -425,7 +491,7 @@ def test_the_adapter_starts_with_no_staging_key_and_gets_one_attached(tmp_path):
 
     order = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path),
     )
     assert order.status == "filled"
     assert b._staging_key == gk.signing_key   # attached, not re-derived
@@ -452,7 +518,7 @@ def test_a_signature_produced_by_one_gatekeeper_verifies_under_a_separately_cons
 
     order = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=execution_gk, token=token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path),
     )
     assert order.status == "filled"
 
@@ -471,7 +537,7 @@ def test_a_signature_that_does_not_verify_is_a_hard_stop_not_a_fallback(tmp_path
     with pytest.raises(StagingSignatureInvalid):
         execute_approved_request(
             result.request.request_id, store=s, adapter=b, gatekeeper=execution_gk, token=token,
-            reference_price=100.0,
+            quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path),
         )
     assert b.get_by_client_id(result.staged.client_order_id) is None   # never submitted
     assert token.consumed_at is None   # never touched
@@ -489,7 +555,7 @@ def test_a_reference_price_outside_the_approved_band_is_refused(tmp_path):
     with pytest.raises(PriceOutOfBand):
         execute_approved_request(
             result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-            reference_price=200.0,
+            quote_provider=lambda symbol: 200.0, **gate_kwargs(tmp_path),
         )
 
 
@@ -510,7 +576,7 @@ def test_an_approved_submit_during_a_permitted_session_proceeds_to_the_existing_
 
     order = execute_approved_request(
         result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-        reference_price=100.0,
+        quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path),
     )
     assert order.status == "filled"
     spy.assert_called_once()
@@ -528,7 +594,7 @@ def test_an_approved_submit_outside_the_permitted_session_cannot_reach_broker_su
     with pytest.raises(SessionClosed):
         execute_approved_request(
             result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-            reference_price=100.0,
+            quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path, now=OUTSIDE_SESSION),
         )
     spy.assert_not_called()
     assert token.consumed_at is None   # never touched either
@@ -555,7 +621,7 @@ def test_a_session_lookup_failure_blocks_submission_without_reaching_broker_subm
     with pytest.raises(SessionClosed):
         execute_approved_request(
             result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-            reference_price=100.0,
+            quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path),
         )
     spy.assert_not_called()
     assert token.consumed_at is None
@@ -583,7 +649,7 @@ def test_a_stale_approval_crossing_the_session_boundary_is_blocked(tmp_path):
     with pytest.raises(SessionClosed):
         execute_approved_request(
             result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-            reference_price=100.0,
+            quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path, now=OUTSIDE_SESSION),
         )
     spy.assert_not_called()
     assert token.consumed_at is None
@@ -604,6 +670,303 @@ def test_a_weekend_instant_is_also_blocked_not_just_after_hours_on_a_trading_day
     with pytest.raises(SessionClosed):
         execute_approved_request(
             result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
-            reference_price=100.0,
+            quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path, now=saturday),
         )
     spy.assert_not_called()
+
+
+# ---------------------------------------- MODE + RECONCILIATION GATE (new)
+# (security-remediation unit, 2026-08-15) -- SAFETY-CRITICAL finding from
+# the Codex Security scan, treated as a production blocker per explicit
+# instruction ("Treat this as a production blocker regardless of the
+# scanner's MEDIUM severity label"). Each test below proves a FULLY-VALID,
+# signed, in-band, in-session approval STILL cannot reach `adapter.submit`
+# while the persisted mode is PAUSED/DISABLED, or reconciliation is
+# missing/failing/stale -- every case lands on NO TRADE, proven directly
+# against the adapter.submit call count, not merely the raised exception.
+
+def _no_trade_setup(tmp_path):
+    """A request that would otherwise submit cleanly -- PAPER + fresh PASS
+    reconciliation, in-session broker clock -- so each test below only
+    varies the ONE thing it means to test."""
+    gk = gatekeeper()
+    s, result = make_buy(tmp_path, gk=gk)
+    token = token_for(s, result.request.request_id)
+    b = broker()
+    b.set_price("AAPL", 100.0)
+    spy = submit_spy(b)
+    return gk, s, result, token, b, spy
+
+
+def test_a_fully_valid_approval_cannot_submit_while_persisted_mode_is_paused(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ModeNotPermitted, match="PAUSED"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, mode="PAUSED"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_while_persisted_mode_is_disabled(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ModeNotPermitted, match="DISABLED"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, mode="DISABLED"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_while_persisted_mode_is_research(tmp_path):
+    """RESEARCH is a real, known mode -- but not in the submission
+    allowlist (data-collection-only, per its own name) -- proving the gate
+    is an allowlist, not merely a PAUSED/DISABLED blocklist."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ModeNotPermitted, match="RESEARCH"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, mode="RESEARCH"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_modestore_has_never_been_written(tmp_path):
+    """A never-written ModeStore normalizes to DISABLED (agent.mode.
+    normalize_persisted's own contract) -- the Day-1 fail-closed default,
+    not "anything goes" for a fresh install."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ModeNotPermitted, match="DISABLED"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, mode=None),   # mode=None -- ModeStore never written
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_modestore_is_corrupt(tmp_path):
+    """A ModeStore whose file is corrupt/truncated must still land on
+    NO TRADE. `agent.mode_store.ModeStore._load` itself already treats a
+    corrupt/unparseable trailing row as "discard it, report the last
+    well-formed row" (its own crash-mid-write tolerance, mirroring
+    `agent.audit.AuditLog`'s identical convention) rather than raising --
+    with NO well-formed row at all here, that resolves to `current() is
+    None`, normalized to DISABLED, which `_mode_permits_submission`
+    refuses exactly like a genuinely persisted DISABLED. Either way
+    (a raised read error OR a graceful-but-empty resolution), the
+    outcome this test actually cares about holds: NO TRADE."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    paths = gate_kwargs(tmp_path)
+    Path(paths["mode_store_path"]).write_text("not valid json at all {{{")
+    with pytest.raises(ModeNotPermitted):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0, **paths,
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_runtime_status_has_never_been_written(tmp_path):
+    """No runtime_status.json at all -- e.g. a brand-new install that has
+    never completed a cycle, --reconcile-once, or diagnostic run --
+    reconciliation health is simply unknown, and unknown fails closed."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="has ever been written"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            mode_store_path=mode_store_path(tmp_path),
+            runtime_status_path=tmp_path / "never_written_runtime_status.json",
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_reconciliation_status_is_fail(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="FAIL"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, reconciliation_status="FAIL"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_reconciliation_status_is_unavailable(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(ReconciliationNotFresh, match="UNAVAILABLE"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, reconciliation_status="UNAVAILABLE"),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_reconciliation_snapshot_is_stale(tmp_path):
+    """A PASSing reconciliation from over a day ago is not "fresh" -- see
+    agent.runtime_status.DEFAULT_STALE_AFTER (25h). The broker's own clock
+    (what the gate's `now` is read from) is `broker()`'s default
+    (DECIDE_AT + 10s); the snapshot is generated_at 2 days before that."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    stale_now = DECIDE_AT + timedelta(seconds=10)
+    stale_generated_at = stale_now - timedelta(days=2)
+    with pytest.raises(ReconciliationNotFresh, match="stale"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, now=stale_now, generated_at=stale_generated_at),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_submits_normally_in_paper_mode_with_fresh_reconciliation(tmp_path):
+    """Positive control: PAPER + fresh PASS reconciliation does NOT block
+    the otherwise-valid path -- proves the gate is not accidentally
+    refusing everything."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    order = execute_approved_request(
+        result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+        quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path, mode="PAPER"),
+    )
+    assert order.status == "filled"
+    spy.assert_called_once()
+
+
+def test_a_fully_valid_approval_submits_normally_in_production_active_mode(tmp_path):
+    """PRODUCTION_ACTIVE is the other permitted mode -- proves the
+    allowlist is {PAPER, PRODUCTION_ACTIVE}, not PAPER alone."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    order = execute_approved_request(
+        result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+        quote_provider=lambda symbol: 100.0, **gate_kwargs(tmp_path, mode="PRODUCTION_ACTIVE"),
+    )
+    assert order.status == "filled"
+    spy.assert_called_once()
+
+
+def test_mode_and_reconciliation_gate_runs_before_the_session_gate(tmp_path):
+    """Ordering proof: even a request that would ALSO fail the session
+    gate (broker clock outside session) fails with ModeNotPermitted first
+    when the mode is also wrong -- both are real, independent hard stops,
+    but this pins down that mode is checked (at least) as early as
+    session, never skipped because session already would have refused."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    b2 = broker(now=OUTSIDE_SESSION)
+    b2.set_price("AAPL", 100.0)
+    spy2 = submit_spy(b2)
+    with pytest.raises(ModeNotPermitted):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b2, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 100.0,
+            **gate_kwargs(tmp_path, mode="PAUSED", now=OUTSIDE_SESSION),
+        )
+    spy2.assert_not_called()
+    assert token.consumed_at is None
+
+
+# ------------------------------------------------------- PRICE BAND (new)
+# (security-remediation unit, 2026-08-15) -- MEDIUM finding, Codex Security
+# scan. `execute_approved_request` no longer accepts a caller-supplied
+# `reference_price` at all; `quote_provider` is REQUIRED, and each test
+# below proves a fully-valid, signed, in-band-per-the-token approval STILL
+# cannot reach `adapter.submit` when the fresh quote cannot be obtained --
+# proven directly against the adapter.submit call count.
+
+def test_a_fully_valid_approval_cannot_submit_when_quote_provider_returns_none(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(QuoteUnavailable, match="no usable price"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: None,
+            **gate_kwargs(tmp_path),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_quote_provider_returns_zero(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(QuoteUnavailable, match="no usable price"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 0.0,
+            **gate_kwargs(tmp_path),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_quote_provider_returns_negative(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(QuoteUnavailable, match="no usable price"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: -5.0,
+            **gate_kwargs(tmp_path),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_a_fully_valid_approval_cannot_submit_when_quote_provider_raises(tmp_path):
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+
+    def _boom(symbol):
+        raise RuntimeError("market data feed unreachable")
+
+    with pytest.raises(QuoteUnavailable, match="raised"):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=_boom,
+            **gate_kwargs(tmp_path),
+        )
+    spy.assert_not_called()
+    assert token.consumed_at is None
+
+
+def test_quote_provider_is_called_with_the_staged_orders_own_symbol(tmp_path):
+    """Proves the fresh quote is fetched for the REAL symbol being
+    submitted, not a hardcoded/wrong one -- a caller-supplied price could
+    previously be for any symbol at all, since nothing checked it against
+    `staged.symbol`."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    seen_symbols = []
+
+    def recording_provider(symbol):
+        seen_symbols.append(symbol)
+        return 100.0
+
+    order = execute_approved_request(
+        result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+        quote_provider=recording_provider, **gate_kwargs(tmp_path),
+    )
+    assert order.status == "filled"
+    assert seen_symbols == ["AAPL"]
+
+
+def test_a_quote_outside_the_approved_band_is_still_refused_via_the_existing_price_band_check(tmp_path):
+    """The fresh quote is not exempt from the pre-existing price-band
+    check inside BrokerAdapter.submit/ApprovalToken.consume -- proves this
+    unit's fix composes with, rather than bypasses, that existing gate."""
+    gk, s, result, token, b, spy = _no_trade_setup(tmp_path)
+    with pytest.raises(PriceOutOfBand):
+        execute_approved_request(
+            result.request.request_id, store=s, adapter=b, gatekeeper=gk, token=token,
+            quote_provider=lambda symbol: 500.0,   # wildly outside the 1% band
+            **gate_kwargs(tmp_path),
+        )
+    assert token.consumed_at is None
