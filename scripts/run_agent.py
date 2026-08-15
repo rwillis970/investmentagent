@@ -298,7 +298,7 @@ from agent.money import to_decimal
 from agent.opportunity_event_tracker import OpportunityEventTracker
 from agent.pipeline import Gatekeeper
 from agent.pipeline_stage import PipelineRuntime
-from agent.run_loop import (AccountRuntime, in_session_now,
+from agent.run_loop import (AccountRuntime, in_session_now, run_cycle,
                             seconds_until_next_session_open, run_loop as real_run_loop)
 from agent import runtime_status as runtime_status_module
 from agent.process_lock import ProcessLockError, acquire_process_lock
@@ -1013,6 +1013,178 @@ def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
         return 1
 
 
+def _run_reconcile_once(*, data_dir: str, data_dir_relevant: bool = False,
+                        config_path: str, account_id: str,
+                        key_id: str, secret_ref: str,
+                        ledger_store_path: str | Path,
+                        quarantine_store_path: str | Path,
+                        cash_quarantine_store_path: str | Path,
+                        mode_store_path: str | Path,
+                        audit_log_path: str | Path,
+                        secrets_provider_factory: Callable[[str], SecretsProvider],
+                        now_fn: Callable[[], datetime], log: logging.Logger) -> int:
+    """ONE out-of-market-session recovery/reconciliation cycle, then exit
+    (out-of-session-recovery unit, 2026-08-14 -- see deploy/README.md's own
+    section on when to reach for this). Built because investigation found
+    no existing command already did this: `main()`'s real scheduled-loop
+    path only ever reaches `agent.run_loop.run_cycle` through `run_loop`'s
+    own `while` loop, gated on `in_session_now(now)` -- there was no way to
+    run exactly one cycle, in or out of session, from the command line.
+
+    THIS IS NOT A SECOND CODE PATH. It calls the exact same `agent.run_loop.
+    run_cycle` the scheduled loop calls every cycle it ever runs -- same
+    adapter factory (`_real_adapter_factory`, below, the same PAPER-bound
+    one the scheduled loop already uses), same `build_account_runtime`, same
+    `sync_fills` -> `close_terminal_orders` -> `sync_cash_events` ->
+    `build_account_reconciliation` -> `run_startup` sequence inside it. The
+    ONLY differences from a real scheduled cycle: (1) `run_cycle` is called
+    ONCE, directly, bypassing `run_loop`'s `in_session_now` gate entirely --
+    that gate lives in `run_loop`'s own `while` loop, never inside
+    `run_cycle` itself, so calling `run_cycle` directly was always
+    session-independent, not a new bypass invented here; (2) no `pipeline`
+    is attached (the keyword is simply omitted, leaving `run_cycle`'s own
+    default of `None`) -- see CANNOT REACH AN ORDER, below, for why that
+    single omission is what keeps this command read-plus-reconcile-only.
+
+    CANNOT REACH AN ORDER (proof, not merely a claim -- see also tests/
+    test_run_agent.py's own static grep tests for --reconcile-once, mirroring
+    test_run_loop.py's `test_submit_approved_execution_stays_unreachable_
+    from_the_loop`). `agent.broker.base.BrokerAdapter.submit`/`cancel` are
+    the adapter's ONLY write entrypoints (that module's own `__init_subclass__`
+    refuses a subclass that overrides either), and both REQUIRE a
+    `agent.pipeline.StagedOrder` -- the output of `Gatekeeper.stage`, which
+    itself only ever runs inside `agent.pipeline_stage.run_pipeline_stage`,
+    which `run_cycle` only ever calls when its own `pipeline` argument is
+    not `None` (see agent/run_loop.py's own `pipeline_result = None \n if
+    pipeline is not None: ...` guard). This function never constructs a
+    `PipelineRuntime` and never passes `pipeline=` to `run_cycle` at all --
+    there is therefore no `Gatekeeper`, no `StagedOrder`, and structurally no
+    value this function could hand to `submit`/`cancel` even if it wanted
+    to. `sync_fills`/`close_terminal_orders`/`sync_cash_events`/
+    `build_account_reconciliation`/`run_startup` -- the only things
+    `run_cycle` calls without a `pipeline` -- read the broker and write only
+    to the local append-only stores (`LedgerStore`, `ExecutionQuarantineStore`,
+    `CashEventQuarantineStore`, `ModeStore`, `AuditLog`); none of them import
+    `agent.pipeline`, construct a `StagedOrder`, or call `.submit`/`.cancel`
+    (checked directly against each module's own imports).
+
+    NO MODE ADVANCEMENT (stricter than the real scheduled loop, deliberately).
+    The real loop always targets `cfg.mode` (main()'s own scheduled-loop
+    call to `run_loop_fn`) -- safe there only because a mismatched `cfg.mode`
+    is the kind of drift an attended deploy is expected to catch. This
+    command instead reads `ModeStore.current()` itself and passes THAT back
+    as `run_cycle`'s own `target_mode` -- so `target_mode == persisted_mode`
+    is unconditionally true (falling back to `cfg.mode` only in the
+    never-yet-initialized case, identical to a real first-ever cycle) and
+    `agent.mode.is_legal_step` always short-circuits True on `target ==
+    persisted` before any transition or `ConfirmationRequired` gate is even
+    considered (agent/mode.py's own `is_legal_step`) -- `run_startup` takes
+    the `target_mode != persisted_mode` branch that WRITES `ModeStore`/
+    appends a `mode_transition` audit row (agent/startup.py) never, by
+    construction, no matter what `--confirmed` is passed or what `config.
+    json` currently says `mode` is. An out-of-session recovery run can never
+    itself be the reason the persisted mode changes.
+
+    WRITER LOCK: dispatched through `_run_one_shot_locked`, below, exactly
+    like the other four one-shot writers -- acquires the SAME
+    `acquire_process_lock(data_dir)` the scheduled loop holds for its
+    entire process lifetime (see that module's own docstring), so this
+    command correctly refuses with `ProcessLockError` (turned into a
+    logged `return 1`, never a raise) for as long as a real scheduled-loop
+    process is running against the same data_dir -- it cannot be used to
+    race a live process's own writes. This is also exactly why the intended
+    operational sequence (deploy/README.md) is: stop the scheduled loop
+    first, run this once, confirm, then restart the loop -- not "run this
+    alongside it."
+
+    FAILS CLOSED. Like every other step in `run_cycle`, this function does
+    not catch `run_cycle`'s own exceptions selectively -- ANY failure
+    (a broker `TransportError`, a `SecretNotFoundError`, a genuine
+    `ReconciliationMismatch`/other `StartupHalted` from `run_startup`) is
+    caught by this function's own outer `except Exception`, LOGGED IN FULL
+    (never summarized to a bare "failed"), and turned into `return 1` --
+    the same fail-safe-to-NO-TRADE posture `run_loop` itself documents for
+    every uncaught exception, applied here to a single manually-triggered
+    cycle instead of an unattended one. A reconciliation mismatch is
+    therefore reported (in the log line, and in AuditLog if run_startup got
+    that far), never silently swallowed or downgraded to a warning.
+
+    Deliberately does NOT touch `agent.failure_sentinel` (same reasoning as
+    `_run_advance_mode`/`_run_admit_or_reject`/`_run_submit_approved`: this
+    is a one-shot, interactively-run operator command, not the unattended
+    scheduled loop, and sharing that sentinel file would cross-contaminate
+    the loop's own recurrence count with a single manual invocation).
+
+    `data_dir_relevant` mirrors the real scheduled-loop branch's own use of
+    `_check_data_dir_sanity` (Runtime-recovery unit, 2026-08-13) -- run
+    FIRST, inside this function's own try/except (so a `DataDirConflict` is
+    caught and logged like any other failure here, never left to propagate
+    past `_run_one_shot_locked`, which only catches `ProcessLockError`),
+    gated exactly like the real branch on whether `--data-dir` actually
+    defaulted at least one store path for THIS invocation."""
+    try:
+        if data_dir_relevant:
+            _check_data_dir_sanity(Path(data_dir), account_id=account_id)
+
+        cfg = config_module.load(json.loads(Path(config_path).read_text()))
+        secrets_provider = secrets_provider_factory(cfg.mode)
+        credentials = BrokerCredentials(account_id=account_id, key_id=key_id,
+                                       secret_ref=secret_ref)
+        account = build_account_runtime(
+            cfg, account_id=account_id, credentials=credentials,
+            ledger_store_path=ledger_store_path,
+            quarantine_store_path=quarantine_store_path,
+            cash_quarantine_store_path=cash_quarantine_store_path,
+        )
+
+        mode_store = ModeStore(mode_store_path)
+        audit_log = AuditLog(path=audit_log_path)
+        now = now_fn()
+
+        # NO MODE ADVANCEMENT -- see this function's own docstring section
+        # of the same name for the full reasoning.
+        persisted = mode_store.current()
+        target_mode = persisted if persisted is not None else cfg.mode
+
+        approval_service = ApprovalService(
+            expiration=timedelta(minutes=cfg.approval_expiration_minutes),
+            min_display=timedelta(seconds=cfg.approval_min_display_seconds),
+            max_per_day=cfg.max_approval_requests_per_day,
+            price_band_pct=cfg.price_band_pct,
+        )
+
+        report = run_cycle(
+            accounts=[account], adapter_factory=_real_adapter_factory(secrets_provider),
+            mode_store=mode_store, audit_log=audit_log,
+            approval_service=approval_service, target_mode=target_mode,
+            confirmed=False, now=now, logger=log,
+            # `pipeline` intentionally OMITTED (defaults to None) -- see
+            # this function's own "CANNOT REACH AN ORDER" docstring section.
+            # No candidate generation, no materiality screen, no T4
+            # analysis, no approval request is ever attempted on this path.
+        )
+        recon = report.reconciliations[0] if report.reconciliations else None
+        log.info(
+            "--reconcile-once complete: account=%s mode=%s new_fills=%d "
+            "new_cash_adjustments=%d reconciled_accounts=%s positions=%s "
+            "settled_cash local=%s broker=%s",
+            account_id, report.result.mode,
+            len(report.new_fills.get(account_id, ())),
+            len(report.new_cash_adjustments.get(account_id, ())),
+            report.result.reconciled_accounts,
+            recon.local_positions if recon is not None else {},
+            recon.local_settled_cash if recon is not None else None,
+            recon.broker_account.settled_cash if recon is not None else None,
+        )
+        return 0
+    except Exception as exc:   # noqa: BLE001 -- FAILS CLOSED, see this
+        # function's own docstring section of the same name: never raise
+        # out of this script, but never hide the failure either -- logged
+        # in full, non-zero exit, no partial success reported.
+        log.error("--reconcile-once failed: %s", exc)
+        return 1
+
+
 #  ONE-SHOT WRITER-LOCK GAP CLOSED (writer-lock-gap unit, 2026-08-14).
 #
 #  THE DEFECT (disclosed by agent/process_lock.py's own module docstring,
@@ -1043,6 +1215,14 @@ def _run_submit_approved(*, request_id: str, account_id: str, config_path: str,
 #  run`, `--help`, diagnostics, and every dashboard GET in
 #  scripts/run_dashboard.py) are untouched -- this wrapper is only called
 #  from the four writable dispatch branches.
+#
+#  ADDED A FIFTH DISPATCH (out-of-session-recovery unit, 2026-08-14):
+#  `--reconcile-once` (`_run_reconcile_once`, above) is wrapped through this
+#  SAME `_run_one_shot_locked` the identical way -- it durably writes to
+#  `LedgerStore`/`ExecutionQuarantineStore`/`CashEventQuarantineStore` (via
+#  `sync_fills`/`sync_cash_events`) exactly like a real scheduled cycle
+#  would, so it needs exactly the same serialization against a running
+#  scheduled loop that the other four writers do, for the same reason.
 #
 #  NO NESTED SELF-DEADLOCK: `fcntl.flock` locks are per open-file-
 #  description, not per-process -- a second `open()+flock()` on the same
@@ -1405,6 +1585,26 @@ def _parse_args(argv: list[str] | None):
                              "approval_execution.py's own module docstring for why). Checked "
                              "against the approved price band exactly as any other submission "
                              "would be.")
+    parser.add_argument("--reconcile-once", action="store_true",
+                        help="run ONE broker-read + sync_fills + sync_cash_events + account "
+                             "reconciliation cycle -- the exact same agent.run_loop.run_cycle "
+                             "the scheduled loop calls every cycle -- then exit. Unlike the "
+                             "scheduled loop, does NOT require the market to be in session "
+                             "(agent.run_loop.run_cycle has no session gate of its own; that "
+                             "gate lives only in run_loop's own while-loop, never reached "
+                             "here). No pipeline is attached: no candidate generation, no "
+                             "materiality screen, no T4 analysis, no approval request, and -- "
+                             "structurally, not merely by convention -- no path to "
+                             "adapter.submit/cancel (see _run_reconcile_once's own docstring "
+                             "for the proof). Never advances the persisted mode (targets "
+                             "ModeStore.current() itself, not --config's mode). Mirrors "
+                             "--admit-execution's SHAPE (one-shot, narrow, wrapped in the "
+                             "same process lock the scheduled loop holds) but not its "
+                             "collaborators: this command DOES construct a real broker "
+                             "adapter and DOES write to LedgerStore/ExecutionQuarantineStore/"
+                             "CashEventQuarantineStore, same as a real cycle. Requires "
+                             "--account-id, --config, --key-id and --secret-ref; every "
+                             "pipeline/approval flag is ignored.")
     parser.add_argument("--confirmed", action="store_true",
                         help="required for the PAPER/PAUSED -> PRODUCTION_ACTIVE edges (§9.2); "
                              "irrelevant, and harmless, for PAPER")
@@ -1493,6 +1693,30 @@ def _parse_args(argv: list[str] | None):
                 + ", ".join(missing)
             )
         _default_relevant_paths(("approval_request_store_path", "audit_log_path"))
+    elif args.reconcile_once:
+        missing = [name for name, val in (
+            ("--account-id", args.account_id), ("--config", args.config),
+            ("--key-id", args.key_id), ("--secret-ref", args.secret_ref),
+        ) if val is None]
+        if missing:
+            parser.error(
+                "the following arguments are required for --reconcile-once: "
+                + ", ".join(missing)
+            )
+        # Touches the same five durable stores a real scheduled cycle does
+        # (ledger, execution quarantine, cash quarantine, mode, audit) --
+        # unlike --admit-execution/--admit-cash-event/--advance-mode-to/
+        # --submit-approved, which each touch only a narrow subset. Runtime-
+        # recovery unit (2026-08-13) reasoning applies here exactly as it
+        # does to the real scheduled-loop branch below: data_dir_relevant
+        # must reflect whether --data-dir actually defaulted at least one
+        # of these paths THIS call, so _check_data_dir_sanity never runs
+        # against an irrelevant default for a caller who supplied every
+        # path explicitly.
+        args.data_dir_relevant = _default_relevant_paths((
+            "ledger_store_path", "quarantine_store_path", "cash_quarantine_store_path",
+            "mode_store_path", "audit_log_path",
+        ))
     else:
         missing = [name for name, val in (
             ("--config", args.config), ("--account-id", args.account_id),
@@ -1548,15 +1772,21 @@ def main(argv: list[str] | None = None, *,
     `_run_admit_or_reject_cash_event` and returns immediately -- see module
     docstring's --ADMIT-CASH-EVENT section. If `--submit-approved` was
     given, dispatches to `_run_submit_approved` and returns immediately --
-    see module docstring's --SUBMIT-APPROVED section. None of the account/
-    broker/failure-sentinel machinery below is touched on any of these
-    paths (`--submit-approved` builds its OWN adapter, inside `_run_submit_
-    approved` -- not the `run_loop_fn`/`_real_adapter_factory` path below,
-    which this flag never reaches).
+    see module docstring's --SUBMIT-APPROVED section. If `--reconcile-once`
+    was given, dispatches to `_run_reconcile_once` and returns immediately
+    (out-of-session-recovery unit, 2026-08-14) -- see that function's own
+    docstring: unlike the other four, this one DOES reuse the real
+    scheduled-loop's own `_real_adapter_factory`/`build_account_runtime`/
+    `agent.run_loop.run_cycle`, just called once, directly, with no
+    `pipeline` attached and no session-gate check. None of the account/
+    broker/failure-sentinel machinery below is touched on any of the first
+    four paths (`--submit-approved` builds its OWN adapter, inside
+    `_run_submit_approved` -- not the `run_loop_fn`/`_real_adapter_factory`
+    path below, which that flag never reaches).
 
-    All four of these one-shot dispatches are wrapped in `_run_one_shot_
+    All five of these one-shot dispatches are wrapped in `_run_one_shot_
     locked`, which acquires the SAME `acquire_process_lock(args.data_dir)`
-    the scheduled loop below acquires, before any of the four handlers
+    the scheduled loop below acquires, before any of the five handlers
     touches a durable store or (for --submit-approved) can ever reach
     `adapter.submit` -- see `_run_one_shot_locked`'s own docstring/comment
     block (writer-lock-gap unit, 2026-08-14) for why this closes the gap
@@ -1617,6 +1847,28 @@ def main(argv: list[str] | None = None, *,
                 approval_request_store_path=args.approval_request_store_path,
                 audit_log_path=args.audit_log_path,
                 reference_price=args.submit_approved_reference_price,
+                secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
+            ),
+        )
+
+    if args.reconcile_once:
+        # Wrapped in _run_one_shot_locked exactly like the other four
+        # one-shot writers -- see that function's own docstring and the
+        # "ADDED A FIFTH DISPATCH" comment just above it for why this one
+        # needs the identical lock. The data-dir sanity guard runs INSIDE
+        # _run_reconcile_once's own try/except (see that function's own
+        # docstring for why it is not called out here instead).
+        return _run_one_shot_locked(
+            data_dir=args.data_dir, log=log, action_desc="--reconcile-once",
+            fn=lambda: _run_reconcile_once(
+                data_dir=args.data_dir,
+                data_dir_relevant=getattr(args, "data_dir_relevant", False),
+                config_path=args.config, account_id=args.account_id,
+                key_id=args.key_id, secret_ref=args.secret_ref,
+                ledger_store_path=args.ledger_store_path,
+                quarantine_store_path=args.quarantine_store_path,
+                cash_quarantine_store_path=args.cash_quarantine_store_path,
+                mode_store_path=args.mode_store_path, audit_log_path=args.audit_log_path,
                 secrets_provider_factory=secrets_provider_factory, now_fn=now_fn, log=log,
             ),
         )

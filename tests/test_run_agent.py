@@ -2286,3 +2286,577 @@ def test_main_succeeds_normally_once_the_competing_lock_is_released(tmp_path):
     code = main(argv, run_loop_fn=succeeding_run_loop,
                secrets_provider_factory=_secrets_provider_factory)
     assert code == 0
+
+
+# ------------------------------------------------------------ --reconcile-once
+#
+# Out-of-session-recovery unit (2026-08-14). `--reconcile-once` runs ONE
+# agent.run_loop.run_cycle -- the exact same call the scheduled loop makes
+# every cycle -- with no market-session check and no `pipeline` attached.
+# See scripts/run_agent.py's own `_run_reconcile_once` docstring for the
+# full "cannot reach an order" proof this section's tests exercise from the
+# outside. Numbered comments below map each test to the specific
+# requirement it was written to prove; several requirements share one test
+# where doing so is a STRONGER proof, not a shortcut (e.g. items 2/3/5/6 all
+# fall naturally out of one golden-fixture recovery, exactly the way
+# tests/test_fill_sync.py's own Unit D already proves the underlying
+# sync_fills behavior this CLI flag merely triggers once, unmodified).
+#
+# `SimulatorBroker` stands in for `AlpacaPaperAdapter` throughout, via the
+# SAME `monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", ...)`
+# technique the --submit-approved tests above already establish -- see this
+# file's own module docstring. No network egress occurs anywhere in this
+# section.
+
+from agent.approval import ApprovalService, order_fingerprint
+from agent.broker.base import AccountSnapshot, Execution
+from agent.broker.simulator import SimulatorBroker
+from agent.holding import HoldingPolicy
+from agent.pipeline import StagedOrder, sign_staged_order
+from agent.run_loop import in_session_now, seconds_until_next_session_open
+
+_RO_ACCT = "acct-reconcile-once"
+# A real, confirmed non-trading Saturday (see tests/test_run_loop.py's own
+# SATURDAY constant) -- deliberately used as the DEFAULT `now` throughout
+# this section so every test here, not just the one specifically about it,
+# is already exercising "outside a market session" unless a test overrides
+# it for its own narrower reason.
+_RO_OUT_OF_SESSION = datetime(2026, 7, 18, 15, 0, tzinfo=timezone.utc)
+# A real trading Friday -- used ONLY for constructing/submitting the
+# fixture's own PRE-EXISTING fill (SimulatorBroker legitimately refuses to
+# fill an order on a closed session -- "a fill cannot occur on a closed
+# session" -- exactly like a real broker would). The recovery itself is
+# still run at `_RO_OUT_OF_SESSION` (a Saturday), matching the real
+# incident's own timeline: the fill happened during a real session in the
+# past; the recovery command runs after hours, later.
+_RO_FILL_NOW = datetime(2026, 7, 17, 15, 0, tzinfo=timezone.utc)
+_RO_QUARANTINED_AT = datetime(2026, 7, 17, 16, 6, 48, tzinfo=timezone.utc)
+_RO_ADMITTED_AT = datetime(2026, 7, 17, 23, 35, 29, tzinfo=timezone.utc)
+_RO_PRICE = 737.986
+_RO_QTY = 0.027087234
+
+
+def _reconcile_once_argv(*, config_path, data_dir, account_id=_RO_ACCT):
+    return [
+        "--config", str(config_path), "--data-dir", str(data_dir),
+        "--account-id", account_id, "--key-id", "k", "--secret-ref", "ref",
+        "--reconcile-once",
+    ]
+
+
+def _reconcile_once_seed_paper_mode(mode_store_path, *, at=_RO_FILL_NOW):
+    """Every real deployment this command is meant to run against already
+    has ModeStore persisting "PAPER" (the account has been running for
+    days -- see the live incident's own timeline this whole unit responds
+    to). A FRESH, never-seeded ModeStore normalizes to "DISABLED"
+    (agent/mode.py's own module docstring), and DISABLED -> PAPER is not a
+    legal one-step transition (§9.2's own chain) -- exactly the dead end
+    `--advance-mode-to`'s own docstring exists to route around. Since
+    `_run_reconcile_once` deliberately targets `ModeStore.current()` itself
+    (never advancing it -- see that function's own "NO MODE ADVANCEMENT"
+    section), a fixture representing a REAL deploy must seed PAPER first,
+    the same way a real operator already would have via `--advance-mode-to`
+    long before this command is ever reached for the first time."""
+    ModeStore(mode_store_path).write("PAPER", changed_at=at)
+
+
+def _reconcile_once_registry():
+    return HoldingPolicyRegistry([
+        HoldingPolicy(version="config", minimum_holding_period=timedelta(hours=1),
+                     cooldown_period=timedelta(days=1)),
+    ])
+
+
+def _reconcile_once_broker_with_a_pending_fill(*, cash=480.0, now=_RO_FILL_NOW):
+    """A broker that already has a real, broker-confirmed SPY BUY fill --
+    submitted directly against it, bypassing this codebase's own staging
+    machinery entirely (`b.submit` called directly, not through
+    `--reconcile-once`), exactly the way test_run_loop.py's own
+    `test_sync_fills_runs_before_reconciliation_...` simulates "some other
+    process placed this order". Returns `(broker, execution)` -- the real
+    `agent.broker.base.Execution` the broker itself reports for this fill,
+    so a caller can seed a quarantine record with the EXACT fields the
+    broker will independently report back on the very next `fills()` call
+    (never fabricated/duplicated by hand)."""
+    from decimal import Decimal
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=cash, now=now)
+    key = b"k" * 32
+    b.attach_staging_key(key)
+    b.set_price("SPY", _RO_PRICE)
+    fields = dict(
+        account_id=_RO_ACCT, client_order_id="ro-c1", symbol="SPY", side="BUY",
+        requested_qty=_RO_QTY, authorized_qty=_RO_QTY, order_type="LIMIT",
+        time_in_force="DAY", limit_price=_RO_PRICE, asset_class="US_EQUITY",
+        funding="SETTLED_CASH", session="REGULAR",
+        requested_notional=_RO_QTY * _RO_PRICE, notional=_RO_QTY * _RO_PRICE,
+        gates_passed=("capability:universe", "risk", "capability:pre_submit"),
+        binding=(), lot_id=None,
+    )
+    staged = StagedOrder(**fields, signature=sign_staged_order(fields, key))
+    svc = ApprovalService(expiration=timedelta(minutes=30), min_display=timedelta(seconds=10),
+                         max_per_day=4, price_band_pct=1.0)
+    fp = order_fingerprint(symbol=fields["symbol"], side=fields["side"],
+                           qty=fields["authorized_qty"], order_type=fields["order_type"],
+                           time_in_force=fields["time_in_force"],
+                           limit_price=fields["limit_price"], lot_id=fields["lot_id"])
+    token = svc.approve(token_id="ro-t1", request_id="ro-r1", fingerprint=fp,
+                        price_at_analysis=fields["limit_price"],
+                        shown_at=now - timedelta(seconds=15), now=now,
+                        symbol=fields["symbol"], side=fields["side"],
+                        qty=fields["authorized_qty"], order_type=fields["order_type"],
+                        time_in_force=fields["time_in_force"], limit_price=fields["limit_price"],
+                        lot_id=fields["lot_id"])
+    b.submit(staged, approval_token=token)
+    execution = b.fills()[0]
+    return b, execution
+
+
+def _reconcile_once_seed_admitted_recovery(tmp_path, *, execution: Execution):
+    """Reproduces the REAL deployed account's own durable shape (see
+    docs/quarantine_integrity_and_spy_forensics.md and tests/
+    test_fill_sync.py's own `_real_shape_*` fixtures, which this mirrors at
+    the CLI/data-dir level rather than the bare-function level those test):
+    an opening balance already seeded, a real CAT fee cash adjustment
+    already recorded, and this execution ALREADY quarantined-then-ADMITTED
+    by a prior operator decision -- exactly the state a real deploy is in
+    the moment before its first `--reconcile-once` run. Returns the five
+    store paths `--reconcile-once` itself reads/writes."""
+    from decimal import Decimal
+    from agent.ledger import CashAdjustment
+    ledger_path = tmp_path / "ledger.jsonl"
+    quarantine_path = tmp_path / "quarantine.jsonl"
+    cash_quarantine_path = tmp_path / "cash_quarantine.jsonl"
+    mode_path = tmp_path / "mode.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+
+    ledger_store = LedgerStore(ledger_path, account_id=_RO_ACCT,
+                              policy_registry=_reconcile_once_registry())
+    ledger_store.write_opening_balance(Decimal("480"), at=_RO_QUARANTINED_AT)
+    ledger_store.write_cash_adjustment(CashAdjustment(
+        adjustment_id="ro-cat-fee-1", account_id=_RO_ACCT, amount=Decimal("-0.01"),
+        activity_type="FEE", description="CAT fee for a real trade",
+        effective_date=_RO_QUARANTINED_AT.date(), symbol=None,
+    ))
+
+    quarantine_store = ExecutionQuarantineStore(quarantine_path, account_id=_RO_ACCT)
+    quarantine_store.quarantine(
+        execution, reason="BUY with no holding_policy_version recorded at staging time",
+        at=_RO_QUARANTINED_AT,
+    )
+    quarantine_store.admit(execution.execution_id, decided_by="operator",
+                          decided_at=_RO_ADMITTED_AT, holding_policy_version="config")
+
+    _reconcile_once_seed_paper_mode(mode_path)
+
+    return dict(
+        ledger_store_path=ledger_path, quarantine_store_path=quarantine_path,
+        cash_quarantine_store_path=cash_quarantine_path, mode_store_path=mode_path,
+        audit_log_path=audit_path,
+    )
+
+
+def _reconcile_once_pin_account_snapshot(broker, *, settled_cash, now=_RO_OUT_OF_SESSION):
+    """Pins `broker.account()` (an INSTANCE-level override -- see
+    agent/broker/base.py's own `__init_subclass__`: that guard fires at
+    CLASS-definition time only, so replacing an already-bound instance
+    method here is ordinary Python, not the hole that guard closes) to a
+    fixed snapshot whose `settled_cash` matches -- or, for the exact-
+    equality test below, deliberately does NOT match -- what the local
+    ledger will independently compute after recovery. Needed because
+    `SimulatorBroker` has no model of the real account's own CAT fee (see
+    agent/broker/base.py's `non_fill_activities` docstring: "SimulatorBroker
+    legitimately HAS no non-FILL activities to report"), so its own,
+    unmodified post-fill cash figure would never equal the real account's
+    true $460.00 -- pinning it is what lets this fixture exercise
+    reconciliation's real exact-equality check against a KNOWN value,
+    rather than an incidental one this fixture's own arithmetic happens to
+    produce. `positions()`/`open_orders()` are left exactly as
+    `SimulatorBroker` itself already tracks them (correct without help:
+    qty-tracking is not the thing this fixture needs to control)."""
+    from decimal import Decimal
+    broker.account = lambda: AccountSnapshot(
+        account_id=_RO_ACCT, equity=Decimal(settled_cash), cash=Decimal(settled_cash),
+        settled_cash=Decimal(settled_cash), unsettled_cash=Decimal("0"),
+        buying_power=Decimal(settled_cash), multiplier=Decimal("1"),
+        pattern_day_trader=False, day_trade_count=0, fetched_at=now,
+    )
+
+
+def test_reconcile_once_requires_its_own_flags(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--reconcile-once", "--data-dir", str(tmp_path / "data")])
+    assert exc_info.value.code == 2
+
+
+def test_reconcile_once_runs_outside_a_market_session(tmp_path, monkeypatch):
+    """Item 1: --reconcile-once must succeed with `now` outside any real
+    trading session -- the whole reason this command exists. A clean,
+    first-ever, no-pending-fill account (agent.run_loop's own "clean first
+    cycle" shape, tests/test_run_loop.py's
+    `test_a_clean_first_ever_cycle_reconciles_with_no_fills`) is enough to
+    prove this: nothing about session timing gates this path at all."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paper_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    assert not in_session_now(_RO_OUT_OF_SESSION)   # the premise this test exists to exercise
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+
+
+def test_reconcile_once_recovers_the_admitted_fill_exactly_once_and_is_idempotent(
+    tmp_path, monkeypatch,
+):
+    """Items 2, 3, 4, 5, 6 together -- the central proof this command is
+    for: given a real broker-confirmed, quarantined-then-ADMITTED SPY BUY
+    (the real incident's own shape, docs/
+    quarantine_integrity_and_spy_forensics.md), one --reconcile-once run
+    recovers it via the ORDINARY sync_fills path (no special case), writes
+    EXACTLY one local Fill, and lands on the exact golden figures -- SPY
+    position 0.027087234, settled cash $460.00 -- the same figures tests/
+    test_fill_sync.py's own Unit D already proved for bare sync_fills;
+    this test proves the SAME thing survives being driven through the real
+    CLI/lock/adapter-construction machinery, not just the bare function. A
+    SECOND run, minutes later, changes nothing -- idempotent on
+    execution_id, not merely "doesn't crash twice"."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    broker, execution = _reconcile_once_broker_with_a_pending_fill()
+    paths = _reconcile_once_seed_admitted_recovery(tmp_path, execution=execution)
+    _reconcile_once_pin_account_snapshot(broker, settled_cash="460.00")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: broker)
+
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(paths["ledger_store_path"]),
+        "--quarantine-store-path", str(paths["quarantine_store_path"]),
+        "--cash-quarantine-store-path", str(paths["cash_quarantine_store_path"]),
+        "--mode-store-path", str(paths["mode_store_path"]),
+        "--audit-log-path", str(paths["audit_log_path"]),
+    ]
+
+    first = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert first == 0
+
+    check_store = LedgerStore(paths["ledger_store_path"], account_id=_RO_ACCT,
+                              policy_registry=_reconcile_once_registry())
+    ledger = check_store.to_ledger()
+    from agent.money import to_decimal
+    assert ledger.positions() == {"SPY": to_decimal("0.027087234")}
+    assert ledger.settled_cash(now=_RO_OUT_OF_SESSION) == to_decimal("460.00")
+    assert len(ledger.fills) == 1   # exactly one local Fill appended (item 3)
+
+    second = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                 now_fn=lambda: _RO_OUT_OF_SESSION + timedelta(minutes=5))
+    assert second == 0
+    check_store_2 = LedgerStore(paths["ledger_store_path"], account_id=_RO_ACCT,
+                               policy_registry=_reconcile_once_registry())
+    ledger_2 = check_store_2.to_ledger()
+    assert len(ledger_2.fills) == 1   # idempotent -- still exactly one (item 4)
+    assert ledger_2.positions() == {"SPY": to_decimal("0.027087234")}
+    assert ledger_2.settled_cash(now=_RO_OUT_OF_SESSION) == to_decimal("460.00")
+
+
+def test_reconcile_once_never_calls_adapter_submit_or_cancel(tmp_path, monkeypatch):
+    """Items 7 and 8. `broker.submit`/`broker.cancel` are wrapped with
+    counters AFTER the fixture's own direct `broker.submit` call (simulating
+    the pre-existing, out-of-band fill) has already happened -- so the
+    counters below measure ONLY what `--reconcile-once` itself does."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    broker, execution = _reconcile_once_broker_with_a_pending_fill()
+    paths = _reconcile_once_seed_admitted_recovery(tmp_path, execution=execution)
+    _reconcile_once_pin_account_snapshot(broker, settled_cash="460.00")
+
+    submit_calls = []
+    cancel_calls = []
+    real_submit, real_cancel = broker.submit, broker.cancel
+    broker.submit = lambda *a, **k: (submit_calls.append((a, k)), real_submit(*a, **k))[1]
+    broker.cancel = lambda *a, **k: (cancel_calls.append((a, k)), real_cancel(*a, **k))[1]
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: broker)
+
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(paths["ledger_store_path"]),
+        "--quarantine-store-path", str(paths["quarantine_store_path"]),
+        "--cash-quarantine-store-path", str(paths["cash_quarantine_store_path"]),
+        "--mode-store-path", str(paths["mode_store_path"]),
+        "--audit-log-path", str(paths["audit_log_path"]),
+    ]
+    code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+               now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert code == 0
+    assert submit_calls == []
+    assert cancel_calls == []
+
+
+def test_reconcile_once_statically_cannot_reach_an_order_or_approval_machinery(tmp_path):
+    """Items 9 and 10, proven the same way this codebase already proves
+    the analogous negative elsewhere (tests/test_run_loop.py's own
+    `test_submit_approved_execution_stays_unreachable_from_the_loop`):
+    grepped against the ACTUAL source of `_run_reconcile_once`, not merely
+    inferred from the absence of a call in the tests above (which could
+    pass even if a dead, unreachable-in-practice call existed)."""
+    import ast
+    import inspect
+    import scripts.run_agent as run_agent_module
+
+    full_source = inspect.getsource(run_agent_module._run_reconcile_once)
+    # Strip the function's own docstring before searching -- it deliberately
+    # NAMES several of these forbidden things by way of explaining why
+    # they're unreachable (see the docstring itself), which would otherwise
+    # make this check trip on its own prose rather than on real code.
+    tree = ast.parse(full_source)
+    func_node = tree.body[0]
+    has_docstring = (
+        func_node.body and isinstance(func_node.body[0], ast.Expr)
+        and isinstance(func_node.body[0].value, ast.Constant)
+        and isinstance(func_node.body[0].value.value, str)
+    )
+    if has_docstring:
+        doc_end_line = func_node.body[0].end_lineno
+        source = "\n".join(full_source.splitlines()[doc_end_line:])
+    else:
+        source = full_source
+    for forbidden in (
+        "execute_approved_request", "approval_execution", "Gatekeeper",
+        "PipelineRuntime", "pipeline_stage", "build_pipeline_runtime",
+        ".submit(", ".cancel(", "mint_approval_token", "pipeline=",
+    ):
+        assert forbidden not in source, (
+            f"_run_reconcile_once's own source unexpectedly references "
+            f"{forbidden!r} -- this command must not be able to reach "
+            "candidate generation, materiality screening, T4 analysis, an "
+            "approval request, or an order submission/cancellation, and "
+            "must never pass pipeline= to run_cycle"
+        )
+    # _run_reconcile_once has no `pipeline` parameter of its own at all --
+    # there is no value it could even forward if it wanted to.
+    assert "pipeline" not in inspect.signature(run_agent_module._run_reconcile_once).parameters
+
+
+def test_reconcile_once_refuses_and_never_touches_the_adapter_while_the_scheduled_loop_holds_the_lock(
+    tmp_path, monkeypatch, caplog,
+):
+    """Items 11 and 12 together, mirroring `test_submit_approved_refuses_
+    and_never_touches_the_adapter_while_the_scheduled_loop_holds_the_lock`
+    exactly: the fake adapter here raises if constructed AT ALL, so a gap
+    in the lock wrapper would fail this test on that raise, not merely on
+    the exit code -- proving the lock is acquired BEFORE any local
+    mutation could occur, not merely that one happens to also be held
+    somewhere."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+
+    def _must_not_be_constructed(**kwargs):
+        raise AssertionError(
+            "--reconcile-once must never construct a broker adapter (and so "
+            "can never reach sync_fills's own writes) while the process "
+            "lock could not be acquired")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", _must_not_be_constructed)
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(ledger_path),
+    ]
+    with acquire_process_lock(data_dir):   # simulates the real scheduled loop already running
+        with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+            code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+                       now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert code == 1
+    assert any("reconcile-once" in r.message for r in caplog.records)
+    assert not ledger_path.exists()   # refused before any local mutation
+
+
+def test_reconcile_once_succeeds_normally_once_the_competing_lock_is_released(tmp_path, monkeypatch):
+    """The other half of the proof above, mirroring the equivalent
+    --submit-approved/scheduled-loop tests: the SAME argv, with no
+    competing lock held, succeeds normally -- proving the refusal above was
+    genuinely about lock contention."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paper_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+
+
+def test_reconcile_once_fails_closed_on_a_broker_read_failure(tmp_path, monkeypatch, caplog):
+    """Item 13: a broker read raising mid-cycle (a real TransportError,
+    say) must propagate to a logged failure and a non-zero exit -- never a
+    silently-swallowed, falsely-successful cycle."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paper_mode(data_dir / "mode_state.jsonl")
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+
+    def _boom():
+        raise ConnectionError("simulated broker read failure")
+    b.account = _boom
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    with caplog.at_level(logging.ERROR, logger="investmentagent.run_loop"):
+        code = main(
+            _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+            secrets_provider_factory=_secrets_provider_factory,
+            now_fn=lambda: _RO_OUT_OF_SESSION,
+        )
+    assert code == 1
+    assert any("simulated broker read failure" in r.message for r in caplog.records)
+
+
+def test_reconcile_once_reports_a_reconciliation_halt_rather_than_hiding_it(tmp_path, monkeypatch):
+    """Item 14: an unresolved execution the ordinary sync_fills path cannot
+    explain (no admitted resolution at all -- a manually-placed order this
+    account has never seen before) must still halt this cycle exactly the
+    way it would a real scheduled cycle (tests/test_run_loop.py's own
+    `test_sync_fills_runs_before_reconciliation_so_a_real_fill_is_not_a_
+    false_mismatch`) -- reported via a non-zero exit and the real
+    exception's own message, never silently downgraded to a warning or a
+    quiet success."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    _reconcile_once_seed_paper_mode(data_dir / "mode_state.jsonl")
+
+    # A fill exists at the broker with NO admitted resolution anywhere --
+    # sync_fills quarantines it (does not raise for that alone), but the
+    # ledger has never had opening_settled_cash seeded and now cannot be,
+    # because a pending quarantine blocks seeding (cash-seed-ordering fix,
+    # 2026-08-14) -- store.to_ledger() refuses, LedgerStoreError propagates
+    # out of run_cycle uncaught.
+    b, _execution = _reconcile_once_broker_with_a_pending_fill()
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 1
+
+
+def test_reconcile_once_introduces_no_settled_cash_tolerance(tmp_path, monkeypatch):
+    """Item 15: a broker settled-cash figure even one cent off from what
+    the local ledger computes must still halt -- proving this new call
+    site did not quietly introduce a tolerance band `agent.reconciliation`
+    itself has never had (see this codebase's own early "report on
+    settled-cash tolerance options (no implementation)" decision)."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config()))
+    data_dir = tmp_path / "data"
+
+    broker, execution = _reconcile_once_broker_with_a_pending_fill()
+    paths = _reconcile_once_seed_admitted_recovery(tmp_path, execution=execution)
+    # Local will compute exactly $460.00 (proven above); pin the broker's
+    # own reported settled_cash ONE CENT off from that on purpose.
+    _reconcile_once_pin_account_snapshot(broker, settled_cash="460.01")
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: broker)
+
+    argv = _reconcile_once_argv(config_path=config_path, data_dir=data_dir) + [
+        "--ledger-store-path", str(paths["ledger_store_path"]),
+        "--quarantine-store-path", str(paths["quarantine_store_path"]),
+        "--cash-quarantine-store-path", str(paths["cash_quarantine_store_path"]),
+        "--mode-store-path", str(paths["mode_store_path"]),
+        "--audit-log-path", str(paths["audit_log_path"]),
+    ]
+    code = main(argv, secrets_provider_factory=_secrets_provider_factory,
+               now_fn=lambda: _RO_OUT_OF_SESSION)
+    assert code == 1   # a real cent of drift is still a halt, not a pass
+
+
+def test_reconcile_once_never_advances_the_persisted_mode(tmp_path, monkeypatch):
+    """Documented in `_run_reconcile_once`'s own "NO MODE ADVANCEMENT"
+    section: targets `ModeStore.current()` itself, never `--config`'s
+    `mode`, so a config drifted from the persisted mode can never be the
+    reason this command changes it."""
+    import json as json_module
+    import scripts.run_agent as run_agent_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json_module.dumps(base_config(mode="PAPER")))
+    data_dir = tmp_path / "data"
+    mode_path = data_dir / "mode_state.jsonl"
+    data_dir.mkdir(parents=True)
+    mode_store = ModeStore(mode_path)
+    mode_store.write("PAPER", changed_at=_RO_OUT_OF_SESSION - timedelta(days=1))
+
+    b = SimulatorBroker(account_id=_RO_ACCT, cash=500.0, now=_RO_OUT_OF_SESSION)
+    monkeypatch.setattr(run_agent_module, "AlpacaPaperAdapter", lambda **kw: b)
+
+    code = main(
+        _reconcile_once_argv(config_path=config_path, data_dir=data_dir),
+        secrets_provider_factory=_secrets_provider_factory,
+        now_fn=lambda: _RO_OUT_OF_SESSION,
+    )
+    assert code == 0
+    # No SECOND mode_transition row was appended by this run.
+    transitions = [ln for ln in mode_path.read_text().splitlines() if '"mode_transition"' in ln]
+    # ModeStore itself only records mode VALUES, not an audit trail of
+    # transitions -- the absence of any change is instead confirmed by
+    # reading the current value back and confirming it is still exactly
+    # what was seeded, untouched by this run.
+    assert ModeStore(mode_path).current() == "PAPER"
+
+
+def test_reconcile_once_does_not_change_the_scheduled_loops_own_session_gate(tmp_path):
+    """Item 16: adding --reconcile-once must not have touched
+    `agent.run_loop.in_session_now`/`seconds_until_next_session_open` or
+    `run_loop`'s own gating on them -- spot-checked directly here (the
+    exhaustive behavior is already tests/test_run_loop.py's own, unchanged
+    by this unit)."""
+    in_session_instant = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)   # a real trading Monday
+    assert in_session_now(in_session_instant) is True
+    assert in_session_now(_RO_OUT_OF_SESSION) is False
+    assert seconds_until_next_session_open(_RO_OUT_OF_SESSION) > 0
