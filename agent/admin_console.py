@@ -453,16 +453,16 @@ def make_server(runtime: AdminRuntime, host: str = "127.0.0.1",
             super().setup()
             self.connection.settimeout(10)
 
-        def _handle(self, *, send_body: bool = True):
+        def _request_headers(self) -> dict[str, str]:
             request_headers = {}
             for name in ("Host", "Origin", "Content-Length", "Transfer-Encoding",
                          CSRF_HEADER):
                 values = self.headers.get_all(name, [])
                 if values:
                     request_headers[name] = values[0] if len(values) == 1 else "\x00"
-            result = route_request(runtime, self.command, self.path,
-                                   headers=request_headers, allowed_hosts=allowed_hosts,
-                                   allowed_origins=allowed_origins)
+            return request_headers
+
+        def _send_result(self, result: RouteResult, *, send_body: bool = True):
             self.close_connection = True
             self.send_response(result.status); self.send_header("Content-Type", result.content_type)
             for name, value in result.headers:
@@ -471,6 +471,24 @@ def make_server(runtime: AdminRuntime, host: str = "127.0.0.1",
             self.send_header("Content-Length", str(len(result.body))); self.end_headers()
             if send_body:
                 self.wfile.write(result.body)
+
+        def _handle(self, *, send_body: bool = True):
+            result = route_request(runtime, self.command, self.path,
+                                   headers=self._request_headers(), allowed_hosts=allowed_hosts,
+                                   allowed_origins=allowed_origins)
+            self._send_result(result, send_body=send_body)
+
+        def send_error(self, code, message=None, explain=None):
+            if code == 501 and hasattr(self, "headers"):
+                result = route_request(
+                    runtime, self.command, self.path,
+                    headers=self._request_headers(), allowed_hosts=allowed_hosts,
+                    allowed_origins=allowed_origins,
+                )
+                self._send_result(result, send_body=self.command != "HEAD")
+                return
+            super().send_error(code, message, explain)
+
         do_GET = _handle
         do_POST = _handle
         do_PUT = _handle

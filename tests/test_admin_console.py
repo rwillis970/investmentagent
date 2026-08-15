@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import socket
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,38 @@ def admin_runtime(tmp_path, *, repo_root=None, csrf_token=CSRF):
     backups.mkdir(exist_ok=True)
     return AdminRuntime(repo_root or tmp_path, data, backups, FakeServices(),
                         csrf_token=csrf_token)
+
+
+def raw_handler_response(runtime, request, monkeypatch):
+    captured = {}
+
+    class CaptureServer:
+        def __init__(self, address, handler):
+            captured["handler"] = handler
+
+    monkeypatch.setattr("agent.admin_console.ThreadingHTTPServer", CaptureServer)
+    server = make_server(runtime, "127.0.0.1", 8766)
+    server_side, client_side = socket.socketpair()
+    client_side.settimeout(1)
+    try:
+        client_side.sendall(request)
+        client_side.shutdown(socket.SHUT_WR)
+        captured["handler"](server_side, ("local", 0), server)
+        server_side.close()
+        response = b""
+        while chunk := client_side.recv(65536):
+            response += chunk
+    finally:
+        server_side.close()
+        client_side.close()
+    head, _, body = response.partition(b"\r\n\r\n")
+    status = int(head.split(b"\r\n", 1)[0].split()[1])
+    headers = {
+        name.decode().lower(): value.decode().strip()
+        for line in head.split(b"\r\n")[1:]
+        for name, value in [line.split(b":", 1)]
+    }
+    return status, headers, body
 
 
 def local_headers(*, host=LOCAL_HOST, origin=None, token=None, **extra):
@@ -125,6 +158,33 @@ def test_localhost_binding_only(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.admin_console.ThreadingHTTPServer", FakeServer)
     make_server(runtime, "127.0.0.1", 8766)
     assert seen["address"] == ("127.0.0.1", 8766)
+
+
+@pytest.mark.parametrize("host,path,expected", [
+    ("127.0.0.1:8766", "/api/services/com.investmentagent.dashboard/restart", 404),
+    ("127.0.0.1:8766", "/api/utilities/backup", 404),
+    ("evil.example", "/api/services/com.investmentagent.dashboard/restart", 403),
+])
+def test_unsupported_raw_method_uses_hardened_response_path(
+    tmp_path, monkeypatch, host, path, expected,
+):
+    runtime = admin_runtime(tmp_path, repo_root=REPO_ROOT)
+    utility_calls = []
+    monkeypatch.setattr(
+        "agent.admin_console._run_utility_subprocess",
+        lambda argv, **kwargs: utility_calls.append(argv),
+    )
+    request = (
+        f"FOO {path} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode()
+    )
+    status, headers, body = raw_handler_response(runtime, request, monkeypatch)
+    assert status == expected
+    assert headers["content-security-policy"] == "frame-ancestors 'none'"
+    assert headers["x-frame-options"] == "DENY"
+    assert headers["connection"] == "close"
+    assert CSRF.encode() not in body
+    assert runtime.service_manager.calls == []
+    assert utility_calls == []
 
 
 def test_git_tracking_detection(tmp_path):
