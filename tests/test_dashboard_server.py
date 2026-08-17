@@ -469,42 +469,6 @@ def test_dashboard_bind_js_is_served_as_javascript_not_html(tmp_path):
     assert result.content_type == "text/javascript; charset=utf-8"
 
 
-def test_admin_console_link_js_is_reachable_through_serve_static(tmp_path):
-    """admin_console_link.js (admin-console/dashboard cross-link follow-up,
-    2026-08-17) -- served the same way as the other companion scripts,
-    byte-identical to the checked-in file."""
-    runtime, _ = make_runtime(tmp_path)
-    result = route_request(runtime, method="GET", path="/admin_console_link.js")
-    assert result.status == 200
-    assert result.body == (STATIC_DIR / "admin_console_link.js").read_bytes()
-
-
-def test_admin_console_link_js_is_served_as_javascript_not_html(tmp_path):
-    runtime, _ = make_runtime(tmp_path)
-    result = route_request(runtime, method="GET", path="/admin_console_link.js")
-    assert result.content_type == "text/javascript; charset=utf-8"
-
-
-def test_admin_console_link_js_targets_the_exact_loopback_admin_console_url_with_opener_isolation(tmp_path):
-    """Proves the dashboard's own served asset -- not just a hand-read of
-    the source file -- contains the exact `http://127.0.0.1:8766` loopback
-    URL (agent.admin_console.DEFAULT_ADMIN_PORT) and full opener isolation
-    (`target="_blank"` + `rel="noopener noreferrer"`), and that it is
-    navigation-only: no `fetch(`/`XMLHttpRequest(` call anywhere in the
-    file (this script talks to nothing, proxies nothing, and shares no
-    authorization mechanism with the admin console -- it only builds one
-    static anchor element)."""
-    runtime, _ = make_runtime(tmp_path)
-    result = route_request(runtime, method="GET", path="/admin_console_link.js")
-    js = result.body.decode("utf-8")
-    assert 'ADMIN_CONSOLE_URL = "http://127.0.0.1:8766"' in js
-    assert "link.href = ADMIN_CONSOLE_URL" in js
-    assert 'link.target = "_blank"' in js
-    assert 'link.rel = "noopener noreferrer"' in js
-    assert "fetch(" not in js
-    assert "XMLHttpRequest(" not in js
-
-
 def test_existing_html_routes_keep_their_content_type(tmp_path):
     """Guards the content-type fix from ever regressing the two existing
     HTML routes while making _serve_static suffix-aware."""
@@ -723,28 +687,78 @@ def test_command_center_html_registers_the_real_agent_command_center_contract(tm
 
 
 def test_command_center_html_has_exactly_one_dashboard_bind_script_tag_immediately_before_closing_body(tmp_path):
-    """The permitted edits to the generated file (see this unit's own
-    report, Unit 17's own report for the second one, and the admin-console/
-    dashboard cross-link follow-up's own report for the third): a single
-    `<script src="dashboard_bind.js"></script>`, immediately followed by a
-    single `<script src="credential_preflight_bind.js"></script>` (Unit 17,
-    2026-08-12 -- credential preflight strip), immediately followed by a
-    single `<script src="admin_console_link.js"></script>` (2026-08-17 --
-    static "Open Admin Console" navigation link), all three inserted right
-    before the real, outer document's closing `</body>` -- not the escaped
-    `<\\/body>` that appears as inert text inside the `__bundler/template`
-    JSON string, and not anywhere else in the file."""
+    """The permitted script-tag edits to the generated file (see this
+    unit's own report, and Unit 17's own report for the second one): a
+    single `<script src="dashboard_bind.js"></script>`, immediately
+    followed by a single `<script src="credential_preflight_bind.js">
+    </script>` (Unit 17, 2026-08-12 -- credential preflight strip), both
+    inserted right before the real, outer document's closing `</body>`
+    -- not the escaped `<\\/body>` that appears as inert text inside the
+    `__bundler/template` JSON string, and not anywhere else in the file.
+
+    The admin-console/dashboard cross-link follow-up's ORIGINAL attempt
+    added a third script tag here (a JS-injected link) -- REVERTED by
+    this unit's own UI-acceptance-failure follow-up (2026-08-17): the
+    dynamically-injected node never survived `document.documentElement.
+    replaceWith(doc.documentElement)` inside the bundle's own unpacking
+    script (line ~307 of this file), which replaces the ENTIRE outer
+    `<html>` element -- including anything a separately-loaded script
+    appended to `<body>` beforehand -- with the unpacked `__bundler/
+    template` content. The corrected fix instead edits that template
+    content directly; see
+    test_command_center_html_contains_the_static_admin_console_anchor_element
+    below."""
     runtime, _ = make_runtime(tmp_path)
     result = route_request(runtime, method="GET", path="/")
     html = result.body.decode("utf-8")
     assert html.count('<script src="dashboard_bind.js"></script>') == 1
     assert html.count('<script src="credential_preflight_bind.js"></script>') == 1
-    assert html.count('<script src="admin_console_link.js"></script>') == 1
+    assert 'admin_console_link.js' not in html
     assert html.rstrip().endswith(
         '<script src="dashboard_bind.js"></script>\n'
-        '<script src="credential_preflight_bind.js"></script>\n'
-        '<script src="admin_console_link.js"></script>\n</body>\n</html>'
+        '<script src="credential_preflight_bind.js"></script>\n</body>\n</html>'
     )
+
+
+def test_command_center_html_contains_the_static_admin_console_anchor_element(tmp_path):
+    """The corrected fix (UI-acceptance-failure follow-up, 2026-08-17):
+    a real `<a>` element baked directly into the `__bundler/template`
+    JSON string itself -- part of the page's initial render output, not
+    appended by a separately-loaded script after the fact. This is what
+    makes it survive `document.documentElement.replaceWith(...)` (the
+    bundle's own unpacking step, which replaces the whole outer <html>,
+    including any DOM node a companion script had appended to <body>
+    beforehand -- the root cause of the original JS-injected link never
+    appearing on the real, restarted dashboard).
+
+    Checked against the RAW SERVED BYTES (the escaped JSON string, exactly
+    as `GET /` serves it) rather than a parsed/rendered DOM, since this
+    process has no browser -- but the escaped substrings below are
+    exactly what a JSON.parse of the `__bundler/template` script's
+    textContent turns into the literal attribute values on the rendered
+    anchor: href="http://127.0.0.1:8766", target="_blank", rel="noopener
+    noreferrer", visible text "Open Admin Console". Also proves it sits
+    immediately before the existing `Pause</button>` markup -- i.e. in
+    the same header row, next to (not overlapping or replacing) the
+    existing Pause control -- and that the now-removed
+    admin_console_link.js is not referenced anywhere."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+
+    anchor = (
+        r'<a href=\"http://127.0.0.1:8766\" target=\"_blank\" '
+        r'rel=\"noopener noreferrer\" id=\"admin-console-link\"'
+    )
+    assert anchor in html
+    assert r'>Open Admin Console</a>' in html
+    # Immediately precedes the existing Pause button -- same header row,
+    # adjacent (flexbox gap), never overlapping or replacing it.
+    idx_anchor = html.index(anchor)
+    idx_pause = html.index(r'>Pause</button>')
+    assert idx_anchor < idx_pause
+    assert idx_pause - idx_anchor < 900   # same header row, not some other part of the page
+    assert 'admin_console_link.js' not in html
 
 
 def test_command_center_html_makes_no_live_external_script_fetch(tmp_path):
