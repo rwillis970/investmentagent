@@ -250,6 +250,58 @@ def test_both_call_sites_get_the_same_adapter_type_for_the_same_config():
 
 # --------------------------------------------------- capability_policy forwarding
 
+# ------------------------------------ expected_broker_account_id (pin) threading
+# (broker-account-uuid-pin-threading follow-up, 2026-08-17)
+
+def test_expected_broker_account_id_reaches_the_alpaca_adapter_only():
+    """The pin is forwarded to AlpacaPaperAdapter's own `expected_broker_
+    account_id` constructor kwarg -- proven by reading the adapter's own
+    attribute, not just by absence of an error."""
+    alp = select_broker_adapter(
+        _cfg(broker="alpaca_paper"), account_id=ACCT, credentials=_creds(),
+        secrets_provider=_secrets(), transport=ScriptedTransport(),
+        expected_broker_account_id="pinned-uuid-1",
+    )
+    assert alp._expected_broker_account_id == "pinned-uuid-1"
+
+
+def test_expected_broker_account_id_is_never_forwarded_to_the_simulator():
+    """Structural guarantee, not just convention: SimulatorBroker.__init__
+    has no `expected_broker_account_id` parameter at all -- passing it
+    would raise TypeError. A factory that captures its kwargs proves
+    select_broker_adapter's simulator branch never even tries."""
+    captured = {}
+
+    def _capturing_simulator(**kwargs):
+        captured.update(kwargs)
+        return SimulatorBroker(**kwargs)
+
+    adapter = select_broker_adapter(
+        _cfg(broker="simulator"), account_id=ACCT, now=NOW,
+        expected_broker_account_id="pinned-uuid-1",
+        simulator_cls=_capturing_simulator,
+    )
+    assert isinstance(adapter, SimulatorBroker)
+    assert "expected_broker_account_id" not in captured
+
+    # Belt and suspenders: the REAL SimulatorBroker class itself would
+    # refuse this kwarg -- confirms the guarantee is structural, not just
+    # this function choosing not to pass it.
+    with pytest.raises(TypeError):
+        SimulatorBroker(account_id=ACCT, expected_broker_account_id="x")
+
+
+def test_no_pin_configured_preserves_existing_alpaca_construction_default():
+    """expected_broker_account_id's own default (None, unset by this
+    call) must reach AlpacaPaperAdapter identically to before this
+    follow-up existed -- unpinned deployments see no behavior change."""
+    alp = select_broker_adapter(
+        _cfg(broker="alpaca_paper"), account_id=ACCT, credentials=_creds(),
+        secrets_provider=_secrets(), transport=ScriptedTransport(),
+    )
+    assert alp._expected_broker_account_id is None
+
+
 def test_capability_policy_is_forwarded_identically_to_either_adapter_type():
     policy = initial_policy()
     sim = select_broker_adapter(_cfg(broker="simulator"), account_id=ACCT, now=NOW,

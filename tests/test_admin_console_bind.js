@@ -29,3 +29,18 @@ test('stale and unavailable states have explicit non-green visual classes', () =
   assert.match(css, /\.caution\{color:var\(--amber\)\}/);
   assert.match(css, /\.unknown\{color:var\(--muted\)\}/);
 });
+
+test('Open Dashboard link opens in an isolated new tab (opener isolation), independent of app.js', () => {
+  // The #dashboard anchor must carry target="_blank" rel="noopener noreferrer"
+  // in the static HTML itself (admin-console/dashboard cross-link follow-up,
+  // 2026-08-17) -- app.js only ever sets .textContent/.href/removes the
+  // "disabled" class when the dashboard becomes AVAILABLE, and never touches
+  // target/rel, so the isolation attributes must be present unconditionally,
+  // in both the disabled and enabled states.
+  assert.match(
+    html,
+    /<a id="dashboard" class="button disabled" target="_blank" rel="noopener noreferrer">/
+  );
+  assert.doesNotMatch(script, /\.target\s*=/);
+  assert.doesNotMatch(script, /\.rel\s*=/);
+});

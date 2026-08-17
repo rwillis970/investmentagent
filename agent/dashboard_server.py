@@ -555,6 +555,8 @@ def route_request(runtime: DashboardRuntime, *, method: str, path: str,
         return _serve_static("approval_card_bind.js")
     if method == "GET" and path == "/credential_preflight_bind.js":
         return _serve_static("credential_preflight_bind.js")
+    if method == "GET" and path == "/admin_console_link.js":
+        return _serve_static("admin_console_link.js")
 
     return _json_result(404, {"error": f"no route for {method} {path}"})
 

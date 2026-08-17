@@ -469,6 +469,42 @@ def test_dashboard_bind_js_is_served_as_javascript_not_html(tmp_path):
     assert result.content_type == "text/javascript; charset=utf-8"
 
 
+def test_admin_console_link_js_is_reachable_through_serve_static(tmp_path):
+    """admin_console_link.js (admin-console/dashboard cross-link follow-up,
+    2026-08-17) -- served the same way as the other companion scripts,
+    byte-identical to the checked-in file."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/admin_console_link.js")
+    assert result.status == 200
+    assert result.body == (STATIC_DIR / "admin_console_link.js").read_bytes()
+
+
+def test_admin_console_link_js_is_served_as_javascript_not_html(tmp_path):
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/admin_console_link.js")
+    assert result.content_type == "text/javascript; charset=utf-8"
+
+
+def test_admin_console_link_js_targets_the_exact_loopback_admin_console_url_with_opener_isolation(tmp_path):
+    """Proves the dashboard's own served asset -- not just a hand-read of
+    the source file -- contains the exact `http://127.0.0.1:8766` loopback
+    URL (agent.admin_console.DEFAULT_ADMIN_PORT) and full opener isolation
+    (`target="_blank"` + `rel="noopener noreferrer"`), and that it is
+    navigation-only: no `fetch(`/`XMLHttpRequest(` call anywhere in the
+    file (this script talks to nothing, proxies nothing, and shares no
+    authorization mechanism with the admin console -- it only builds one
+    static anchor element)."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/admin_console_link.js")
+    js = result.body.decode("utf-8")
+    assert 'ADMIN_CONSOLE_URL = "http://127.0.0.1:8766"' in js
+    assert "link.href = ADMIN_CONSOLE_URL" in js
+    assert 'link.target = "_blank"' in js
+    assert 'link.rel = "noopener noreferrer"' in js
+    assert "fetch(" not in js
+    assert "XMLHttpRequest(" not in js
+
+
 def test_existing_html_routes_keep_their_content_type(tmp_path):
     """Guards the content-type fix from ever regressing the two existing
     HTML routes while making _serve_static suffix-aware."""
@@ -688,11 +724,14 @@ def test_command_center_html_registers_the_real_agent_command_center_contract(tm
 
 def test_command_center_html_has_exactly_one_dashboard_bind_script_tag_immediately_before_closing_body(tmp_path):
     """The permitted edits to the generated file (see this unit's own
-    report, and Unit 17's own report for the second one): a single
+    report, Unit 17's own report for the second one, and the admin-console/
+    dashboard cross-link follow-up's own report for the third): a single
     `<script src="dashboard_bind.js"></script>`, immediately followed by a
     single `<script src="credential_preflight_bind.js"></script>` (Unit 17,
-    2026-08-12 -- credential preflight strip), both inserted right before
-    the real, outer document's closing `</body>` -- not the escaped
+    2026-08-12 -- credential preflight strip), immediately followed by a
+    single `<script src="admin_console_link.js"></script>` (2026-08-17 --
+    static "Open Admin Console" navigation link), all three inserted right
+    before the real, outer document's closing `</body>` -- not the escaped
     `<\\/body>` that appears as inert text inside the `__bundler/template`
     JSON string, and not anywhere else in the file."""
     runtime, _ = make_runtime(tmp_path)
@@ -700,9 +739,11 @@ def test_command_center_html_has_exactly_one_dashboard_bind_script_tag_immediate
     html = result.body.decode("utf-8")
     assert html.count('<script src="dashboard_bind.js"></script>') == 1
     assert html.count('<script src="credential_preflight_bind.js"></script>') == 1
+    assert html.count('<script src="admin_console_link.js"></script>') == 1
     assert html.rstrip().endswith(
         '<script src="dashboard_bind.js"></script>\n'
-        '<script src="credential_preflight_bind.js"></script>\n</body>\n</html>'
+        '<script src="credential_preflight_bind.js"></script>\n'
+        '<script src="admin_console_link.js"></script>\n</body>\n</html>'
     )
 
 

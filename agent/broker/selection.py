@@ -113,13 +113,25 @@ def select_broker_adapter(
     staging_key: bytes | None = None,
     now: datetime | None = None,
     transport: Transport | None = None,
+    expected_broker_account_id: str | None = None,
     simulator_cls: Callable[..., BrokerAdapter] = SimulatorBroker,
     alpaca_adapter_cls: Callable[..., BrokerAdapter] = AlpacaPaperAdapter,
 ) -> BrokerAdapter:
     """The one place `cfg.broker` is turned into a real `BrokerAdapter`.
     See this module's own docstring for the full contract. `now` is only
     ever used by the simulator branch (SimulatorBroker's own clock);
-    `transport` is only ever used by the alpaca_paper branch."""
+    `transport` is only ever used by the alpaca_paper branch.
+
+    `expected_broker_account_id` (broker-account-uuid-pin-threading follow-up,
+    2026-08-17) is forwarded ONLY to the alpaca_paper branch, as
+    `AlpacaPaperAdapter(expected_broker_account_id=...)`. It is never passed
+    to `simulator_cls` -- `SimulatorBroker.__init__` has no such parameter,
+    so doing so would raise `TypeError`; this is a structural guarantee, not
+    just a convention, that the pin can never silently apply to the
+    simulator. When `None` (the default -- i.e. no pin configured in
+    `cfg.broker_account_uuid`), `AlpacaPaperAdapter` keeps its own existing
+    compatibility behaviour (a construction-time warning, no verification)
+    unchanged."""
     if cfg.broker == "simulator":
         return simulator_cls(
             account_id=account_id, credentials=credentials, now=now,
@@ -158,7 +170,7 @@ def select_broker_adapter(
         kwargs = dict(
             account_id=account_id, credentials=credentials,
             secrets_provider=secrets_provider, capability_policy=capability_policy,
-            staging_key=staging_key,
+            staging_key=staging_key, expected_broker_account_id=expected_broker_account_id,
         )
         if transport is not None:
             kwargs["transport"] = transport

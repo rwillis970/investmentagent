@@ -152,7 +152,26 @@ def _build_broker_state(
     regression test proving it, not just asserting it in prose. `transport`
     is exposed purely for tests (`agent.broker.transport.ScriptedTransport`,
     no real network) -- production code never passes one, letting
-    `AlpacaPaperAdapter` construct its own real `UrllibTransport`."""
+    `AlpacaPaperAdapter` construct its own real `UrllibTransport`.
+
+    `cfg.broker_account_uuid`, NOW THREADED (broker-account-uuid-pin-
+    threading follow-up, 2026-08-17), is forwarded as `select_broker_
+    adapter`'s `expected_broker_account_id=` on every call, unconditionally
+    -- `select_broker_adapter` itself is what confines the pin to the
+    alpaca_paper branch only (see agent/broker/selection.py's own
+    docstring); `cfg.broker: "simulator"` never sees this value at all. With
+    no pin configured (`cfg.broker_account_uuid` is `None`, its own
+    default), this is `expected_broker_account_id=None`, `AlpacaPaperAdapter`'s
+    own existing default -- byte-for-byte the same call this function made
+    before this follow-up, so unpinned deployments keep their existing
+    compatibility behaviour and construction-time warning unchanged. With a
+    pin configured, a broker-identity mismatch/missing/malformed identity
+    raises inside `adapter.account()` (via `AlpacaPaperAdapter._verify_
+    broker_identity_or_raise`, unchanged by this follow-up), caught by this
+    function's own pre-existing `except Exception` below and degraded to
+    the same honest null quadruple every other failure here already
+    produces -- fail-closed to NO DATA, never fail-open to an unverified
+    account's state, and never a crash."""
     if not account_id:
         return None, (), None, None
     try:
@@ -163,6 +182,7 @@ def _build_broker_state(
         adapter = select_broker_adapter(
             cfg, account_id=account_id, credentials=credentials,
             secrets_provider=secrets_provider, now=now, transport=transport,
+            expected_broker_account_id=cfg.broker_account_uuid,
         )
         store = LedgerStore(ledger_store_path, account_id=account_id,
                             policy_registry=registry)

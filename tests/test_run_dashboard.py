@@ -42,7 +42,7 @@ import pytest
 
 from agent import config as config_module
 from agent.accounts import BrokerCredentials
-from agent.broker.base import StagingKeyUnset
+from agent.broker.base import CapabilityPolicyUnset, StagingKeyUnset
 from agent.broker.transport import ScriptedTransport
 from agent.daytrade import DayTradeGuard
 from agent.secrets_provider import CachingSecretsProvider, InMemorySecretsProvider
@@ -323,6 +323,197 @@ def test_alpaca_paper_with_no_credentials_at_all_still_degrades_to_the_null_quad
     assert broker_positions == ()
     assert day_trade_guard is None
     assert ledger is None
+
+
+# --------------------------------------------------------------------
+# broker_account_uuid pin threading (broker-account-uuid-pin-threading
+# follow-up, 2026-08-17). `cfg.broker_account_uuid` -> `_build_broker_
+# state` -> `select_broker_adapter(..., expected_broker_account_id=...)`
+# -> `AlpacaPaperAdapter(expected_broker_account_id=...)` only.
+
+def test_configured_pin_reaches_the_real_alpaca_adapter_construction(tmp_path):
+    """Behavioral proof the configured UUID actually reaches
+    AlpacaPaperAdapter's own `expected_broker_account_id` (not just
+    "accepted as an unused parameter"): when the scripted /v2/account
+    response's `id` MATCHES the configured pin, the read succeeds and
+    reports that response's real figures -- if the pin were silently
+    dropped anywhere in the select_broker_adapter -> AlpacaPaperAdapter
+    chain, verification simply would not run and this would trivially
+    pass too, so this is paired with the mismatch test below (which only
+    fails the way it does BECAUSE the identity check is live) to prove
+    the pin genuinely reaches and is enforced by the real adapter, not
+    merely accepted."""
+    transport = ScriptedTransport()
+    transport.enqueue(200, dict(id="pinned-uuid-1", cash="777.00", equity="777.00",
+                                buying_power="777.00", multiplier="1",
+                                pattern_day_trader=False, daytrade_count=0))
+    transport.enqueue(200, [])
+    transport.enqueue(200, [])
+    transport.enqueue(200, [])
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
+        _cfg(broker="alpaca_paper", broker_account_uuid="pinned-uuid-1"),
+        account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+        credentials=_alpaca_creds(), secrets_provider=_alpaca_secrets(),
+        transport=transport,
+    )
+    assert broker_account is not None
+    assert float(broker_account.settled_cash) == 777.00
+
+
+def test_simulator_construction_is_unaffected_by_a_configured_pin(tmp_path):
+    """cfg.broker == "simulator" with cfg.broker_account_uuid ALSO set
+    (an operator who configured a pin but never switched off the
+    simulator) must still construct successfully -- select_broker_
+    adapter's own structural guarantee (SimulatorBroker has no such
+    parameter) means the pin is silently inapplicable here, never an
+    error."""
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
+        _cfg(broker="simulator", broker_account_uuid="pinned-uuid-1"),
+        account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+    )
+    assert broker_account is not None
+    assert float(broker_account.settled_cash) == 500.0   # SimulatorBroker's own default
+
+
+def test_missing_pin_preserves_existing_alpaca_compatibility_behavior(tmp_path):
+    """cfg.broker_account_uuid unset (its own None default) -> _build_
+    broker_state's alpaca_paper read behaves exactly as before this
+    follow-up: it succeeds and reports whatever account id the scripted
+    response returns, with no identity check performed at all."""
+    transport = ScriptedTransport()
+    transport.enqueue(200, dict(id="whatever-account", cash="12345.67", equity="12345.67",
+                                buying_power="12345.67", multiplier="1",
+                                pattern_day_trader=False, daytrade_count=0))
+    transport.enqueue(200, [])
+    transport.enqueue(200, [])
+    transport.enqueue(200, [])
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
+        _cfg(broker="alpaca_paper"),  # broker_account_uuid left at its own default: None
+        account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+        credentials=_alpaca_creds(), secrets_provider=_alpaca_secrets(),
+        transport=transport,
+    )
+    assert broker_account is not None
+    assert float(broker_account.settled_cash) == 12345.67
+
+
+def test_a_pinned_identity_mismatch_degrades_to_the_null_quadruple_without_crashing(tmp_path):
+    """The whole point of threading the pin through THIS function
+    specifically: a configured pin whose reported account id does not
+    match must fail closed to the exact same honest null quadruple every
+    other _build_broker_state failure already produces (via this
+    function's own pre-existing broad `except Exception`), never a
+    fabricated value and never an unhandled exception that would crash
+    the dashboard server process serving the rest of GET /api/state."""
+    transport = ScriptedTransport()
+    transport.enqueue(200, dict(id="some-other-account", cash="500.00", equity="500.00",
+                                buying_power="500.00", multiplier="1",
+                                pattern_day_trader=False, daytrade_count=0))
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
+        _cfg(broker="alpaca_paper", broker_account_uuid="pinned-uuid-1"),
+        account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+        credentials=_alpaca_creds(), secrets_provider=_alpaca_secrets(),
+        transport=transport,
+    )
+    assert broker_account is None
+    assert broker_positions == ()
+    assert day_trade_guard is None
+    assert ledger is None
+
+
+def test_a_pinned_missing_reported_id_also_degrades_to_the_null_quadruple(tmp_path):
+    """Same fail-closed path, but the broker response omits `id` entirely
+    (a malformed/absent identity) rather than reporting a mismatched one
+    -- AlpacaAccountIdentityMismatch treats None != "pinned-uuid-1" the
+    same as any other mismatch (agent/broker/alpaca.py's own account())."""
+    transport = ScriptedTransport()
+    transport.enqueue(200, dict(cash="500.00", equity="500.00", buying_power="500.00",
+                                multiplier="1", pattern_day_trader=False, daytrade_count=0))
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    broker_account, broker_positions, day_trade_guard, ledger = _build_broker_state(
+        _cfg(broker="alpaca_paper", broker_account_uuid="pinned-uuid-1"),
+        account_id="acct-1", ledger_store_path=tmp_path / "ledger.jsonl",
+        quarantine_store_path=tmp_path / "quarantine.jsonl", now=now,
+        credentials=_alpaca_creds(), secrets_provider=_alpaca_secrets(),
+        transport=transport,
+    )
+    assert broker_account is None
+    assert broker_positions == ()
+    assert day_trade_guard is None
+    assert ledger is None
+
+
+def test_no_dashboard_adapter_gains_submit_or_cancel_capability_even_when_pinned():
+    """Task 3's own explicit requirement: threading the pin must not also
+    attach capability_policy/staging_key. Constructs the adapter the SAME
+    way _build_broker_state does (select_broker_adapter, no capability_
+    policy, no staging_key, but WITH expected_broker_account_id set this
+    time) and proves submit()/cancel() still refuse via the unchanged,
+    already-validated StagingKeyUnset mutation guard -- pinning identity
+    is orthogonal to, and does not loosen, that gate."""
+    from agent.accounts import AccountType
+    from agent.broker.selection import select_broker_adapter as _select
+    from agent.daytrade import DayTradeGuard as _DTG
+    from agent.pipeline import Gatekeeper
+    from agent.policy import initial_policy
+    from agent.risk import PortfolioState, RiskPolicy
+
+    acct = "acct-1"
+    now = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)
+    transport = ScriptedTransport()
+    adapter = _select(
+        _cfg(broker="alpaca_paper", broker_account_uuid="pinned-uuid-1"),
+        account_id=acct, credentials=_alpaca_creds(acct),
+        secrets_provider=_alpaca_secrets(), transport=transport, now=now,
+        expected_broker_account_id="pinned-uuid-1",
+    )
+    assert adapter._staging_key is None
+    # capability_policy is a property that RAISES CapabilityPolicyUnset when
+    # unset (agent/broker/base.py), not one that returns None -- confirms
+    # no policy was attached, the same way the staging-key check above does.
+    with pytest.raises(CapabilityPolicyUnset):
+        adapter.capability_policy
+
+    gk = Gatekeeper(
+        account_id=acct, account_type=AccountType.TAXABLE,
+        capability_policy=initial_policy(),
+        risk_policy=RiskPolicy("t", max_position_pct=50.0, max_sector_pct=100.0,
+                               min_settled_cash_pct_of_nlv=0.0, min_absolute_settled_cash=0.0),
+        day_trade_guard=_DTG(account_id=acct, max_per_5_sessions=3),
+        signing_key=b"k" * 32,
+    )
+    portfolio = PortfolioState(account_id=acct, nlv=10000.0, settled_cash=10000.0)
+    staged = gk.stage(client_order_id="c1", symbol="SPY", side="BUY", order_type="LIMIT",
+                      time_in_force="DAY", portfolio=portfolio, now=now, posture="CASH",
+                      qty=1.0, price=100.0, limit_price=100.0)
+    # With a pin configured, submit()/cancel() each run
+    # _verify_broker_identity_or_raise() FIRST (agent/broker/base.py's own
+    # documented ordering) -- an extra self.account() round-trip ahead of
+    # the staging-key gate. Queue a matching identity response for each of
+    # the two mutating calls below so identity verification PASSES,
+    # isolating what this test actually checks: that the pin does not
+    # loosen the staging-key refusal underneath it.
+    transport.enqueue(200, dict(id="pinned-uuid-1", cash="500.00", equity="500.00",
+                                buying_power="500.00", multiplier="1",
+                                pattern_day_trader=False, daytrade_count=0))
+    with pytest.raises(StagingKeyUnset):
+        adapter.submit(staged)
+    cancel_staged = gk.stage(client_order_id="c1", symbol="SPY", side="CANCEL",
+                             order_type="LIMIT", time_in_force="DAY",
+                             portfolio=portfolio, now=now, posture="CASH")
+    transport.enqueue(200, dict(id="pinned-uuid-1", cash="500.00", equity="500.00",
+                                buying_power="500.00", multiplier="1",
+                                pattern_day_trader=False, daytrade_count=0))
+    with pytest.raises(StagingKeyUnset):
+        adapter.cancel(cancel_staged)
 
 
 def test_the_dashboards_own_adapter_construction_never_attaches_a_staging_key():
