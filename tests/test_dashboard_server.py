@@ -761,6 +761,54 @@ def test_command_center_html_contains_the_static_admin_console_anchor_element(tm
     assert 'admin_console_link.js' not in html
 
 
+def test_command_center_template_script_is_valid_json_and_decodes_the_admin_console_anchor(tmp_path):
+    """Bundle-parse-regression follow-up (2026-08-17). The real, restarted
+    dashboard failed with 'Error unpacking: JSON Parse error: Invalid
+    escape character' -- the admin-console-anchor commit had inserted
+    `\\'Rajdhani\\'` (an escaped single quote; JSON has no such escape
+    -- single quotes never need escaping in JSON and `\\'` is not a
+    recognised escape sequence) plus a literal, unescaped newline
+    character (JSON strings may not contain raw control characters --
+    they must be written as the two-character sequence `\\n`) into the
+    `__bundler/template` script's JSON string content.
+
+    Both defects would have passed the previous test above, since that
+    test only checked for the presence of raw substrings in the SERVED
+    HTML -- it never actually ran the extracted `__bundler/template`
+    content through a JSON parser the way the real browser's unpacking
+    script does (`JSON.parse(templateEl.textContent)`, see this file's
+    own `<script>` bootstrap). This test closes that gap: it extracts
+    the complete `__bundler/template` script tag's textContent from the
+    real served `/` response, decodes it with Python's own `json.loads`
+    (a real, independent JSON parser -- not a hand-rolled string check),
+    and only THEN inspects the decoded template text for the visible
+    anchor, immediately before the Pause button -- proving both that the
+    JSON is well-formed AND that unpacking it actually yields the
+    intended markup."""
+    runtime, _ = make_runtime(tmp_path)
+    result = route_request(runtime, method="GET", path="/")
+    html = result.body.decode("utf-8")
+
+    match = re.search(
+        r'<script type="__bundler/template">([\s\S]*?)</script>', html,
+    )
+    assert match is not None, "no __bundler/template script tag found in served HTML"
+
+    # The real assertion: a genuine JSON parser must accept this string.
+    # json.loads raises json.JSONDecodeError (a ValueError) on the exact
+    # class of defect this follow-up fixes -- invalid \' escapes and raw
+    # control characters -- so simply not raising here is the proof.
+    template = json.loads(match.group(1))
+
+    idx_anchor = template.index(
+        '<a href="http://127.0.0.1:8766" target="_blank" '
+        'rel="noopener noreferrer" id="admin-console-link"'
+    )
+    idx_pause = template.index('>Pause</button>')
+    assert idx_anchor < idx_pause
+    assert idx_pause - idx_anchor < 900   # same header row, adjacent to Pause
+
+
 def test_command_center_html_makes_no_live_external_script_fetch(tmp_path):
     """The literal ask was 'no unpkg.com URL' -- that does NOT hold as a raw
     substring check against this exact, unmodified file: its embedded
